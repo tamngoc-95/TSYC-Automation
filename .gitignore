@@ -1,0 +1,36 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs and temporary files
+logs/
+temp/
+*.log
+
+# Playwright authentication and browser profiles
+playwright/.auth/
+playwright/facebook-profile/
+browser-profile/
+cookies/
+secrets/
+
+# Generated data
+data/raw/*
+data/processed/*
+data/output/*
+
+# Keep folder placeholders
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/output/.gitkeep
