@@ -29,6 +29,7 @@ secrets/
 data/raw/*
 data/processed/*
 data/output/*
+data/raw/facebook-images/
 
 # Keep folder placeholders
 !data/raw/.gitkeep
