@@ -1,5 +1,4 @@
 import re
-import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,14 +15,23 @@ from playwright.sync_api import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(
+    0,
+    str(PROJECT_ROOT),
+)
 
-from src.repositories.supabase_repository import SupabaseRepository
+from src.repositories.supabase_repository import (
+    SupabaseRepository,
+)
 
 
 BATCH_CODE = "FB-2026-001"
-COLLECTOR_NAME = "facebook_permalink_image_detector"
-COLLECTOR_VERSION = "0.4.1"
+
+COLLECTOR_NAME = (
+    "facebook_permalink_image_detector"
+)
+
+COLLECTOR_VERSION = "0.4.2"
 
 FACEBOOK_PROFILE_DIRECTORY = (
     PROJECT_ROOT
@@ -33,7 +41,11 @@ FACEBOOK_PROFILE_DIRECTORY = (
 
 MIN_IMAGE_WIDTH = 250
 MIN_IMAGE_HEIGHT = 250
-MAX_PREVIEW_IMAGES = 20
+MIN_RENDERED_WIDTH = 100
+MIN_RENDERED_HEIGHT = 100
+
+MAX_PREVIEW_IMAGES = 30
+MIN_CONTAINER_OVERLAP = 0.30
 
 POST_CONTAINER_SELECTORS = (
     "div[role='dialog'] div[role='article']",
@@ -43,22 +55,13 @@ POST_CONTAINER_SELECTORS = (
     "div[role='main']",
 )
 
-PROFILE_CACHE_DIRECTORIES = (
-    "GPUPersistentCache",
-    "ShaderCache",
-    "GrShaderCache",
-    "DawnCache",
-    "GraphiteDawnCache",
-)
-
 IGNORED_ALT_TEXT_PARTS = (
     "profile picture",
     "ảnh đại diện",
     "avatar",
     "emoji",
-    "facebook",
-    "logo",
-    "icon",
+    "facebook logo",
+    "logo facebook",
     "biểu tượng",
     "sticker",
 )
@@ -68,21 +71,28 @@ IGNORED_URL_PARTS = (
     "rsrc.php",
     "static.xx.fbcdn.net",
     "/safe_image.php",
-    "profile",
 )
 
 
-def normalize_text(value: str | None) -> str:
-    """Normalize text for stable content comparison."""
+def normalize_text(
+    value: str | None,
+) -> str:
+    """Normalize whitespace for stable text comparison."""
     if not value:
         return ""
 
-    return " ".join(value.split()).strip()
+    return " ".join(
+        value.split()
+    ).strip()
 
 
-def tokenize_text(value: str) -> set[str]:
-    """Create normalized text tokens used for container scoring."""
-    normalized = normalize_text(value).lower()
+def tokenize_text(
+    value: str,
+) -> set[str]:
+    """Create normalized tokens for post-container matching."""
+    normalized = normalize_text(
+        value
+    ).lower()
 
     tokens = re.findall(
         r"[0-9a-zA-ZÀ-ỹ]+",
@@ -100,10 +110,11 @@ def calculate_text_overlap(
     reference_text: str,
     candidate_text: str,
 ) -> float:
-    """Calculate token overlap between cleaned text and a DOM container."""
+    """Calculate token overlap between two text values."""
     reference_tokens = tokenize_text(
         reference_text
     )
+
     candidate_tokens = tokenize_text(
         candidate_text
     )
@@ -116,85 +127,42 @@ def calculate_text_overlap(
         & candidate_tokens
     )
 
-    return len(matching_tokens) / len(
-        reference_tokens
+    return (
+        len(matching_tokens)
+        / len(reference_tokens)
     )
 
 
-def remove_directory_safely(
-    directory: Path,
-) -> None:
-    """Remove one cache directory without failing the full process."""
-    if not directory.exists():
-        return
-
-    try:
-        shutil.rmtree(directory)
-        print(
-            f"Removed browser cache directory: {directory.name}"
-        )
-    except PermissionError:
-        print(
-            "Warning: browser cache directory is still locked: "
-            f"{directory}"
-        )
-    except OSError as error:
-        print(
-            "Warning: browser cache directory could not be removed: "
-            f"{directory}"
-        )
-        print(
-            f"Details: {error}"
-        )
-
-
-def clean_browser_profile_cache() -> None:
-    """Remove disposable browser cache while preserving login data."""
-    if not FACEBOOK_PROFILE_DIRECTORY.exists():
-        raise RuntimeError(
-            "The Facebook Playwright profile directory "
-            "does not exist: "
-            f"{FACEBOOK_PROFILE_DIRECTORY}"
-        )
-
-    print()
-    print("Cleaning disposable browser profile cache...")
-
-    for directory_name in PROFILE_CACHE_DIRECTORIES:
-        remove_directory_safely(
-            FACEBOOK_PROFILE_DIRECTORY
-            / directory_name
-        )
-
-    for temporary_directory in (
-        FACEBOOK_PROFILE_DIRECTORY.glob(
-            "*.CHROME_DELETE"
-        )
-    ):
-        remove_directory_safely(
-            temporary_directory
-        )
-
-    print(
-        "Browser profile cache cleanup finished."
-    )
-
-
-def get_collected_raw_pages(
+def get_cleaned_raw_pages(
     repository: SupabaseRepository,
     batch_id: str,
 ) -> list[dict[str, Any]]:
-    """Return cleaned Facebook pages available for image detection."""
+    """Return cleaned Facebook posts available for image inspection."""
     response = (
-        repository.client.table("raw_pages")
+        repository.client
+        .table("raw_pages")
         .select(
-            "raw_page_id, source_url_id, page_url, "
-            "raw_title, raw_text, cleaned_text, "
-            "cleaning_status, collected_at"
+            "raw_page_id, "
+            "source_url_id, "
+            "page_url, "
+            "raw_title, "
+            "raw_text, "
+            "cleaned_text, "
+            "cleaning_status, "
+            "collected_at"
         )
-        .eq("batch_id", batch_id)
-        .eq("page_type", "FACEBOOK_POST")
-        .eq("cleaning_status", "CLEANED")
+        .eq(
+            "batch_id",
+            batch_id,
+        )
+        .eq(
+            "page_type",
+            "FACEBOOK_POST",
+        )
+        .eq(
+            "cleaning_status",
+            "CLEANED",
+        )
         .order(
             "collected_at",
             desc=True,
@@ -208,14 +176,14 @@ def get_collected_raw_pages(
 def select_raw_page(
     raw_pages: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Allow the user to select one collected Facebook post."""
+    """Allow the user to select one Facebook post."""
     if not raw_pages:
         raise RuntimeError(
             "No cleaned Facebook raw pages were found."
         )
 
     print()
-    print("Collected Facebook pages:")
+    print("Cleaned Facebook pages:")
 
     for index, raw_page in enumerate(
         raw_pages,
@@ -227,7 +195,9 @@ def select_raw_page(
         )
 
         print()
-        print(f"[{index}] {title}")
+        print(
+            f"[{index}] {title}"
+        )
         print(
             f"    URL: {raw_page.get('page_url')}"
         )
@@ -247,7 +217,10 @@ def select_raw_page(
         return raw_pages[0]
 
     try:
-        selected_index = int(selection) - 1
+        selected_index = (
+            int(selection) - 1
+        )
+
     except ValueError as error:
         raise ValueError(
             "The selected page number must be numeric."
@@ -265,44 +238,81 @@ def select_raw_page(
     return raw_pages[selected_index]
 
 
+def open_browser_context(
+    playwright: Any,
+) -> BrowserContext:
+    """Open Google Chrome using the persistent Facebook profile."""
+    if not FACEBOOK_PROFILE_DIRECTORY.exists():
+        raise RuntimeError(
+            "The persistent Facebook profile "
+            "does not exist: "
+            f"{FACEBOOK_PROFILE_DIRECTORY}"
+        )
+
+    return playwright.chromium.launch_persistent_context(
+        user_data_dir=str(
+            FACEBOOK_PROFILE_DIRECTORY
+        ),
+        channel="chrome",
+        headless=False,
+        no_viewport=True,
+        chromium_sandbox=True,
+        ignore_default_args=[
+            "--no-sandbox",
+        ],
+        args=[
+            "--start-maximized",
+            "--disable-gpu-shader-disk-cache",
+        ],
+    )
+
+
+def get_active_page(
+    context: BrowserContext,
+) -> Page:
+    """Return the first existing page or create a new page."""
+    if context.pages:
+        return context.pages[0]
+
+    return context.new_page()
+
+
 def wait_for_facebook_render(
     page: Page,
 ) -> None:
-    """Wait until the Facebook page has rendered usable content."""
-    page.wait_for_load_state(
-        "domcontentloaded"
-    )
-
+    """Wait until Facebook has rendered visible page content."""
     try:
         page.wait_for_selector(
             "body",
             state="visible",
             timeout=30_000,
         )
+
     except PlaywrightTimeoutError as error:
         raise RuntimeError(
             "Facebook body did not become visible."
         ) from error
 
-    page.wait_for_timeout(7_000)
+    page.wait_for_timeout(
+        8_000
+    )
 
 
 def get_container_text(
     container: Locator,
 ) -> str:
-    """Read normalized text from one candidate container."""
+    """Read normalized visible text from one container."""
     try:
         text = container.evaluate(
             """
-            element => {
-                return (
-                    element.innerText
-                    || element.textContent
-                    || ""
-                );
-            }
+            element => (
+                element.innerText
+                || element.textContent
+                || ""
+            )
             """
         )
+
     except Exception:
         return ""
 
@@ -315,16 +325,16 @@ def find_best_post_container(
     page: Page,
     cleaned_text: str,
 ) -> tuple[Locator, float, str]:
-    """Find the visible DOM container matching the collected post text."""
+    """Find the visible DOM container matching the saved post."""
     best_container: Locator | None = None
     best_score = 0.0
     best_selector = ""
 
-    seen_texts: set[str] = set()
+    seen_text_keys: set[str] = set()
 
     print()
     print(
-        "Searching for the target post container..."
+        "Searching for the target Facebook post container..."
     )
 
     for selector in POST_CONTAINER_SELECTORS:
@@ -332,24 +342,35 @@ def find_best_post_container(
             selector
         )
 
-        container_count = containers.count()
-
-        print(
-            f"Selector: {selector} "
-            f"-> containers found: {container_count}"
+        container_count = (
+            containers.count()
         )
 
-        for index in range(container_count):
-            container = containers.nth(index)
+        print(
+            f"Selector: {selector}"
+        )
+        print(
+            f"Containers found: {container_count}"
+        )
+
+        for index in range(
+            container_count
+        ):
+            container = containers.nth(
+                index
+            )
 
             try:
                 if not container.is_visible():
                     continue
+
             except Exception:
                 continue
 
-            candidate_text = get_container_text(
-                container
+            candidate_text = (
+                get_container_text(
+                    container
+                )
             )
 
             if len(candidate_text) < 80:
@@ -357,14 +378,18 @@ def find_best_post_container(
 
             text_key = candidate_text[:500]
 
-            if text_key in seen_texts:
+            if text_key in seen_text_keys:
                 continue
 
-            seen_texts.add(text_key)
+            seen_text_keys.add(
+                text_key
+            )
 
-            overlap_score = calculate_text_overlap(
-                reference_text=cleaned_text,
-                candidate_text=candidate_text,
+            overlap_score = (
+                calculate_text_overlap(
+                    reference_text=cleaned_text,
+                    candidate_text=candidate_text,
+                )
             )
 
             print(
@@ -384,10 +409,11 @@ def find_best_post_container(
             "could be identified."
         )
 
-    if best_score < 0.30:
+    if best_score < MIN_CONTAINER_OVERLAP:
         raise RuntimeError(
-            "A container was found, but its text overlap "
-            f"was too low: {best_score:.3f}"
+            "A Facebook container was found, "
+            "but its text overlap was too low: "
+            f"{best_score:.3f}"
         )
 
     print()
@@ -411,51 +437,81 @@ def find_best_post_container(
 def extract_image_candidates(
     container: Locator,
 ) -> list[dict[str, Any]]:
-    """Extract image attributes from the selected post container."""
-    images = container.locator("img")
+    """Extract image metadata from the selected post container."""
+    images = container.locator(
+        "img"
+    )
 
     image_data = images.evaluate_all(
         """
         elements => elements.map((image, index) => {
-            const rect = image.getBoundingClientRect();
-            const computedStyle =
+            const rect =
+                image.getBoundingClientRect();
+
+            const style =
                 window.getComputedStyle(image);
+
+            const parentAnchor =
+                image.closest("a");
 
             return {
                 dom_index: index,
+
                 src:
                     image.currentSrc
                     || image.src
                     || "",
+
+                src_attribute:
+                    image.getAttribute("src")
+                    || "",
+
                 alt:
                     image.alt
                     || "",
-                width_attribute:
-                    image.getAttribute("width"),
-                height_attribute:
-                    image.getAttribute("height"),
+
                 natural_width:
-                    image.naturalWidth
-                    || 0,
+                    Number(
+                        image.naturalWidth
+                        || 0
+                    ),
+
                 natural_height:
-                    image.naturalHeight
-                    || 0,
+                    Number(
+                        image.naturalHeight
+                        || 0
+                    ),
+
                 rendered_width:
-                    Math.round(rect.width || 0),
+                    Math.round(
+                        rect.width
+                        || 0
+                    ),
+
                 rendered_height:
-                    Math.round(rect.height || 0),
+                    Math.round(
+                        rect.height
+                        || 0
+                    ),
+
                 visible:
                     rect.width > 0
                     && rect.height > 0
-                    && computedStyle.visibility
-                        !== "hidden"
-                    && computedStyle.display
-                        !== "none",
-                loading:
-                    image.loading
-                    || "",
+                    && style.display !== "none"
+                    && style.visibility !== "hidden"
+                    && style.opacity !== "0",
+
                 parent_link:
-                    image.closest("a")?.href
+                    parentAnchor
+                    ? parentAnchor.href
+                    : "",
+
+                role:
+                    image.getAttribute("role")
+                    || "",
+
+                aria_label:
+                    image.getAttribute("aria-label")
                     || ""
             };
         })
@@ -471,13 +527,15 @@ def extract_image_candidates(
 def is_http_image_url(
     url: str,
 ) -> bool:
-    """Return True for usable HTTP or HTTPS image URLs."""
+    """Return True for HTTP and HTTPS image URLs."""
     if not url:
         return False
 
-    parsed = urlparse(url)
+    parsed_url = urlparse(
+        url
+    )
 
-    return parsed.scheme in {
+    return parsed_url.scheme in {
         "http",
         "https",
     }
@@ -486,38 +544,57 @@ def is_http_image_url(
 def classify_image_candidate(
     image: dict[str, Any],
 ) -> tuple[str, list[str]]:
-    """Classify one image candidate using conservative rules."""
+    """Classify one Facebook image conservatively."""
     reasons: list[str] = []
 
-    src = str(
-        image.get("src") or ""
+    source_url = str(
+        image.get("src")
+        or ""
     ).strip()
 
-    alt = normalize_text(
-        str(image.get("alt") or "")
+    alt_text = normalize_text(
+        str(
+            image.get("alt")
+            or ""
+        )
+    )
+
+    aria_label = normalize_text(
+        str(
+            image.get("aria_label")
+            or ""
+        )
     )
 
     natural_width = int(
-        image.get("natural_width") or 0
+        image.get("natural_width")
+        or 0
     )
+
     natural_height = int(
-        image.get("natural_height") or 0
+        image.get("natural_height")
+        or 0
     )
 
     rendered_width = int(
-        image.get("rendered_width") or 0
+        image.get("rendered_width")
+        or 0
     )
+
     rendered_height = int(
-        image.get("rendered_height") or 0
+        image.get("rendered_height")
+        or 0
     )
 
     visible = bool(
         image.get("visible")
     )
 
-    if not is_http_image_url(src):
+    if not is_http_image_url(
+        source_url
+    ):
         reasons.append(
-            "The image does not have an HTTP URL."
+            "The image does not have a valid HTTP URL."
         )
         return "REJECTED", reasons
 
@@ -527,23 +604,36 @@ def classify_image_candidate(
         )
         return "REJECTED", reasons
 
-    src_lower = src.lower()
-    alt_lower = alt.lower()
+    source_url_lower = (
+        source_url.lower()
+    )
 
-    for ignored_part in IGNORED_URL_PARTS:
-        if ignored_part in src_lower:
+    combined_description = (
+        f"{alt_text} {aria_label}"
+    ).lower()
+
+    for ignored_url_part in (
+        IGNORED_URL_PARTS
+    ):
+        if ignored_url_part in source_url_lower:
             reasons.append(
-                "The image URL resembles a Facebook "
-                f"interface asset: {ignored_part}"
+                "The URL resembles a Facebook "
+                "interface asset: "
+                f"{ignored_url_part}"
             )
             return "REJECTED", reasons
 
-    for ignored_part in IGNORED_ALT_TEXT_PARTS:
-        if ignored_part in alt_lower:
+    for ignored_alt_part in (
+        IGNORED_ALT_TEXT_PARTS
+    ):
+        if (
+            ignored_alt_part
+            in combined_description
+        ):
             reasons.append(
-                "The image alternative text resembles "
-                "an interface or avatar image: "
-                f"{ignored_part}"
+                "The description resembles an avatar "
+                "or interface image: "
+                f"{ignored_alt_part}"
             )
             return "REJECTED", reasons
 
@@ -552,14 +642,14 @@ def classify_image_candidate(
         or natural_height < MIN_IMAGE_HEIGHT
     ):
         reasons.append(
-            "The natural image dimensions are below "
+            "The natural dimensions are below "
             f"{MIN_IMAGE_WIDTH} x {MIN_IMAGE_HEIGHT}."
         )
         return "REJECTED", reasons
 
     if (
-        rendered_width < 100
-        or rendered_height < 100
+        rendered_width < MIN_RENDERED_WIDTH
+        or rendered_height < MIN_RENDERED_HEIGHT
     ):
         reasons.append(
             "The rendered image is too small."
@@ -567,7 +657,8 @@ def classify_image_candidate(
         return "REJECTED", reasons
 
     aspect_ratio = (
-        natural_width / natural_height
+        natural_width
+        / natural_height
         if natural_height
         else 0
     )
@@ -577,7 +668,8 @@ def classify_image_candidate(
         or aspect_ratio < 0.20
     ):
         reasons.append(
-            "The image aspect ratio is unusually extreme."
+            "The image has an unusually extreme "
+            "aspect ratio."
         )
         return "REVIEW_REQUIRED", reasons
 
@@ -588,25 +680,56 @@ def classify_image_candidate(
     return "CANDIDATE", reasons
 
 
+def normalize_image_identity(
+    image_url: str,
+) -> str:
+    """Create a stable identity for duplicate URL detection."""
+    if not image_url:
+        return ""
+
+    parsed_url = urlparse(
+        image_url
+    )
+
+    return (
+        f"{parsed_url.scheme}://"
+        f"{parsed_url.netloc}"
+        f"{parsed_url.path}"
+    )
+
+
 def remove_duplicate_images(
     images: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Remove duplicate image URLs while preserving order."""
-    unique_images: list[dict[str, Any]] = []
-    seen_urls: set[str] = set()
+    unique_images: list[
+        dict[str, Any]
+    ] = []
+
+    seen_identities: set[str] = set()
 
     for image in images:
-        src = str(
-            image.get("src") or ""
+        source_url = str(
+            image.get("src")
+            or ""
         ).strip()
 
-        if (
-            not src
-            or src in seen_urls
-        ):
+        identity = (
+            normalize_image_identity(
+                source_url
+            )
+        )
+
+        if not identity:
             continue
 
-        seen_urls.add(src)
+        if identity in seen_identities:
+            continue
+
+        seen_identities.add(
+            identity
+        )
+
         unique_images.append(
             image
         )
@@ -617,28 +740,35 @@ def remove_duplicate_images(
 def score_image_candidate(
     image: dict[str, Any],
 ) -> int:
-    """Calculate a simple ranking score for preview order."""
+    """Calculate ranking score for preview ordering."""
     natural_width = int(
-        image.get("natural_width") or 0
+        image.get("natural_width")
+        or 0
     )
+
     natural_height = int(
-        image.get("natural_height") or 0
+        image.get("natural_height")
+        or 0
     )
 
     rendered_width = int(
-        image.get("rendered_width") or 0
+        image.get("rendered_width")
+        or 0
     )
+
     rendered_height = int(
-        image.get("rendered_height") or 0
+        image.get("rendered_height")
+        or 0
     )
 
     status = str(
-        image.get("candidate_status") or ""
+        image.get("candidate_status")
+        or ""
     )
 
     status_score = {
-        "CANDIDATE": 1_000_000,
-        "REVIEW_REQUIRED": 500_000,
+        "CANDIDATE": 10_000_000,
+        "REVIEW_REQUIRED": 5_000_000,
         "REJECTED": 0,
     }.get(
         status,
@@ -665,9 +795,11 @@ def score_image_candidate(
 def prepare_image_candidates(
     raw_images: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Classify, deduplicate, and rank extracted images."""
-    unique_images = remove_duplicate_images(
-        raw_images
+    """Classify, deduplicate and rank image candidates."""
+    unique_images = (
+        remove_duplicate_images(
+            raw_images
+        )
     )
 
     prepared_images: list[
@@ -699,7 +831,8 @@ def prepare_image_candidates(
 
     prepared_images.sort(
         key=lambda item: int(
-            item.get("score") or 0
+            item.get("score")
+            or 0
         ),
         reverse=True,
     )
@@ -710,7 +843,7 @@ def prepare_image_candidates(
 def print_image_candidates(
     images: list[dict[str, Any]],
 ) -> None:
-    """Print detailed image candidate information."""
+    """Print image detection details to CMD."""
     if not images:
         print()
         print(
@@ -790,6 +923,10 @@ def print_image_candidates(
             f"{image.get('alt') or '[empty]'}"
         )
         print(
+            "ARIA label: "
+            f"{image.get('aria_label') or '[empty]'}"
+        )
+        print(
             "Parent link: "
             f"{image.get('parent_link') or '[none]'}"
         )
@@ -800,15 +937,15 @@ def print_image_candidates(
             image.get("src")
         )
 
+        print(
+            "Reasons:"
+        )
+
         reasons = (
             image.get(
                 "classification_reasons"
             )
             or []
-        )
-
-        print(
-            "Reasons:"
         )
 
         for reason in reasons:
@@ -821,9 +958,12 @@ def add_visual_labels(
     container: Locator,
     images: list[dict[str, Any]],
 ) -> None:
-    """Add temporary labels around image candidates in the browser."""
-    status_by_url = {
-        str(image.get("src")): {
+    """Add temporary visual labels to images in Chrome."""
+    metadata_by_url = {
+        str(
+            image.get("src")
+            or ""
+        ): {
             "status": image.get(
                 "candidate_status"
             ),
@@ -839,7 +979,7 @@ def add_visual_labels(
         "img"
     ).evaluate_all(
         """
-        (elements, statusByUrl) => {
+        (elements, metadataByUrl) => {
             elements.forEach(image => {
                 const source =
                     image.currentSrc
@@ -847,19 +987,11 @@ def add_visual_labels(
                     || "";
 
                 const metadata =
-                    statusByUrl[source];
+                    metadataByUrl[source];
 
                 if (!metadata) {
                     return;
                 }
-
-                image.style.outline =
-                    metadata.status === "CANDIDATE"
-                    ? "5px solid green"
-                    : metadata.status
-                        === "REVIEW_REQUIRED"
-                    ? "5px solid orange"
-                    : "3px solid red";
 
                 const parent =
                     image.parentElement;
@@ -868,13 +1000,23 @@ def add_visual_labels(
                     return;
                 }
 
-                const existingLabel =
+                const outline =
+                    metadata.status === "CANDIDATE"
+                    ? "5px solid green"
+                    : metadata.status === "REVIEW_REQUIRED"
+                    ? "5px solid orange"
+                    : "3px solid red";
+
+                image.style.outline =
+                    outline;
+
+                const oldLabel =
                     parent.querySelector(
                         ":scope > .tsyc-image-label"
                     );
 
-                if (existingLabel) {
-                    existingLabel.remove();
+                if (oldLabel) {
+                    oldLabel.remove();
                 }
 
                 const label =
@@ -891,16 +1033,25 @@ def add_visual_labels(
 
                 label.style.background =
                     "black";
+
                 label.style.color =
                     "white";
+
                 label.style.fontSize =
                     "14px";
+
                 label.style.fontWeight =
                     "bold";
+
                 label.style.padding =
                     "4px 8px";
+
                 label.style.margin =
                     "4px 0";
+
+                label.style.position =
+                    "relative";
+
                 label.style.zIndex =
                     "999999";
 
@@ -911,13 +1062,12 @@ def add_visual_labels(
             });
         }
         """,
-        status_by_url,
+        metadata_by_url,
     )
 
     print()
     print(
-        "Temporary image labels were added "
-        "to the browser page:"
+        "Temporary labels were added in Chrome:"
     )
     print(
         "  Green  = CANDIDATE"
@@ -930,52 +1080,24 @@ def add_visual_labels(
     )
 
 
-def open_browser_context(
-    playwright: Any,
-) -> BrowserContext:
-    """Open Google Chrome with the persistent Facebook login profile."""
-    if not FACEBOOK_PROFILE_DIRECTORY.exists():
-        raise RuntimeError(
-            "The Facebook Playwright profile "
-            "directory does not exist: "
-            f"{FACEBOOK_PROFILE_DIRECTORY}"
-        )
-
-    return (
-        playwright.chromium
-        .launch_persistent_context(
-            user_data_dir=str(
-                FACEBOOK_PROFILE_DIRECTORY
-            ),
-            channel="chrome",
-            headless=False,
-            no_viewport=True,
-            args=[
-                "--start-maximized",
-                "--disable-gpu-shader-disk-cache",
-                "--disable-features=OptimizationHints",
-                "--disable-background-networking",
-            ],
-        )
-    )
-
-
 def inspect_facebook_images(
     page: Page,
     raw_page: dict[str, Any],
 ) -> None:
-    """Open one permalink and inspect images in its post container."""
+    """Inspect images for one cleaned Facebook post."""
     page_url = str(
-        raw_page.get("page_url") or ""
+        raw_page.get("page_url")
+        or ""
     ).strip()
 
     cleaned_text = str(
-        raw_page.get("cleaned_text") or ""
+        raw_page.get("cleaned_text")
+        or ""
     ).strip()
 
     if not page_url:
         raise RuntimeError(
-            "The selected raw page has no page URL."
+            "The selected raw page has no URL."
         )
 
     if not cleaned_text:
@@ -1013,19 +1135,25 @@ def inspect_facebook_images(
         page
     )
 
-    container, overlap_score, selector = (
-        find_best_post_container(
-            page=page,
-            cleaned_text=cleaned_text,
+    (
+        container,
+        overlap_score,
+        selector,
+    ) = find_best_post_container(
+        page=page,
+        cleaned_text=cleaned_text,
+    )
+
+    raw_images = (
+        extract_image_candidates(
+            container
         )
     )
 
-    raw_images = extract_image_candidates(
-        container
-    )
-
-    prepared_images = prepare_image_candidates(
-        raw_images
+    prepared_images = (
+        prepare_image_candidates(
+            raw_images
+        )
     )
 
     print_image_candidates(
@@ -1037,7 +1165,7 @@ def inspect_facebook_images(
         images=prepared_images,
     )
 
-    candidate_images = [
+    usable_images = [
         image
         for image in prepared_images
         if image.get(
@@ -1064,37 +1192,47 @@ def inspect_facebook_images(
     )
     print(
         "Usable image candidates: "
-        f"{len(candidate_images)}"
+        f"{len(usable_images)}"
     )
     print()
     print(
-        "No images have been downloaded, "
-        "uploaded, or saved to Supabase."
+        "No image was downloaded."
     )
     print(
-        "Review the browser and CMD output."
+        "No image was uploaded to Supabase."
+    )
+    print(
+        "No product_images record was created."
+    )
+    print()
+    print(
+        "Review the labeled images in Chrome."
     )
 
     input(
-        "Press Enter after you finish reviewing "
-        "the highlighted images..."
+        "Press Enter after image review is complete..."
     )
 
 
 def main() -> None:
-    """Run Facebook post image detection for one cleaned page."""
+    """Run image detection for one cleaned Facebook post."""
     load_dotenv()
 
     print(
         "Facebook post image detector started."
     )
+    print(
+        f"Version: {COLLECTOR_VERSION}"
+    )
 
-    clean_browser_profile_cache()
+    repository = (
+        SupabaseRepository()
+    )
 
-    repository = SupabaseRepository()
-
-    batch = repository.get_batch_by_code(
-        BATCH_CODE
+    batch = (
+        repository.get_batch_by_code(
+            BATCH_CODE
+        )
     )
 
     if batch is None:
@@ -1102,7 +1240,7 @@ def main() -> None:
             f"Batch was not found: {BATCH_CODE}"
         )
 
-    raw_pages = get_collected_raw_pages(
+    raw_pages = get_cleaned_raw_pages(
         repository=repository,
         batch_id=batch["batch_id"],
     )
@@ -1112,8 +1250,10 @@ def main() -> None:
         f"{len(raw_pages)}"
     )
 
-    selected_raw_page = select_raw_page(
-        raw_pages
+    selected_raw_page = (
+        select_raw_page(
+            raw_pages
+        )
     )
 
     with sync_playwright() as playwright:
@@ -1122,12 +1262,8 @@ def main() -> None:
         )
 
         try:
-            pages = context.pages
-
-            page = (
-                pages[0]
-                if pages
-                else context.new_page()
+            page = get_active_page(
+                context
             )
 
             inspect_facebook_images(
@@ -1151,8 +1287,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print()
         print(
-            "Image detection was cancelled "
-            "by the user."
+            "Image detection was cancelled."
         )
         sys.exit(130)
 
