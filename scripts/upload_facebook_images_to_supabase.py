@@ -17,7 +17,7 @@ BATCH_CODE = "FB-2026-001"
 STORAGE_BUCKET = "product-images"
 
 UPLOADER_NAME = "facebook_image_supabase_uploader"
-UPLOADER_VERSION = "0.6.3"
+UPLOADER_VERSION = "0.7.0"
 
 LOCAL_IMAGE_ROOT = (
     PROJECT_ROOT
@@ -661,36 +661,615 @@ def upload_one_image(
     return "UPLOADED"
 
 
-def print_files_ready_for_upload(
-    metadata_files: list[Path],
-) -> None:
-    """Print local metadata files ready for upload."""
-    print()
-    print(
-        "Files ready for upload:"
+
+def build_metadata_item(
+    metadata_path: Path,
+) -> dict[str, Any]:
+    """Load one metadata file and return a lightweight selection item."""
+    metadata = load_json(
+        metadata_path
     )
 
-    for index, metadata_path in enumerate(
-        metadata_files,
-        start=1,
-    ):
+    raw_page_id = str(
+        metadata.get("raw_page_id")
+        or ""
+    ).strip()
+
+    if not raw_page_id:
+        raise RuntimeError(
+            "Metadata does not contain raw_page_id: "
+            f"{metadata_path}"
+        )
+
+    return {
+        "metadata_path": metadata_path,
+        "metadata": metadata,
+        "raw_page_id": raw_page_id,
+        "source_url_id": str(
+            metadata.get("source_url_id")
+            or ""
+        ).strip(),
+        "facebook_post_url": str(
+            metadata.get("facebook_post_url")
+            or ""
+        ).strip(),
+        "image_hash": str(
+            metadata.get("sha256")
+            or ""
+        ).strip().lower(),
+        "width": metadata.get(
+            "natural_width"
+        ),
+        "height": metadata.get(
+            "natural_height"
+        ),
+    }
+
+
+def build_metadata_items(
+    metadata_files: list[Path],
+) -> list[dict[str, Any]]:
+    """Load all metadata files and skip invalid selection entries."""
+    items: list[dict[str, Any]] = []
+
+    for metadata_path in metadata_files:
         try:
-            display_path = (
-                metadata_path.relative_to(
-                    PROJECT_ROOT
+            items.append(
+                build_metadata_item(
+                    metadata_path
                 )
             )
 
-        except ValueError:
-            display_path = metadata_path
+        except Exception as error:
+            print()
+            print(
+                "Skipping invalid metadata file:"
+            )
+            print(
+                f"  File: {metadata_path}"
+            )
+            print(
+                f"  Error: {error}"
+            )
+
+    return items
+
+
+def group_metadata_items(
+    items: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Group metadata items by raw_page_id."""
+    groups: dict[
+        str,
+        list[dict[str, Any]],
+    ] = {}
+
+    for item in items:
+        raw_page_id = item[
+            "raw_page_id"
+        ]
+
+        groups.setdefault(
+            raw_page_id,
+            [],
+        ).append(
+            item
+        )
+
+    for raw_page_id in groups:
+        groups[raw_page_id] = sorted(
+            groups[raw_page_id],
+            key=lambda item: str(
+                item["metadata_path"]
+            ),
+        )
+
+    return groups
+
+
+def get_candidate_for_raw_page(
+    repository: SupabaseRepository,
+    raw_page_id: str,
+) -> dict[str, Any] | None:
+    """Return one candidate linked to the selected raw page."""
+    response = (
+        repository.client
+        .table("product_candidates")
+        .select(
+            "candidate_id, "
+            "candidate_code, "
+            "extracted_title, "
+            "workflow_status"
+        )
+        .eq(
+            "raw_page_id",
+            raw_page_id,
+        )
+        .order(
+            "created_at",
+            desc=True,
+        )
+        .limit(1)
+        .execute()
+    )
+
+    records = response.data or []
+
+    if not records:
+        return None
+
+    return records[0]
+
+
+def get_raw_page_summary(
+    repository: SupabaseRepository,
+    raw_page_id: str,
+) -> dict[str, Any] | None:
+    """Return basic source details for one raw page."""
+    response = (
+        repository.client
+        .table("raw_pages")
+        .select(
+            "raw_page_id, "
+            "page_url, "
+            "raw_title, "
+            "collected_at"
+        )
+        .eq(
+            "raw_page_id",
+            raw_page_id,
+        )
+        .limit(1)
+        .execute()
+    )
+
+    records = response.data or []
+
+    if not records:
+        return None
+
+    return records[0]
+
+
+def select_raw_page_group(
+    repository: SupabaseRepository,
+    groups: dict[str, list[dict[str, Any]]],
+) -> tuple[
+    str,
+    list[dict[str, Any]],
+    dict[str, Any] | None,
+]:
+    """Allow the user to select exactly one raw-page image group."""
+    if not groups:
+        raise RuntimeError(
+            "No valid image metadata groups were found."
+        )
+
+    group_entries: list[
+        tuple[
+            str,
+            list[dict[str, Any]],
+            dict[str, Any] | None,
+        ]
+    ] = []
+
+    print()
+    print(
+        "Facebook posts with local images:"
+    )
+
+    for index, raw_page_id in enumerate(
+        sorted(groups),
+        start=1,
+    ):
+        items = groups[
+            raw_page_id
+        ]
+
+        candidate = get_candidate_for_raw_page(
+            repository=repository,
+            raw_page_id=raw_page_id,
+        )
+
+        raw_page = get_raw_page_summary(
+            repository=repository,
+            raw_page_id=raw_page_id,
+        )
+
+        group_entries.append(
+            (
+                raw_page_id,
+                items,
+                candidate,
+            )
+        )
+
+        candidate_code = (
+            candidate.get(
+                "candidate_code"
+            )
+            if candidate
+            else "[not linked]"
+        )
+
+        candidate_title = (
+            candidate.get(
+                "extracted_title"
+            )
+            if candidate
+            else "[candidate not found]"
+        )
+
+        page_url = (
+            raw_page.get(
+                "page_url"
+            )
+            if raw_page
+            else (
+                items[0].get(
+                    "facebook_post_url"
+                )
+                or "[URL not found]"
+            )
+        )
+
+        print()
+        print(
+            f"[{index}] Raw page ID: {raw_page_id}"
+        )
+        print(
+            f"    Candidate: {candidate_code}"
+        )
+        print(
+            f"    Title: {candidate_title}"
+        )
+        print(
+            f"    Local images: {len(items)}"
+        )
+        print(
+            f"    URL: {page_url}"
+        )
+
+    print()
+
+    selection = input(
+        "Enter one post number to continue, "
+        "or press Enter to cancel: "
+    ).strip()
+
+    if not selection:
+        raise KeyboardInterrupt
+
+    try:
+        selected_index = int(
+            selection
+        ) - 1
+
+    except ValueError as error:
+        raise ValueError(
+            "The selected post number must be numeric."
+        ) from error
+
+    if (
+        selected_index < 0
+        or selected_index >= len(
+            group_entries
+        )
+    ):
+        raise ValueError(
+            "The selected post number is outside "
+            "the available range."
+        )
+
+    return group_entries[
+        selected_index
+    ]
+
+
+def filter_database_duplicates(
+    repository: SupabaseRepository,
+    items: list[dict[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """Split local metadata into uploadable and existing database images."""
+    uploadable: list[
+        dict[str, Any]
+    ] = []
+
+    duplicates: list[
+        dict[str, Any]
+    ] = []
+
+    for item in items:
+        existing_record = (
+            find_existing_database_record(
+                repository=repository,
+                raw_page_id=item[
+                    "raw_page_id"
+                ],
+                image_hash=item[
+                    "image_hash"
+                ],
+            )
+        )
+
+        if existing_record is None:
+            uploadable.append(
+                item
+            )
+
+        else:
+            duplicate_item = dict(
+                item
+            )
+
+            duplicate_item[
+                "existing_record"
+            ] = existing_record
+
+            duplicates.append(
+                duplicate_item
+            )
+
+    return (
+        uploadable,
+        duplicates,
+    )
+
+
+def print_existing_duplicates(
+    duplicates: list[dict[str, Any]],
+) -> None:
+    """Print local images already represented in product_images."""
+    if not duplicates:
+        return
+
+    print()
+    print(
+        "Images already in the database "
+        "and excluded from this upload:"
+    )
+
+    for duplicate in duplicates:
+        existing = duplicate[
+            "existing_record"
+        ]
 
         print(
-            f"[{index}] {display_path}"
+            "- "
+            f"{duplicate['metadata_path'].name} "
+            "-> image_id "
+            f"{existing.get('image_id')} "
+            f"({existing.get('image_status')})"
         )
 
 
+def print_selectable_images(
+    items: list[dict[str, Any]],
+) -> None:
+    """Print uploadable images from the selected raw page."""
+    print()
+    print(
+        "Images available for selection:"
+    )
+
+    for index, item in enumerate(
+        items,
+        start=1,
+    ):
+        metadata_path = item[
+            "metadata_path"
+        ]
+
+        try:
+            image_path = resolve_local_image_path(
+                metadata=item[
+                    "metadata"
+                ],
+                metadata_path=metadata_path,
+            )
+
+            image_name = image_path.name
+
+        except Exception:
+            image_name = "[image file unresolved]"
+
+        print(
+            f"[{index}] {metadata_path.name}"
+        )
+        print(
+            f"    Image: {image_name}"
+        )
+        print(
+            "    Size: "
+            f"{item.get('width')} x "
+            f"{item.get('height')}"
+        )
+        print(
+            "    SHA-256: "
+            f"{item.get('image_hash')}"
+        )
+
+
+def parse_image_selection(
+    selection: str,
+    item_count: int,
+) -> list[int]:
+    """
+    Parse ALL, one number, comma-separated numbers, or ranges.
+
+    Examples: ALL, 1, 1,3, 1-3, 1,3-5.
+    """
+    normalized = selection.strip().upper()
+
+    if normalized == "ALL":
+        return list(
+            range(item_count)
+        )
+
+    if not normalized:
+        return []
+
+    selected_indexes: set[
+        int
+    ] = set()
+
+    for token in normalized.split(","):
+        token = token.strip()
+
+        if not token:
+            continue
+
+        if "-" in token:
+            start_text, end_text = token.split(
+                "-",
+                1,
+            )
+
+            try:
+                start_number = int(
+                    start_text
+                )
+
+                end_number = int(
+                    end_text
+                )
+
+            except ValueError as error:
+                raise ValueError(
+                    "Image ranges must contain numeric values."
+                ) from error
+
+            if start_number > end_number:
+                raise ValueError(
+                    "Image range start cannot exceed its end."
+                )
+
+            numbers = range(
+                start_number,
+                end_number + 1,
+            )
+
+        else:
+            try:
+                numbers = [
+                    int(token)
+                ]
+
+            except ValueError as error:
+                raise ValueError(
+                    "Image selection must use numbers, "
+                    "commas, ranges, or ALL."
+                ) from error
+
+        for number in numbers:
+            if number < 1 or number > item_count:
+                raise ValueError(
+                    "Selected image number is outside "
+                    "the available range: "
+                    f"{number}"
+                )
+
+            selected_indexes.add(
+                number - 1
+            )
+
+    return sorted(
+        selected_indexes
+    )
+
+
+def select_images(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Allow the user to select images from one raw page."""
+    if not items:
+        return []
+
+    print_selectable_images(
+        items
+    )
+
+    print()
+
+    selection = input(
+        "Select images using ALL, one number, "
+        "comma-separated numbers, or a range "
+        "(example: 1,3-5). "
+        "Press Enter to cancel: "
+    ).strip()
+
+    selected_indexes = parse_image_selection(
+        selection=selection,
+        item_count=len(items),
+    )
+
+    return [
+        items[index]
+        for index in selected_indexes
+    ]
+
+
+def print_final_upload_plan(
+    raw_page_id: str,
+    candidate: dict[str, Any] | None,
+    selected_items: list[dict[str, Any]],
+) -> None:
+    """Print the exact final upload plan before confirmation."""
+    print()
+    print("=" * 78)
+    print(
+        "FINAL SUPABASE UPLOAD PLAN"
+    )
+    print("=" * 78)
+    print(
+        f"Raw page ID: {raw_page_id}"
+    )
+    print(
+        "Candidate: "
+        + (
+            str(
+                candidate.get(
+                    "candidate_code"
+                )
+            )
+            if candidate
+            else "[not linked]"
+        )
+    )
+    print(
+        "Candidate title: "
+        + (
+            str(
+                candidate.get(
+                    "extracted_title"
+                )
+            )
+            if candidate
+            else "[not found]"
+        )
+    )
+    print(
+        f"Images selected: {len(selected_items)}"
+    )
+
+    for index, item in enumerate(
+        selected_items,
+        start=1,
+    ):
+        print(
+            f"[{index}] "
+            f"{item['metadata_path'].name}"
+        )
+        print(
+            "    SHA-256: "
+            f"{item['image_hash']}"
+        )
+
 def main() -> None:
-    """Upload downloaded Facebook images to Supabase."""
+    """Upload selected Facebook images from one raw page to Supabase."""
     load_dotenv()
 
     print(
@@ -721,14 +1300,64 @@ def main() -> None:
         )
         return
 
-    print_files_ready_for_upload(
+    metadata_items = build_metadata_items(
         metadata_files
+    )
+
+    groups = group_metadata_items(
+        metadata_items
+    )
+
+    (
+        selected_raw_page_id,
+        selected_group_items,
+        selected_candidate,
+    ) = select_raw_page_group(
+        repository=repository,
+        groups=groups,
+    )
+
+    (
+        uploadable_items,
+        duplicate_items,
+    ) = filter_database_duplicates(
+        repository=repository,
+        items=selected_group_items,
+    )
+
+    print_existing_duplicates(
+        duplicate_items
+    )
+
+    if not uploadable_items:
+        print()
+        print(
+            "All local images for the selected post already "
+            "exist in product_images. Nothing will be uploaded."
+        )
+        return
+
+    selected_items = select_images(
+        uploadable_items
+    )
+
+    if not selected_items:
+        print(
+            "No images were selected. "
+            "Supabase upload cancelled."
+        )
+        return
+
+    print_final_upload_plan(
+        raw_page_id=selected_raw_page_id,
+        candidate=selected_candidate,
+        selected_items=selected_items,
     )
 
     print()
 
     confirmation = input(
-        "Type UPLOAD to send these images to Supabase, "
+        "Type UPLOAD to upload only the images listed above, "
         "or press Enter to cancel: "
     ).strip().upper()
 
@@ -745,7 +1374,11 @@ def main() -> None:
         "FAILED": 0,
     }
 
-    for metadata_path in metadata_files:
+    for item in selected_items:
+        metadata_path = item[
+            "metadata_path"
+        ]
+
         try:
             status = upload_one_image(
                 repository=repository,
@@ -786,8 +1419,12 @@ def main() -> None:
         f"{results['DATABASE_RECORD_CREATED']}"
     )
     print(
-        "Database duplicates skipped: "
+        "Database duplicates skipped during upload: "
         f"{results['DUPLICATE_DATABASE']}"
+    )
+    print(
+        "Duplicates excluded before selection: "
+        f"{len(duplicate_items)}"
     )
     print(
         f"Failed: {results['FAILED']}"
