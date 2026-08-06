@@ -16,7 +16,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 MATCHER_NAME = "candidate_identity_matcher"
-MATCHER_VERSION = "1.2.0"
+MATCHER_VERSION = "1.3.0"
 
 
 def utc_now() -> str:
@@ -1060,8 +1060,807 @@ def validate_queue_item(
         )
 
 
+
+GENERIC_AUTHOR_VALUES = {
+    "nhieu tac gia",
+    "dang cap nhat",
+    "khong ro",
+    "unknown",
+    "various authors",
+}
+
+
+def is_specific_author(value: str | None) -> bool:
+    """Return True when an author value names a specific person or group."""
+    normalized = normalize_text(value)
+
+    return bool(
+        normalized
+        and normalized not in GENERIC_AUTHOR_VALUES
+    )
+
+
+def get_pending_consensus_candidate(
+    repository: SupabaseRepository,
+) -> dict[str, Any] | None:
+    """Return one pending candidate with at least two collected references."""
+    candidate_response = (
+        repository.client
+        .table("product_candidates")
+        .select(
+            "candidate_id,"
+            "candidate_code,"
+            "candidate_type,"
+            "extracted_title,"
+            "extracted_author,"
+            "possible_isbn,"
+            "verified_title,"
+            "verified_isbn,"
+            "verified_author,"
+            "verified_publisher,"
+            "verified_page_count,"
+            "verified_weight_grams,"
+            "verified_length_cm,"
+            "verified_width_cm,"
+            "verified_height_cm,"
+            "identity_status,"
+            "workflow_status,"
+            "identity_confidence,"
+            "review_required,"
+            "review_reason,"
+            "decision_reason,"
+            "source_evidence,"
+            "conflict_fields"
+        )
+        .eq(
+            "identity_status",
+            "IDENTITY_PENDING",
+        )
+        .order(
+            "updated_at",
+            desc=False,
+        )
+        .limit(50)
+        .execute()
+    )
+
+    candidates = candidate_response.data or []
+
+    for candidate in candidates:
+        candidate_id = candidate.get("candidate_id")
+
+        if not candidate_id:
+            continue
+
+        reference_response = (
+            repository.client
+            .table("product_references")
+            .select(
+                "reference_id,"
+                "candidate_id,"
+                "source_url_id,"
+                "source_type,"
+                "source_name,"
+                "source_url,"
+                "reference_title,"
+                "reference_isbn,"
+                "reference_author,"
+                "reference_publisher,"
+                "reference_page_count,"
+                "reference_weight_grams,"
+                "reference_length_cm,"
+                "reference_width_cm,"
+                "reference_height_cm,"
+                "reference_cover_price_vnd,"
+                "match_decision,"
+                "match_confidence,"
+                "source_priority,"
+                "raw_metadata,"
+                "collected_at"
+            )
+            .eq(
+                "candidate_id",
+                candidate_id,
+            )
+            .order(
+                "source_priority",
+                desc=False,
+            )
+            .order(
+                "collected_at",
+                desc=False,
+            )
+            .execute()
+        )
+
+        references = reference_response.data or []
+
+        valid_references = [
+            reference
+            for reference in references
+            if reference.get("source_url_id")
+            and reference.get("reference_title")
+        ]
+
+        if len(valid_references) >= 2:
+            return {
+                "candidate": candidate,
+                "references": valid_references,
+            }
+
+    return None
+
+
+def choose_best_reference(
+    references: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Choose the richest trusted reference for verified metadata."""
+    def score(reference: dict[str, Any]) -> tuple[int, int]:
+        metadata_score = sum(
+            1
+            for field_name in (
+                "reference_title",
+                "reference_isbn",
+                "reference_author",
+                "reference_publisher",
+                "reference_page_count",
+                "reference_weight_grams",
+                "reference_length_cm",
+                "reference_width_cm",
+                "reference_height_cm",
+            )
+            if reference.get(field_name)
+        )
+
+        if is_specific_author(
+            reference.get("reference_author")
+        ):
+            metadata_score += 3
+
+        priority = int(
+            reference.get("source_priority")
+            or 99
+        )
+
+        return (
+            metadata_score,
+            -priority,
+        )
+
+    return max(
+        references,
+        key=score,
+    )
+
+
+def calculate_consensus_match(
+    candidate: dict[str, Any],
+    references: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Calculate a multi-source identity decision for one candidate."""
+    candidate_title = candidate.get("extracted_title")
+    candidate_isbn = normalize_isbn(
+        candidate.get("possible_isbn")
+    )
+
+    reference_results: list[dict[str, Any]] = []
+    title_matches: list[dict[str, Any]] = []
+    isbn_values: set[str] = set()
+
+    for reference in references:
+        result = calculate_match(
+            candidate=candidate,
+            reference=reference,
+        )
+
+        reference_result = {
+            "reference": reference,
+            "result": result,
+        }
+
+        reference_results.append(
+            reference_result
+        )
+
+        if (
+            result["title_similarity"] >= 0.90
+            and not result["isbn_conflict"]
+        ):
+            title_matches.append(
+                reference_result
+            )
+
+        reference_isbn = normalize_isbn(
+            reference.get("reference_isbn")
+        )
+
+        if reference_isbn:
+            isbn_values.add(reference_isbn)
+
+    isbn_conflict = (
+        len(isbn_values) > 1
+        or bool(
+            candidate_isbn
+            and isbn_values
+            and candidate_isbn not in isbn_values
+        )
+    )
+
+    specific_authors = [
+        item["reference"].get("reference_author")
+        for item in title_matches
+        if is_specific_author(
+            item["reference"].get(
+                "reference_author"
+            )
+        )
+    ]
+
+    normalized_specific_authors = {
+        normalize_text(author)
+        for author in specific_authors
+        if author
+    }
+
+    author_conflict = (
+        len(normalized_specific_authors) > 1
+    )
+
+    matching_page_counts = {
+        item["reference"].get(
+            "reference_page_count"
+        )
+        for item in title_matches
+        if item["reference"].get(
+            "reference_page_count"
+        ) is not None
+    }
+
+    page_count_conflict = (
+        len(matching_page_counts) > 1
+    )
+
+    best_reference = choose_best_reference(
+        [
+            item["reference"]
+            for item in title_matches
+        ]
+        or references
+    )
+
+    if isbn_conflict:
+        decision = "NO_MATCH"
+        confidence = 0.99
+        reason = (
+            "References contain conflicting ISBN values."
+        )
+
+    elif author_conflict:
+        decision = "MANUAL_REVIEW"
+        confidence = 0.80
+        reason = (
+            "Strong title matches were found, but specific author "
+            "values conflict across references."
+        )
+
+    elif page_count_conflict:
+        decision = "MANUAL_REVIEW"
+        confidence = 0.82
+        reason = (
+            "Strong title matches were found, but page counts "
+            "conflict across references."
+        )
+
+    elif (
+        len(title_matches) >= 2
+        and specific_authors
+    ):
+        decision = "MATCH"
+        confidence = 0.96
+        reason = (
+            "Identity was confirmed by multiple independent sources "
+            "with matching titles, consistent metadata, and at least "
+            "one specific author."
+        )
+
+    elif len(title_matches) >= 2:
+        decision = "MATCH"
+        confidence = 0.92
+        reason = (
+            "Identity was confirmed by multiple independent sources "
+            "with matching titles and no material metadata conflicts."
+        )
+
+    else:
+        decision = "POSSIBLE_MATCH"
+        confidence = max(
+            (
+                item["result"]["match_confidence"]
+                for item in reference_results
+            ),
+            default=0.0,
+        )
+        reason = (
+            "Multi-source evidence is not yet sufficient for "
+            "automatic identity verification."
+        )
+
+    return {
+        "match_decision": decision,
+        "match_confidence": confidence,
+        "match_reason": reason,
+        "isbn_conflict": isbn_conflict,
+        "author_conflict": author_conflict,
+        "page_count_conflict": page_count_conflict,
+        "matching_reference_count": len(
+            title_matches
+        ),
+        "reference_results": reference_results,
+        "best_reference": best_reference,
+        "specific_author": (
+            specific_authors[0]
+            if specific_authors
+            else None
+        ),
+    }
+
+
+def print_consensus_result(
+    candidate: dict[str, Any],
+    consensus: dict[str, Any],
+) -> None:
+    """Print a multi-source identity result."""
+    print()
+    print("=" * 72)
+    print("MULTI-SOURCE IDENTITY CONSENSUS")
+    print("=" * 72)
+    print(
+        "Candidate code: "
+        f"{candidate.get('candidate_code')}"
+    )
+    print(
+        "Candidate title: "
+        f"{candidate.get('extracted_title')}"
+    )
+    print(
+        "Matching references: "
+        f"{consensus['matching_reference_count']}"
+    )
+
+    for index, item in enumerate(
+        consensus["reference_results"],
+        start=1,
+    ):
+        reference = item["reference"]
+        result = item["result"]
+
+        print()
+        print(
+            f"[{index}] "
+            f"{reference.get('source_type')} | "
+            f"{reference.get('source_name')}"
+        )
+        print(
+            "    Title: "
+            f"{reference.get('reference_title')}"
+        )
+        print(
+            "    Author: "
+            f"{reference.get('reference_author') or '[not found]'}"
+        )
+        print(
+            "    Publisher: "
+            f"{reference.get('reference_publisher') or '[not found]'}"
+        )
+        print(
+            "    Page count: "
+            f"{reference.get('reference_page_count') or '[not found]'}"
+        )
+        print(
+            "    Title similarity: "
+            f"{result['title_similarity']}"
+        )
+
+    print()
+    print(
+        "Selected verified author: "
+        f"{consensus.get('specific_author') or '[not found]'}"
+    )
+    print(
+        "Decision: "
+        f"{consensus['match_decision']}"
+    )
+    print(
+        "Confidence: "
+        f"{consensus['match_confidence']}"
+    )
+    print(
+        "Reason: "
+        f"{consensus['match_reason']}"
+    )
+
+
+def build_consensus_source_evidence(
+    candidate: dict[str, Any],
+    consensus: dict[str, Any],
+) -> dict[str, Any]:
+    """Append a multi-source consensus event to candidate evidence."""
+    existing_evidence = candidate.get(
+        "source_evidence"
+    )
+
+    source_evidence = (
+        dict(existing_evidence)
+        if isinstance(existing_evidence, dict)
+        else {}
+    )
+
+    history = source_evidence.get(
+        "identity_consensus_history"
+    )
+
+    if not isinstance(history, list):
+        history = []
+
+    event = {
+        "match_decision": consensus[
+            "match_decision"
+        ],
+        "match_confidence": consensus[
+            "match_confidence"
+        ],
+        "match_reason": consensus[
+            "match_reason"
+        ],
+        "matching_reference_count": consensus[
+            "matching_reference_count"
+        ],
+        "selected_reference_id": consensus[
+            "best_reference"
+        ].get("reference_id"),
+        "selected_author": consensus.get(
+            "specific_author"
+        ),
+        "reference_ids": [
+            item["reference"].get(
+                "reference_id"
+            )
+            for item in consensus[
+                "reference_results"
+            ]
+        ],
+        "matcher_name": MATCHER_NAME,
+        "matcher_version": MATCHER_VERSION,
+        "verified_at": utc_now(),
+    }
+
+    history.append(event)
+
+    source_evidence[
+        "identity_consensus_history"
+    ] = history
+    source_evidence[
+        "latest_identity_consensus"
+    ] = event
+
+    return source_evidence
+
+
+def update_candidate_from_consensus(
+    repository: SupabaseRepository,
+    candidate: dict[str, Any],
+    consensus: dict[str, Any],
+) -> None:
+    """Update candidate using the multi-source consensus decision."""
+    candidate_id = candidate.get(
+        "candidate_id"
+    )
+
+    if not candidate_id:
+        raise ValueError(
+            "candidate_id is required."
+        )
+
+    decision = consensus[
+        "match_decision"
+    ]
+    best_reference = consensus[
+        "best_reference"
+    ]
+
+    if decision == "MATCH":
+        missing_fields: list[str] = []
+
+        verified_isbn = (
+            best_reference.get(
+                "reference_isbn"
+            )
+            or candidate.get(
+                "possible_isbn"
+            )
+        )
+
+        verified_weight = best_reference.get(
+            "reference_weight_grams"
+        )
+
+        if not verified_isbn:
+            missing_fields.append("ISBN")
+
+        if not verified_weight:
+            missing_fields.append("weight")
+
+        review_required = bool(
+            missing_fields
+        )
+
+        review_reason = (
+            "Identity verified by multi-source consensus. "
+            + (
+                "The following metadata still requires review: "
+                + ", ".join(missing_fields)
+                + "."
+                if missing_fields
+                else ""
+            )
+        ).strip()
+
+        payload: dict[str, Any] = {
+            "identity_status": "IDENTITY_VERIFIED",
+            "workflow_status": "IDENTITY_VERIFIED",
+            "identity_confidence": consensus[
+                "match_confidence"
+            ],
+            "verified_title": (
+                best_reference.get(
+                    "reference_title"
+                )
+                or candidate.get(
+                    "extracted_title"
+                )
+            ),
+            "verified_isbn": verified_isbn,
+            "verified_author": (
+                consensus.get(
+                    "specific_author"
+                )
+                or best_reference.get(
+                    "reference_author"
+                )
+                or candidate.get(
+                    "extracted_author"
+                )
+            ),
+            "verified_publisher": best_reference.get(
+                "reference_publisher"
+            ),
+            "verified_page_count": best_reference.get(
+                "reference_page_count"
+            ),
+            "verified_weight_grams": verified_weight,
+            "verified_length_cm": best_reference.get(
+                "reference_length_cm"
+            ),
+            "verified_width_cm": best_reference.get(
+                "reference_width_cm"
+            ),
+            "verified_height_cm": best_reference.get(
+                "reference_height_cm"
+            ),
+            "review_required": review_required,
+            "review_reason": (
+                review_reason
+                if review_required
+                else None
+            ),
+            "decision_reason": consensus[
+                "match_reason"
+            ],
+            "conflict_fields": [],
+            "source_evidence": (
+                build_consensus_source_evidence(
+                    candidate=candidate,
+                    consensus=consensus,
+                )
+            ),
+            "updated_at": utc_now(),
+        }
+
+    elif decision == "NO_MATCH":
+        payload = {
+            "identity_status": "IDENTITY_CONFLICT",
+            "workflow_status": "IDENTITY_CONFLICT",
+            "identity_confidence": consensus[
+                "match_confidence"
+            ],
+            "review_required": True,
+            "review_reason": consensus[
+                "match_reason"
+            ],
+            "decision_reason": None,
+            "conflict_fields": [
+                field_name
+                for field_name, has_conflict in (
+                    (
+                        "isbn",
+                        consensus.get(
+                            "isbn_conflict"
+                        ),
+                    ),
+                    (
+                        "author",
+                        consensus.get(
+                            "author_conflict"
+                        ),
+                    ),
+                    (
+                        "page_count",
+                        consensus.get(
+                            "page_count_conflict"
+                        ),
+                    ),
+                )
+                if has_conflict
+            ],
+            "source_evidence": (
+                build_consensus_source_evidence(
+                    candidate=candidate,
+                    consensus=consensus,
+                )
+            ),
+            "updated_at": utc_now(),
+        }
+
+    else:
+        payload = {
+            "identity_status": "IDENTITY_PENDING",
+            "workflow_status": "IDENTITY_PENDING",
+            "identity_confidence": consensus[
+                "match_confidence"
+            ],
+            "review_required": True,
+            "review_reason": consensus[
+                "match_reason"
+            ],
+            "decision_reason": None,
+            "source_evidence": (
+                build_consensus_source_evidence(
+                    candidate=candidate,
+                    consensus=consensus,
+                )
+            ),
+            "updated_at": utc_now(),
+        }
+
+    response = (
+        repository.client
+        .table("product_candidates")
+        .update(payload)
+        .eq(
+            "candidate_id",
+            candidate_id,
+        )
+        .execute()
+    )
+
+    if not response.data:
+        raise RuntimeError(
+            "Candidate consensus update returned no data."
+        )
+
+
+def update_references_from_consensus(
+    repository: SupabaseRepository,
+    consensus: dict[str, Any],
+) -> None:
+    """Update all reference and discovery records from consensus."""
+    final_decision = consensus[
+        "match_decision"
+    ]
+
+    for item in consensus[
+        "reference_results"
+    ]:
+        reference = item[
+            "reference"
+        ]
+        individual_result = item[
+            "result"
+        ]
+
+        if (
+            final_decision == "MATCH"
+            and individual_result[
+                "title_similarity"
+            ] >= 0.90
+            and not individual_result[
+                "isbn_conflict"
+            ]
+        ):
+            reference_decision = "MATCH"
+            reference_confidence = max(
+                individual_result[
+                    "match_confidence"
+                ],
+                0.90,
+            )
+        else:
+            reference_decision = individual_result[
+                "match_decision"
+            ]
+            reference_confidence = individual_result[
+                "match_confidence"
+            ]
+
+        updated_result = dict(
+            individual_result
+        )
+        updated_result[
+            "match_decision"
+        ] = reference_decision
+        updated_result[
+            "match_confidence"
+        ] = reference_confidence
+        updated_result[
+            "match_reason"
+        ] = (
+            consensus[
+                "match_reason"
+            ]
+            if reference_decision == "MATCH"
+            else individual_result[
+                "match_reason"
+            ]
+        )
+
+        update_product_reference(
+            repository=repository,
+            reference=reference,
+            result=updated_result,
+        )
+
+        discovery_response = (
+            repository.client
+            .table(
+                "candidate_reference_sources"
+            )
+            .select(
+                "discovery_id,"
+                "candidate_id,"
+                "source_url_id,"
+                "discovery_status,"
+                "is_selected_for_crawl"
+            )
+            .eq(
+                "candidate_id",
+                reference.get(
+                    "candidate_id"
+                ),
+            )
+            .eq(
+                "source_url_id",
+                reference.get(
+                    "source_url_id"
+                ),
+            )
+            .limit(1)
+            .execute()
+        )
+
+        discoveries = (
+            discovery_response.data
+            or []
+        )
+
+        if discoveries:
+            update_discovery_status(
+                repository=repository,
+                discovery=discoveries[0],
+                decision=reference_decision,
+            )
+
 def main() -> None:
-    """Match one candidate against one collected product reference."""
+    """Match one candidate using multi-source consensus when available."""
     load_dotenv()
 
     print("=" * 72)
@@ -1073,6 +1872,73 @@ def main() -> None:
 
     repository = SupabaseRepository()
 
+    print(
+        "Searching for a pending multi-source identity consensus..."
+    )
+
+    consensus_item = get_pending_consensus_candidate(
+        repository
+    )
+
+    if consensus_item is not None:
+        candidate = consensus_item[
+            "candidate"
+        ]
+        references = consensus_item[
+            "references"
+        ]
+
+        consensus = calculate_consensus_match(
+            candidate=candidate,
+            references=references,
+        )
+
+        print_consensus_result(
+            candidate=candidate,
+            consensus=consensus,
+        )
+
+        print()
+
+        confirmation = input(
+            "Type SAVE to save this consensus result, "
+            "or press Enter to cancel: "
+        ).strip().upper()
+
+        if confirmation != "SAVE":
+            print(
+                "Identity consensus result was not saved."
+            )
+            return
+
+        update_candidate_from_consensus(
+            repository=repository,
+            candidate=candidate,
+            consensus=consensus,
+        )
+
+        print(
+            "Candidate identity consensus updated."
+        )
+
+        update_references_from_consensus(
+            repository=repository,
+            consensus=consensus,
+        )
+
+        print(
+            "Reference and discovery statuses updated."
+        )
+
+        print()
+        print(
+            "Multi-source identity matching completed successfully."
+        )
+        return
+
+    print(
+        "No pending multi-source candidate was found."
+    )
     print(
         "Searching for an unmatched product reference..."
     )
@@ -1130,8 +1996,6 @@ def main() -> None:
         )
         return
 
-    # Update the candidate first because it has the strictest
-    # workflow and identity-status constraints.
     update_candidate_status(
         repository=repository,
         candidate=candidate,
