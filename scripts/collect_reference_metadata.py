@@ -27,7 +27,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 COLLECTOR_NAME = "reference_metadata_collector"
-COLLECTOR_VERSION = "1.3.1"
+COLLECTOR_VERSION = "1.4.0"
 
 NAVIGATION_TIMEOUT_MS = 60_000
 
@@ -1092,6 +1092,95 @@ def parse_fahasa_metadata(
     }
 
 
+
+def parse_generic_book_metadata(
+    page: Page,
+    body_text: str,
+    parser_label: str,
+) -> dict[str, Any]:
+    """Parse a public Vietnamese book product page using generic metadata rules."""
+    json_ld_objects = extract_json_ld(page)
+    product_json_ld = find_product_json_ld(json_ld_objects)
+
+    title = extract_title(
+        page=page,
+        product_json_ld=product_json_ld,
+    )
+    author = extract_author(
+        body_text=body_text,
+        product_json_ld=product_json_ld,
+    )
+    isbn = extract_isbn(
+        body_text=body_text,
+        product_json_ld=product_json_ld,
+    )
+    publisher = extract_publisher(body_text)
+    page_count = extract_page_count(body_text)
+    publication_year = extract_publication_year(body_text)
+    translator = extract_translator(body_text)
+    book_format = extract_book_format(body_text)
+    displayed_supplier = extract_supplier_name(body_text)
+    weight_grams = extract_weight_grams(body_text)
+
+    (
+        length_cm,
+        width_cm,
+        height_cm,
+        raw_dimensions,
+    ) = extract_dimensions(body_text)
+
+    (
+        current_price_vnd,
+        cover_price_vnd,
+    ) = extract_price_values(
+        page=page,
+        body_text=body_text,
+        product_json_ld=product_json_ld,
+    )
+
+    description = extract_description(
+        page=page,
+        product_json_ld=product_json_ld,
+    )
+    image_url = extract_image_url(
+        page=page,
+        product_json_ld=product_json_ld,
+    )
+
+    raw_metadata = {
+        "parser_name": parser_label,
+        "parser_version": "1.0.0",
+        "publication_year": publication_year,
+        "translator": translator,
+        "book_format": book_format,
+        "displayed_supplier": displayed_supplier,
+        "raw_dimensions": raw_dimensions,
+        "current_price_vnd": decimal_to_json_value(current_price_vnd),
+        "cover_price_vnd": decimal_to_json_value(cover_price_vnd),
+        "json_ld_found": product_json_ld is not None,
+        "purchase_price_eligible": False,
+        "source_usage_note": (
+            "This public website is used only for book identity, metadata, "
+            "images, dimensions, weight, and cover-price reference."
+        ),
+    }
+
+    return {
+        "reference_title": title,
+        "reference_isbn": isbn,
+        "reference_author": author,
+        "reference_publisher": publisher,
+        "reference_page_count": page_count,
+        "reference_weight_grams": weight_grams,
+        "reference_length_cm": decimal_to_json_value(length_cm),
+        "reference_width_cm": decimal_to_json_value(width_cm),
+        "reference_height_cm": decimal_to_json_value(height_cm),
+        "reference_cover_price_vnd": decimal_to_json_value(cover_price_vnd),
+        "reference_description": description,
+        "reference_image_url": image_url,
+        "raw_metadata": raw_metadata,
+    }
+
 def validate_reference_metadata(
     metadata: dict[str, Any],
     parser_name: str,
@@ -1908,6 +1997,17 @@ def select_parser(
     ):
         return "FAHASA_METADATA_PARSER"
 
+    generic_domains = {
+        "netabooks.vn": "NETABOOKS_GENERIC_PARSER",
+        "nhanam.vn": "NHANAM_GENERIC_PARSER",
+        "dinhtibooks.com.vn": "DINHTI_GENERIC_PARSER",
+        "firstnews.vn": "FIRSTNEWS_GENERIC_PARSER",
+    }
+
+    for domain, parser_name in generic_domains.items():
+        if hostname == domain or hostname.endswith(f".{domain}"):
+            return parser_name
+
     raise RuntimeError(
         "No metadata parser is available for domain: "
         f"{hostname}"
@@ -1930,6 +2030,20 @@ def parse_reference_page(
         return parse_fahasa_metadata(
             page=page,
             body_text=raw_text,
+        )
+
+    generic_parser_labels = {
+        "NETABOOKS_GENERIC_PARSER": "netabooks_generic",
+        "NHANAM_GENERIC_PARSER": "nhanam_generic",
+        "DINHTI_GENERIC_PARSER": "dinhti_generic",
+        "FIRSTNEWS_GENERIC_PARSER": "firstnews_generic",
+    }
+
+    if parser_name in generic_parser_labels:
+        return parse_generic_book_metadata(
+            page=page,
+            body_text=raw_text,
+            parser_label=generic_parser_labels[parser_name],
         )
 
     raise RuntimeError(
