@@ -27,7 +27,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 COLLECTOR_NAME = "reference_metadata_collector"
-COLLECTOR_VERSION = "1.0.0"
+COLLECTOR_VERSION = "1.3.1"
 
 NAVIGATION_TIMEOUT_MS = 60_000
 
@@ -128,24 +128,99 @@ def parse_integer(
 def parse_vnd_price(
     value: str | None,
 ) -> Decimal | None:
-    """Parse a Vietnamese đồng amount."""
+    """Parse one Vietnamese đồng price without joining discount numbers."""
     if not value:
         return None
 
-    digits = re.sub(
-        r"[^\d]",
-        "",
-        value,
+    normalized_value = normalize_whitespace(value)
+
+    if not normalized_value:
+        return None
+
+    currency_match = re.search(
+        r"(?<!\d)"
+        r"(?P<price>"
+        r"\d{1,3}(?:[.\s,]\d{3})+"
+        r"|"
+        r"\d{4,9}"
+        r")"
+        r"(?:[.,]\d{1,2})?"
+        r"\s*(?:₫|đ|VND)",
+        normalized_value,
+        flags=re.IGNORECASE,
     )
 
-    if not digits:
-        return None
+    if currency_match:
+        digits = re.sub(
+            r"\D",
+            "",
+            currency_match.group("price"),
+        )
 
-    try:
-        return Decimal(digits)
+        if digits:
+            try:
+                parsed_price = Decimal(digits)
+            except InvalidOperation:
+                parsed_price = None
 
-    except InvalidOperation:
-        return None
+            if (
+                parsed_price is not None
+                and Decimal("1000")
+                <= parsed_price
+                <= Decimal("2000000")
+            ):
+                return parsed_price
+
+    isolated_match = re.fullmatch(
+        r"\s*(?P<price>\d{4,9})(?:[.,]\d{1,2})?\s*",
+        normalized_value,
+    )
+
+    if isolated_match:
+        try:
+            parsed_price = Decimal(
+                isolated_match.group("price")
+            )
+        except InvalidOperation:
+            parsed_price = None
+
+        if (
+            parsed_price is not None
+            and Decimal("1000")
+            <= parsed_price
+            <= Decimal("2000000")
+        ):
+            return parsed_price
+
+    grouped_match = re.search(
+        r"(?<!\d)"
+        r"(?P<price>\d{1,3}(?:[.\s,]\d{3})+)"
+        r"(?![\d.,])",
+        normalized_value,
+    )
+
+    if grouped_match:
+        digits = re.sub(
+            r"\D",
+            "",
+            grouped_match.group("price"),
+        )
+
+        if digits:
+            try:
+                parsed_price = Decimal(digits)
+            except InvalidOperation:
+                parsed_price = None
+
+            if (
+                parsed_price is not None
+                and Decimal("1000")
+                <= parsed_price
+                <= Decimal("2000000")
+            ):
+                return parsed_price
+
+    return None
 
 
 def parse_decimal_number(
@@ -900,6 +975,201 @@ def extract_supplier_name(
     )
 
 
+def extract_weight_grams(
+    body_text: str,
+) -> int | None:
+    """Extract product weight and normalize it to grams."""
+    raw_weight = extract_label_value(
+        body_text=body_text,
+        labels=[
+            "Trọng lượng",
+            "Trọng Lượng",
+            "Weight",
+        ],
+    )
+
+    if not raw_weight:
+        return None
+
+    value = parse_decimal_number(raw_weight)
+
+    if value is None:
+        return None
+
+    normalized = raw_weight.lower()
+
+    if "kg" in normalized:
+        return int(value * Decimal("1000"))
+
+    return int(value)
+
+
+def parse_fahasa_metadata(
+    page: Page,
+    body_text: str,
+) -> dict[str, Any]:
+    """Parse one Fahasa product page."""
+    json_ld_objects = extract_json_ld(page)
+    product_json_ld = find_product_json_ld(json_ld_objects)
+
+    title = extract_title(
+        page=page,
+        product_json_ld=product_json_ld,
+    )
+    author = extract_author(
+        body_text=body_text,
+        product_json_ld=product_json_ld,
+    )
+    isbn = extract_isbn(
+        body_text=body_text,
+        product_json_ld=product_json_ld,
+    )
+    publisher = extract_publisher(body_text)
+    page_count = extract_page_count(body_text)
+    publication_year = extract_publication_year(body_text)
+    translator = extract_translator(body_text)
+    book_format = extract_book_format(body_text)
+    displayed_supplier = extract_supplier_name(body_text)
+    weight_grams = extract_weight_grams(body_text)
+
+    (
+        length_cm,
+        width_cm,
+        height_cm,
+        raw_dimensions,
+    ) = extract_dimensions(body_text)
+
+    (
+        current_price_vnd,
+        cover_price_vnd,
+    ) = extract_price_values(
+        page=page,
+        body_text=body_text,
+        product_json_ld=product_json_ld,
+    )
+
+    description = extract_description(
+        page=page,
+        product_json_ld=product_json_ld,
+    )
+    image_url = extract_image_url(
+        page=page,
+        product_json_ld=product_json_ld,
+    )
+
+    raw_metadata = {
+        "parser_name": "fahasa",
+        "parser_version": "1.0.0",
+        "publication_year": publication_year,
+        "translator": translator,
+        "book_format": book_format,
+        "displayed_supplier": displayed_supplier,
+        "raw_dimensions": raw_dimensions,
+        "current_price_vnd": decimal_to_json_value(current_price_vnd),
+        "cover_price_vnd": decimal_to_json_value(cover_price_vnd),
+        "json_ld_found": product_json_ld is not None,
+        "purchase_price_eligible": False,
+        "source_usage_note": (
+            "Fahasa is used only as a metadata, image, dimensions, "
+            "weight, and cover-price reference source."
+        ),
+    }
+
+    return {
+        "reference_title": title,
+        "reference_isbn": isbn,
+        "reference_author": author,
+        "reference_publisher": publisher,
+        "reference_page_count": page_count,
+        "reference_weight_grams": weight_grams,
+        "reference_length_cm": decimal_to_json_value(length_cm),
+        "reference_width_cm": decimal_to_json_value(width_cm),
+        "reference_height_cm": decimal_to_json_value(height_cm),
+        "reference_cover_price_vnd": decimal_to_json_value(cover_price_vnd),
+        "reference_description": description,
+        "reference_image_url": image_url,
+        "raw_metadata": raw_metadata,
+    }
+
+
+def validate_reference_metadata(
+    metadata: dict[str, Any],
+    parser_name: str,
+) -> list[str]:
+    """Validate parsed metadata and remove implausible numeric values."""
+    warnings: list[str] = []
+
+    required_fields = (
+        ("reference_title", "Reference title was not found."),
+        ("reference_author", "Reference author was not found."),
+        ("reference_publisher", "Reference publisher was not found."),
+        ("reference_isbn", "Reference ISBN was not found."),
+    )
+
+    for field_name, warning in required_fields:
+        if not metadata.get(field_name):
+            warnings.append(warning)
+
+    weight_grams = metadata.get("reference_weight_grams")
+
+    if weight_grams is None:
+        warnings.append("Reference weight was not found.")
+    elif not 20 <= int(weight_grams) <= 10_000:
+        warnings.append(
+            "Reference weight was rejected as implausible: "
+            f"{weight_grams} grams."
+        )
+        metadata["reference_weight_grams"] = None
+        metadata.setdefault("raw_metadata", {})[
+            "rejected_weight_grams"
+        ] = weight_grams
+
+    cover_price_vnd = metadata.get("reference_cover_price_vnd")
+
+    if cover_price_vnd is not None:
+        try:
+            numeric_cover_price = Decimal(str(cover_price_vnd))
+        except InvalidOperation:
+            numeric_cover_price = None
+
+        if (
+            numeric_cover_price is None
+            or numeric_cover_price < Decimal("5000")
+            or numeric_cover_price > Decimal("2000000")
+        ):
+            warnings.append(
+                "Reference cover price was rejected as implausible: "
+                f"{cover_price_vnd} VND."
+            )
+            metadata["reference_cover_price_vnd"] = None
+            metadata.setdefault("raw_metadata", {})[
+                "rejected_cover_price_vnd"
+            ] = cover_price_vnd
+
+    page_count = metadata.get("reference_page_count")
+
+    if (
+        page_count is not None
+        and not 1 <= int(page_count) <= 5_000
+    ):
+        warnings.append(
+            "Reference page count was rejected as implausible: "
+            f"{page_count}."
+        )
+        metadata["reference_page_count"] = None
+        metadata.setdefault("raw_metadata", {})[
+            "rejected_page_count"
+        ] = page_count
+
+    if parser_name == "FAHASA_METADATA_PARSER":
+        if not metadata.get("reference_image_url"):
+            warnings.append("Reference image URL was not found.")
+        if not metadata.get("reference_description"):
+            warnings.append("Reference description was not found.")
+
+    return warnings
+
+
 def parse_alpha_books_metadata(
     page: Page,
     body_text: str,
@@ -1630,6 +1900,14 @@ def select_parser(
     ):
         return "ALPHA_BOOKS_METADATA_PARSER"
 
+    if (
+        hostname == "fahasa.com"
+        or hostname.endswith(
+            ".fahasa.com"
+        )
+    ):
+        return "FAHASA_METADATA_PARSER"
+
     raise RuntimeError(
         "No metadata parser is available for domain: "
         f"{hostname}"
@@ -1644,6 +1922,12 @@ def parse_reference_page(
     """Parse metadata with the selected domain parser."""
     if parser_name == "ALPHA_BOOKS_METADATA_PARSER":
         return parse_alpha_books_metadata(
+            page=page,
+            body_text=raw_text,
+        )
+
+    if parser_name == "FAHASA_METADATA_PARSER":
+        return parse_fahasa_metadata(
             page=page,
             body_text=raw_text,
         )
@@ -1843,8 +2127,9 @@ def main() -> None:
                     raw_text=raw_text,
                 )
 
-                warnings = validate_alpha_books_metadata(
-                    metadata
+                warnings = validate_reference_metadata(
+                    metadata=metadata,
+                    parser_name=parser_name,
                 )
 
                 metadata["raw_metadata"][
