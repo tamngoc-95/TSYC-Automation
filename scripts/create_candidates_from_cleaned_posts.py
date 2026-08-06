@@ -17,7 +17,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 BATCH_CODE = "FB-2026-001"
 
 EXTRACTOR_NAME = "facebook_cleaned_post_rule_extractor"
-EXTRACTOR_VERSION = "0.7.0"
+EXTRACTOR_VERSION = "0.8.0"
 
 DEFAULT_CANDIDATE_TYPE = "SINGLE_BOOK"
 DEFAULT_WORKFLOW_STATUS = "EXTRACTED"
@@ -32,6 +32,24 @@ CANDIDATE_CODE_PATTERN = re.compile(
     rf"^{re.escape(BATCH_CODE)}-CAN-(\d+)$"
 )
 
+LEADING_POST_MARKERS = (
+    "Sách có sẵn ở Đức",
+    "Sách có sẵn",
+)
+
+TITLE_DESCRIPTION_PATTERNS = (
+    re.compile(
+        r"^(?P<title>.{2,160}?)\s+"
+        r"(?:là|là một)\s+cuốn sách\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?P<title>.{2,160}?)\s+"
+        r"(?:là|là một)\s+bộ sách\b",
+        flags=re.IGNORECASE,
+    ),
+)
+
 TITLE_AUTHOR_PATTERNS = (
     re.compile(
         r"[“\"](?P<title>[^”\"]+)[”\"]\s+"
@@ -40,12 +58,31 @@ TITLE_AUTHOR_PATTERNS = (
         flags=re.IGNORECASE,
     ),
     re.compile(
-        r"(?P<title>[^\n]{3,200}?)\s+"
+        r"(?P<title>[^\n]{3,160}?)\s+"
         r"(?:của|by)\s+"
         r"(?P<author>[A-ZÀ-Ỹ][^,\n.–—]+)",
         flags=re.IGNORECASE,
     ),
 )
+
+AUTHOR_REJECTION_MARKERS = (
+    "cuốn sách",
+    "bộ sách",
+    "cơ thể",
+    "tuổi dậy thì",
+    "giúp các em",
+    "giúp trẻ",
+    "nội dung",
+    "ngôn ngữ",
+    "minh họa",
+    "phát triển",
+    "thay đổi",
+    "hướng dẫn",
+    "đây là",
+)
+
+MAX_TITLE_LENGTH = 160
+MAX_AUTHOR_LENGTH = 100
 
 ISBN_PATTERN = re.compile(
     r"\b(?:ISBN(?:-1[03])?\s*:?\s*)?"
@@ -64,6 +101,132 @@ def normalize_text(
     return " ".join(
         value.split()
     ).strip()
+
+
+def remove_leading_post_markers(
+    value: str,
+) -> str:
+    """Remove known Facebook post labels before identity extraction."""
+    cleaned = normalize_text(value)
+
+    marker_removed = True
+
+    while marker_removed:
+        marker_removed = False
+        lowered = cleaned.casefold()
+
+        for marker in LEADING_POST_MARKERS:
+            marker_text = normalize_text(marker)
+            marker_lower = marker_text.casefold()
+
+            if lowered == marker_lower:
+                return ""
+
+            if lowered.startswith(
+                marker_lower + " "
+            ):
+                cleaned = cleaned[
+                    len(marker_text):
+                ].lstrip(
+                    " \t\r\n:–—-"
+                )
+                marker_removed = True
+                break
+
+    return cleaned
+
+
+def looks_like_description_fragment(
+    value: str | None,
+) -> bool:
+    """Return True when a value resembles prose rather than a person name."""
+    cleaned = normalize_text(value)
+
+    if not cleaned:
+        return False
+
+    lowered = cleaned.casefold()
+
+    if any(
+        marker in lowered
+        for marker in AUTHOR_REJECTION_MARKERS
+    ):
+        return True
+
+    word_count = len(cleaned.split())
+
+    if word_count > 8:
+        return True
+
+    if len(cleaned) > MAX_AUTHOR_LENGTH:
+        return True
+
+    if re.search(
+        r"[.!?;:]",
+        cleaned,
+    ):
+        return True
+
+    return False
+
+
+def validate_extracted_identity(
+    title: str | None,
+    author: str | None,
+) -> tuple[str, str | None, list[str]]:
+    """Validate extracted fields and return normalized values plus warnings."""
+    warnings: list[str] = []
+
+    cleaned_title = clean_extracted_title(
+        title or ""
+    )
+
+    cleaned_author = (
+        clean_extracted_author(author)
+        if author
+        else None
+    )
+
+    if not cleaned_title:
+        raise RuntimeError(
+            "No reliable book title could be extracted "
+            "from the cleaned Facebook post."
+        )
+
+    if len(cleaned_title) > MAX_TITLE_LENGTH:
+        raise RuntimeError(
+            "The extracted title is too long and appears "
+            "to contain post description text."
+        )
+
+    title_lower = cleaned_title.casefold()
+
+    if title_lower in {
+        "bài viết",
+        "sách có sẵn",
+        "sách có sẵn ở đức",
+        "yêu con",
+        "tiệm sách yêu con ở đức",
+    }:
+        raise RuntimeError(
+            "The extracted title is a Facebook interface label, "
+            "not a reliable book title."
+        )
+
+    if cleaned_author and looks_like_description_fragment(
+        cleaned_author
+    ):
+        warnings.append(
+            "The extracted author resembled description text "
+            "and was removed."
+        )
+        cleaned_author = None
+
+    return (
+        cleaned_title,
+        cleaned_author,
+        warnings,
+    )
 
 
 def clean_extracted_title(
@@ -141,7 +304,7 @@ def extract_book_identity(
     cleaned_text: str,
 ) -> dict[str, Any]:
     """Extract a conservative book identity from cleaned Facebook text."""
-    normalized_text = normalize_text(
+    normalized_text = remove_leading_post_markers(
         cleaned_text
     )
 
@@ -153,9 +316,10 @@ def extract_book_identity(
     extracted_title: str | None = None
     extracted_author: str | None = None
     matched_pattern: str | None = None
+    extraction_warnings: list[str] = []
 
     for pattern_number, pattern in enumerate(
-        TITLE_AUTHOR_PATTERNS,
+        TITLE_DESCRIPTION_PATTERNS,
         start=1,
     ):
         match = pattern.search(
@@ -168,23 +332,51 @@ def extract_book_identity(
         extracted_title = clean_extracted_title(
             match.group("title")
         )
-
-        extracted_author = clean_extracted_author(
-            match.group("author")
-        )
-
+        extracted_author = None
         matched_pattern = (
-            f"TITLE_AUTHOR_PATTERN_{pattern_number}"
+            f"TITLE_DESCRIPTION_PATTERN_{pattern_number}"
         )
-
-        if extracted_title:
-            break
+        break
 
     if not extracted_title:
-        raise RuntimeError(
-            "No reliable book title could be extracted "
-            "from the cleaned Facebook post."
-        )
+        for pattern_number, pattern in enumerate(
+            TITLE_AUTHOR_PATTERNS,
+            start=1,
+        ):
+            match = pattern.search(
+                normalized_text
+            )
+
+            if not match:
+                continue
+
+            extracted_title = clean_extracted_title(
+                match.group("title")
+            )
+
+            extracted_author = clean_extracted_author(
+                match.group("author")
+            )
+
+            matched_pattern = (
+                f"TITLE_AUTHOR_PATTERN_{pattern_number}"
+            )
+
+            if extracted_title:
+                break
+
+    (
+        extracted_title,
+        extracted_author,
+        validation_warnings,
+    ) = validate_extracted_identity(
+        title=extracted_title,
+        author=extracted_author,
+    )
+
+    extraction_warnings.extend(
+        validation_warnings
+    )
 
     isbn_match = ISBN_PATTERN.search(
         normalized_text
@@ -200,8 +392,16 @@ def extract_book_identity(
 
     extraction_confidence = 0.90
 
+    if matched_pattern and matched_pattern.startswith(
+        "TITLE_DESCRIPTION_PATTERN_"
+    ):
+        extraction_confidence = 0.85
+
     if not extracted_author:
-        extraction_confidence = 0.75
+        extraction_confidence = min(
+            extraction_confidence,
+            0.80,
+        )
 
     if possible_isbn:
         extraction_confidence = min(
@@ -215,6 +415,7 @@ def extract_book_identity(
         "possible_isbn": possible_isbn,
         "extraction_confidence": extraction_confidence,
         "matched_pattern": matched_pattern,
+        "warnings": extraction_warnings,
     }
 
 
@@ -465,6 +666,9 @@ def build_source_evidence(
         "matched_pattern": extraction.get(
             "matched_pattern"
         ),
+        "extraction_warnings": extraction.get(
+            "warnings"
+        ) or [],
         "extracted_fields": {
             "title": extraction.get(
                 "extracted_title"
@@ -705,6 +909,20 @@ def print_extraction_preview(
         "Unlinked images available: "
         f"{len(unlinked_images)}"
     )
+
+    extraction_warnings = (
+        extraction.get("warnings")
+        or []
+    )
+
+    if extraction_warnings:
+        print()
+        print("Extraction warnings:")
+
+        for warning in extraction_warnings:
+            print(
+                f"  - {warning}"
+            )
 
     if unlinked_images:
         print()
