@@ -1,3 +1,4 @@
+import argparse
 import json
 import re
 import sys
@@ -17,7 +18,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 BATCH_CODE = "FB-2026-001"
 
 EXTRACTOR_NAME = "facebook_cleaned_post_rule_extractor"
-EXTRACTOR_VERSION = "0.8.0"
+EXTRACTOR_VERSION = "0.9.0"
 
 DEFAULT_CANDIDATE_TYPE = "SINGLE_BOOK"
 DEFAULT_WORKFLOW_STATUS = "EXTRACTED"
@@ -89,6 +90,70 @@ ISBN_PATTERN = re.compile(
     r"(?P<isbn>97[89][\d\-\s]{10,20}\d)\b",
     flags=re.IGNORECASE,
 )
+
+
+def normalize_confirmation(
+    value: str | None,
+) -> str:
+    """Normalize confirmation values across case, spaces, and hyphens."""
+    if not value:
+        return ""
+
+    return (
+        value.strip()
+        .upper()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create one product candidate from one cleaned Facebook post."
+        )
+    )
+
+    parser.add_argument(
+        "--raw-page-id",
+        help="Process one exact cleaned Facebook raw page UUID.",
+    )
+
+    parser.add_argument(
+        "--source-url-id",
+        help="Process one exact Facebook source URL UUID.",
+    )
+
+    parser.add_argument(
+        "--candidate-type",
+        choices=[
+            "SINGLE_BOOK",
+            "BOOK_COMBO",
+            "BOOK_SET",
+            "ACTIVITY_PRODUCT",
+            "OTHER",
+        ],
+        default=DEFAULT_CANDIDATE_TYPE,
+        help="Candidate type to assign to the new candidate.",
+    )
+
+    parser.add_argument(
+        "--confirm-create",
+        action="store_true",
+        help="Confirm candidate creation without prompting.",
+    )
+
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Disable input prompts. Requires --raw-page-id or "
+            "--source-url-id and --confirm-create."
+        ),
+    )
+
+    return parser.parse_args()
 
 
 def normalize_text(
@@ -421,6 +486,7 @@ def extract_book_identity(
 
 def get_batch_by_code(
     repository: SupabaseRepository,
+    batch_code: str = BATCH_CODE,
 ) -> dict[str, Any]:
     """Return the configured batch."""
     response = (
@@ -431,7 +497,7 @@ def get_batch_by_code(
         )
         .eq(
             "batch_code",
-            BATCH_CODE,
+            batch_code,
         )
         .limit(1)
         .execute()
@@ -441,7 +507,7 @@ def get_batch_by_code(
 
     if not records:
         raise RuntimeError(
-            f"Batch was not found: {BATCH_CODE}"
+            f"Batch was not found: {batch_code}"
         )
 
     return records[0]
@@ -450,9 +516,11 @@ def get_batch_by_code(
 def get_cleaned_raw_pages(
     repository: SupabaseRepository,
     batch_id: str,
+    raw_page_id: str | None = None,
+    source_url_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return cleaned Facebook posts available for extraction."""
-    response = (
+    query = (
         repository.client
         .table("raw_pages")
         .select(
@@ -466,18 +534,25 @@ def get_cleaned_raw_pages(
             "cleaned_text, "
             "collected_at"
         )
-        .eq(
-            "batch_id",
-            batch_id,
+        .eq("batch_id", batch_id)
+        .eq("page_type", "FACEBOOK_POST")
+        .eq("cleaning_status", "CLEANED")
+    )
+
+    if raw_page_id:
+        query = query.eq(
+            "raw_page_id",
+            raw_page_id,
         )
-        .eq(
-            "page_type",
-            "FACEBOOK_POST",
+
+    if source_url_id:
+        query = query.eq(
+            "source_url_id",
+            source_url_id,
         )
-        .eq(
-            "cleaning_status",
-            "CLEANED",
-        )
+
+    response = (
+        query
         .order(
             "collected_at",
             desc=False,
@@ -490,11 +565,21 @@ def get_cleaned_raw_pages(
 
 def select_raw_page(
     raw_pages: list[dict[str, Any]],
+    non_interactive: bool = False,
 ) -> dict[str, Any]:
-    """Allow the user to select one cleaned Facebook post."""
+    """Select one cleaned Facebook post."""
     if not raw_pages:
         raise RuntimeError(
             "No cleaned Facebook posts were found."
+        )
+
+    if len(raw_pages) == 1:
+        return raw_pages[0]
+
+    if non_interactive:
+        raise RuntimeError(
+            "Multiple cleaned Facebook posts matched the selector. "
+            "Use --raw-page-id to select one exact post."
         )
 
     print()
@@ -520,17 +605,15 @@ def select_raw_page(
     print()
 
     selection = input(
-        "Enter the page number to extract "
-        "[default: 1]: "
+        "Enter the page number to extract, "
+        "or press Enter to cancel: "
     ).strip()
 
     if not selection:
-        return raw_pages[0]
+        raise KeyboardInterrupt
 
     try:
-        selected_index = int(
-            selection
-        ) - 1
+        selected_index = int(selection) - 1
 
     except ValueError as error:
         raise ValueError(
@@ -554,7 +637,7 @@ def find_existing_candidate(
     raw_page_id: str,
     extracted_title: str,
 ) -> dict[str, Any] | None:
-    """Find an existing candidate for the same page and title."""
+    """Find an existing candidate for the same raw page and normalized title."""
     response = (
         repository.client
         .table("product_candidates")
@@ -564,6 +647,7 @@ def find_existing_candidate(
             "raw_page_id, "
             "extracted_title, "
             "extracted_author, "
+            "candidate_type, "
             "workflow_status, "
             "review_required"
         )
@@ -571,24 +655,28 @@ def find_existing_candidate(
             "raw_page_id",
             raw_page_id,
         )
-        .ilike(
-            "extracted_title",
-            extracted_title,
-        )
-        .limit(1)
         .execute()
     )
 
     records = response.data or []
+    normalized_target = normalize_text(
+        extracted_title
+    ).casefold()
 
-    if not records:
-        return None
+    for record in records:
+        normalized_existing = normalize_text(
+            record.get("extracted_title")
+        ).casefold()
 
-    return records[0]
+        if normalized_existing == normalized_target:
+            return record
+
+    return None
 
 
 def get_next_candidate_code(
     repository: SupabaseRepository,
+    batch_id: str,
 ) -> str:
     """Generate the next sequential candidate code for the batch."""
     response = (
@@ -599,9 +687,7 @@ def get_next_candidate_code(
         )
         .eq(
             "batch_id",
-            get_batch_by_code(
-                repository
-            )["batch_id"],
+            batch_id,
         )
         .execute()
     )
@@ -691,14 +777,13 @@ def build_candidate_payload(
     raw_page: dict[str, Any],
     extraction: dict[str, Any],
     candidate_code: str,
+    candidate_type: str,
 ) -> dict[str, Any]:
     """Build a valid product_candidates insert payload."""
     return {
         "batch_id": batch["batch_id"],
         "candidate_code": candidate_code,
-        "candidate_type": (
-            DEFAULT_CANDIDATE_TYPE
-        ),
+        "candidate_type": candidate_type,
         "combo_group_code": None,
 
         "raw_page_id": raw_page[
@@ -856,6 +941,7 @@ def print_extraction_preview(
     raw_page: dict[str, Any],
     extraction: dict[str, Any],
     candidate_code: str,
+    candidate_type: str,
     unlinked_images: list[dict[str, Any]],
 ) -> None:
     """Print the candidate before database insertion."""
@@ -876,7 +962,7 @@ def print_extraction_preview(
     )
     print(
         "Candidate type: "
-        f"{DEFAULT_CANDIDATE_TYPE}"
+        f"{candidate_type}"
     )
     print(
         "Extracted title: "
@@ -1019,6 +1105,9 @@ def create_candidate_from_page(
     repository: SupabaseRepository,
     batch: dict[str, Any],
     raw_page: dict[str, Any],
+    candidate_type: str,
+    confirm_create: bool,
+    non_interactive: bool,
 ) -> str:
     """Create one candidate and link its source images."""
     cleaned_text = str(
@@ -1069,7 +1158,8 @@ def create_candidate_from_page(
         return "DUPLICATE_CANDIDATE"
 
     candidate_code = get_next_candidate_code(
-        repository
+        repository=repository,
+        batch_id=batch["batch_id"],
     )
 
     unlinked_images = find_unlinked_images(
@@ -1081,17 +1171,38 @@ def create_candidate_from_page(
         raw_page=raw_page,
         extraction=extraction,
         candidate_code=candidate_code,
+        candidate_type=candidate_type,
         unlinked_images=unlinked_images,
     )
 
     print()
 
-    confirmation = input(
-        "Type CREATE to create this candidate, "
-        "or press Enter to cancel: "
-    ).strip().upper()
+    if confirm_create:
+        confirmation = "CREATE"
 
-    if confirmation != "CREATE":
+    elif non_interactive:
+        confirmation = ""
+
+    else:
+        confirmation = normalize_confirmation(
+            input(
+                "Type CREATE, CREATE_CANDIDATE, or CONFIRM "
+                "to create this candidate, or press Enter to cancel: "
+            )
+        )
+
+    if confirmation not in {
+        "CREATE",
+        "CREATE_CANDIDATE",
+        "CONFIRM",
+    }:
+        print()
+        print(
+            "Invalid confirmation. Use CREATE, CREATE_CANDIDATE, or CONFIRM."
+        )
+        print(
+            f"Received value: {confirmation or '[empty]'}"
+        )
         print(
             "Candidate creation cancelled."
         )
@@ -1103,6 +1214,7 @@ def create_candidate_from_page(
         raw_page=raw_page,
         extraction=extraction,
         candidate_code=candidate_code,
+        candidate_type=candidate_type,
     )
 
     candidate = insert_candidate(
@@ -1261,6 +1373,21 @@ def create_candidate_from_page(
 def main() -> None:
     """Create one product candidate from one cleaned Facebook post."""
     load_dotenv()
+    args = parse_arguments()
+
+    if args.non_interactive:
+        if not (
+            args.raw_page_id
+            or args.source_url_id
+        ):
+            raise RuntimeError(
+                "--non-interactive requires --raw-page-id or --source-url-id."
+            )
+
+        if not args.confirm_create:
+            raise RuntimeError(
+                "--non-interactive requires --confirm-create."
+            )
 
     print(
         "Facebook cleaned-post candidate extractor started."
@@ -1281,6 +1408,8 @@ def main() -> None:
     raw_pages = get_cleaned_raw_pages(
         repository=repository,
         batch_id=batch["batch_id"],
+        raw_page_id=args.raw_page_id,
+        source_url_id=args.source_url_id,
     )
 
     print(
@@ -1289,13 +1418,17 @@ def main() -> None:
     )
 
     selected_raw_page = select_raw_page(
-        raw_pages
+        raw_pages=raw_pages,
+        non_interactive=args.non_interactive,
     )
 
     result = create_candidate_from_page(
         repository=repository,
         batch=batch,
         raw_page=selected_raw_page,
+        candidate_type=args.candidate_type,
+        confirm_create=args.confirm_create,
+        non_interactive=args.non_interactive,
     )
 
     print()

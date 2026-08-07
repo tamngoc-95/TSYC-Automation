@@ -1,3 +1,4 @@
+import argparse
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -5,109 +6,102 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.repositories.supabase_repository import SupabaseRepository
 
 
-CHECKER_NAME = "woocommerce_draft_readiness_checker"
-CHECKER_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
+VALID_CONFIRMATIONS = {"READY", "READY_FOR_DRAFT"}
 
 
 def utc_now() -> str:
     """Return the current UTC timestamp."""
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
-def get_product_to_check(
-    repository: SupabaseRepository,
-) -> dict[str, Any] | None:
-    """Return one product that has not yet been marked ready."""
-    response = (
-        repository.client
-        .table("internal_products")
-        .select(
-            "internal_product_id,"
-            "candidate_id,"
-            "primary_reference_id,"
-            "product_code,"
-            "product_type,"
-            "title,"
-            "author,"
-            "isbn,"
-            "publisher,"
-            "page_count,"
-            "weight_grams,"
-            "metadata_status,"
-            "pricing_status,"
-            "image_status,"
-            "content_status,"
-            "woocommerce_status,"
-            "review_required,"
-            "review_reason,"
-            "product_metadata"
-        )
-        .eq(
-            "is_active",
-            True,
-        )
-        .in_(
-            "woocommerce_status",
-            [
-                "NOT_CREATED",
-                "FAILED",
-            ],
-        )
-        .order(
-            "created_at",
-            desc=False,
-        )
-        .limit(1)
-        .execute()
+def normalize_confirmation(value: str | None) -> str:
+    """Normalize confirmation values across case, spaces, and hyphens."""
+    if not value:
+        return ""
+
+    return (
+        value.strip()
+        .upper()
+        .replace("-", "_")
+        .replace(" ", "_")
     )
 
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Check and update WooCommerce draft readiness."
+    )
+    parser.add_argument(
+        "--product-code",
+        help="Check one exact internal product code.",
+    )
+    parser.add_argument(
+        "--confirm-ready",
+        action="store_true",
+        help="Mark a ready product as READY_FOR_DRAFT without prompting.",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Disable all input prompts.",
+    )
+    return parser.parse_args()
+
+
+def get_product(
+    repository: SupabaseRepository,
+    product_code: str | None,
+) -> dict[str, Any] | None:
+    """Return one active product that has not created a WooCommerce draft."""
+    query = (
+        repository.client
+        .table("internal_products")
+        .select("*")
+        .eq("is_active", True)
+        .in_("woocommerce_status", ["NOT_CREATED", "READY_FOR_DRAFT"])
+    )
+
+    if product_code:
+        query = query.eq("product_code", product_code)
+
+    response = query.order("created_at", desc=False).limit(1).execute()
     rows = response.data or []
 
-    if not rows:
-        return None
+    if product_code and not rows:
+        raise RuntimeError(
+            "No eligible internal product was found for product code: "
+            f"{product_code}"
+        )
 
-    return rows[0]
+    return rows[0] if rows else None
 
 
 def get_candidate(
     repository: SupabaseRepository,
-    candidate_id: str,
+    candidate_id: str | None,
 ) -> dict[str, Any] | None:
-    """Return candidate identity data."""
+    """Return candidate identity status."""
+    if not candidate_id:
+        return None
+
     response = (
         repository.client
-        .table("product_candidates")
-        .select(
-            "candidate_id,"
-            "candidate_code,"
-            "identity_status,"
-            "identity_confidence,"
-            "workflow_status,"
-            "review_required"
-        )
-        .eq(
-            "candidate_id",
-            candidate_id,
-        )
+        .table("candidates")
+        .select("candidate_id,identity_status")
+        .eq("candidate_id", candidate_id)
         .limit(1)
         .execute()
     )
-
     rows = response.data or []
-
-    if not rows:
-        return None
-
-    return rows[0]
+    return rows[0] if rows else None
 
 
 def get_approved_content(
@@ -118,538 +112,268 @@ def get_approved_content(
     response = (
         repository.client
         .table("product_contents")
-        .select(
-            "product_content_id,"
-            "product_name,"
-            "short_description,"
-            "long_description,"
-            "product_details,"
-            "content_status,"
-            "review_required,"
-            "approved_at"
-        )
-        .eq(
-            "internal_product_id",
-            internal_product_id,
-        )
-        .eq(
-            "content_language",
-            "vi",
-        )
-        .eq(
-            "content_status",
-            "APPROVED",
-        )
-        .eq(
-            "review_required",
-            False,
-        )
+        .select("product_content_id,content_status,review_required,approved_at")
+        .eq("internal_product_id", internal_product_id)
+        .eq("content_language", "vi")
+        .eq("content_status", "APPROVED")
+        .eq("review_required", False)
         .limit(1)
         .execute()
     )
-
     rows = response.data or []
-
-    if not rows:
-        return None
-
-    return rows[0]
+    return rows[0] if rows else None
 
 
-def get_selected_main_image(
+def get_selected_main_images(
     repository: SupabaseRepository,
-    candidate_id: str,
-) -> dict[str, Any] | None:
-    """Return the selected publishable main image."""
+    internal_product_id: str,
+) -> list[dict[str, Any]]:
+    """Return selected main images for validation."""
     response = (
         repository.client
         .table("product_images")
         .select(
-            "image_id,"
-            "candidate_id,"
-            "source_type,"
-            "storage_bucket,"
-            "storage_path,"
-            "mime_type,"
-            "width_pixels,"
-            "height_pixels,"
-            "image_role,"
-            "usage_rights_status,"
-            "is_main_image_candidate,"
-            "is_selected_main_image,"
-            "is_publish_eligible,"
-            "image_status"
+            "product_image_id,image_status,is_publish_eligible,"
+            "is_selected_main_image,image_role,usage_rights_status"
         )
-        .eq(
-            "candidate_id",
-            candidate_id,
-        )
-        .eq(
-            "is_selected_main_image",
-            True,
-        )
-        .eq(
-            "is_publish_eligible",
-            True,
-        )
-        .eq(
-            "image_status",
-            "VALIDATED",
-        )
-        .limit(1)
+        .eq("internal_product_id", internal_product_id)
+        .eq("is_selected_main_image", True)
         .execute()
     )
-
-    rows = response.data or []
-
-    if not rows:
-        return None
-
-    return rows[0]
+    return response.data or []
 
 
 def evaluate_readiness(
     product: dict[str, Any],
     candidate: dict[str, Any] | None,
-    content: dict[str, Any] | None,
-    image: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Evaluate whether a product can become a WooCommerce draft."""
-    blocking_issues: list[str] = []
+    approved_content: dict[str, Any] | None,
+    selected_images: list[dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    """Return blocking issues and non-blocking warnings."""
+    blockers: list[str] = []
     warnings: list[str] = []
 
-    if not candidate:
-        blocking_issues.append(
-            "Linked product candidate was not found."
-        )
+    identity_status = (
+        candidate.get("identity_status")
+        if candidate
+        else None
+    )
 
-    elif candidate.get(
-        "identity_status"
-    ) != "IDENTITY_VERIFIED":
-        blocking_issues.append(
-            "Candidate identity is not verified."
-        )
+    if identity_status != "IDENTITY_VERIFIED":
+        blockers.append("Product identity is not verified.")
 
-    if not product.get(
-        "title"
-    ):
-        blocking_issues.append(
-            "Internal product title is missing."
-        )
+    if product.get("content_status") != "APPROVED":
+        blockers.append("Internal product content is not approved.")
 
-    if product.get(
-        "content_status"
-    ) != "APPROVED":
-        blocking_issues.append(
-            "Internal product content is not approved."
-        )
+    if approved_content is None:
+        blockers.append("Approved Vietnamese product content was not found.")
 
-    if not content:
-        blocking_issues.append(
-            "Approved Vietnamese product content was not found."
-        )
+    if product.get("image_status") != "APPROVED":
+        blockers.append("Internal product image status is not approved.")
 
+    if len(selected_images) != 1:
+        blockers.append(
+            "Exactly one selected main image is required."
+        )
     else:
-        if not content.get(
-            "product_name"
-        ):
-            blocking_issues.append(
-                "Approved product name is missing."
+        image = selected_images[0]
+
+        if image.get("image_status") != "VALIDATED":
+            blockers.append("Selected main image is not validated.")
+
+        if image.get("is_publish_eligible") is not True:
+            blockers.append(
+                "Selected main image is not publish eligible."
             )
 
-        if not content.get(
-            "short_description"
-        ):
-            blocking_issues.append(
-                "Approved short description is missing."
-            )
+    if not product.get("isbn"):
+        warnings.append("ISBN is missing.")
 
-        if not content.get(
-            "long_description"
-        ):
-            blocking_issues.append(
-                "Approved long description is missing."
-            )
+    if product.get("weight_grams") is None:
+        warnings.append("Product weight is missing.")
 
-    if product.get(
-        "image_status"
-    ) != "APPROVED":
-        blocking_issues.append(
-            "Internal product image status is not approved."
-        )
-
-    if not image:
-        blocking_issues.append(
-            "A selected publishable main image was not found."
-        )
-
-    if product.get(
-        "review_required"
-    ):
-        blocking_issues.append(
-            "Internal product still requires manual review."
-        )
-
-    # These fields do not block draft creation.
-    if not product.get(
-        "isbn"
-    ):
+    if product.get("pricing_status") != "APPROVED":
         warnings.append(
-            "ISBN is missing."
+            "Pricing is not approved. The shop owner must add or review "
+            "the price before publishing."
         )
 
-    if product.get(
-        "weight_grams"
-    ) is None:
-        warnings.append(
-            "Product weight is missing."
-        )
-
-    if product.get(
-        "pricing_status"
-    ) != "APPROVED":
-        warnings.append(
-            "Pricing is not approved. "
-            "The shop owner must add or review the price "
-            "before publishing."
-        )
-
-    is_ready = not blocking_issues
-
-    return {
-        "is_ready": is_ready,
-        "blocking_issues": blocking_issues,
-        "warnings": warnings,
-    }
+    return blockers, warnings
 
 
 def print_result(
     product: dict[str, Any],
     candidate: dict[str, Any] | None,
-    content: dict[str, Any] | None,
-    image: dict[str, Any] | None,
-    result: dict[str, Any],
+    approved_content: dict[str, Any] | None,
+    selected_images: list[dict[str, Any]],
+    blockers: list[str],
+    warnings: list[str],
 ) -> None:
     """Print readiness details."""
     print()
     print("=" * 72)
     print("WOOCOMMERCE DRAFT READINESS")
     print("=" * 72)
-
-    print(
-        "Product code: "
-        f"{product.get('product_code')}"
-    )
-
-    print(
-        "Title: "
-        f"{product.get('title')}"
-    )
-
+    print(f"Product code: {product.get('product_code')}")
+    print(f"Title: {product.get('title')}")
     print(
         "Identity status: "
-        f"{candidate.get('identity_status') if candidate else '[not found]'}"
+        f"{candidate.get('identity_status') if candidate else '[missing]'}"
     )
-
-    print(
-        "Content status: "
-        f"{product.get('content_status')}"
-    )
-
-    print(
-        "Approved content: "
-        f"{'YES' if content else 'NO'}"
-    )
-
-    print(
-        "Image status: "
-        f"{product.get('image_status')}"
-    )
-
+    print(f"Content status: {product.get('content_status')}")
+    print(f"Approved content: {'YES' if approved_content else 'NO'}")
+    print(f"Image status: {product.get('image_status')}")
     print(
         "Selected main image: "
-        f"{image.get('image_id') if image else '[not found]'}"
+        f"{selected_images[0].get('product_image_id') if len(selected_images) == 1 else '[invalid count]'}"
     )
-
-    print(
-        "Pricing status: "
-        f"{product.get('pricing_status')}"
-    )
+    print(f"Pricing status: {product.get('pricing_status')}")
 
     print()
-
-    if result["blocking_issues"]:
+    if blockers:
         print("Blocking issues:")
-
-        for issue in result[
-            "blocking_issues"
-        ]:
-            print(
-                f"- {issue}"
-            )
-
+        for item in blockers:
+            print(f"- {item}")
     else:
-        print(
-            "Blocking issues: none"
-        )
-
-    if result["warnings"]:
-        print()
-        print("Warnings:")
-
-        for warning in result[
-            "warnings"
-        ]:
-            print(
-                f"- {warning}"
-            )
+        print("Blocking issues: none")
 
     print()
-    print(
-        "Draft readiness: "
-        f"{'READY' if result['is_ready'] else 'NOT READY'}"
-    )
-
-
-def build_readiness_metadata(
-    product: dict[str, Any],
-    content: dict[str, Any] | None,
-    image: dict[str, Any] | None,
-    result: dict[str, Any],
-) -> dict[str, Any]:
-    """Add readiness details without removing existing metadata."""
-    existing_metadata = product.get(
-        "product_metadata"
-    )
-
-    if isinstance(
-        existing_metadata,
-        dict,
-    ):
-        product_metadata = dict(
-            existing_metadata
-        )
-
+    if warnings:
+        print("Warnings:")
+        for item in warnings:
+            print(f"- {item}")
     else:
-        product_metadata = {}
+        print("Warnings: none")
 
-    product_metadata[
-        "draft_readiness"
-    ] = {
-        "checker_name": CHECKER_NAME,
-        "checker_version": CHECKER_VERSION,
-        "checked_at": utc_now(),
-        "is_ready": result[
-            "is_ready"
-        ],
-        "blocking_issues": result[
-            "blocking_issues"
-        ],
-        "warnings": result[
-            "warnings"
-        ],
-        "product_content_id": (
-            content.get(
-                "product_content_id"
-            )
-            if content
-            else None
-        ),
-        "main_image_id": (
-            image.get(
-                "image_id"
-            )
-            if image
-            else None
-        ),
-        "price_required_before_publish": True,
-    }
-
-    return product_metadata
+    print()
+    print(f"Draft readiness: {'READY' if not blockers else 'NOT READY'}")
 
 
-def save_ready_status(
+def mark_ready(
     repository: SupabaseRepository,
-    product: dict[str, Any],
-    content: dict[str, Any],
-    image: dict[str, Any],
-    result: dict[str, Any],
+    internal_product_id: str,
 ) -> None:
-    """Mark the internal product as ready for WooCommerce draft."""
-    if not result["is_ready"]:
-        raise RuntimeError(
-            "Product is not ready for WooCommerce draft creation."
-        )
-
-    product_metadata = build_readiness_metadata(
-        product=product,
-        content=content,
-        image=image,
-        result=result,
-    )
-
+    """Mark an internal product as ready for WooCommerce draft creation."""
     response = (
         repository.client
         .table("internal_products")
         .update(
             {
                 "woocommerce_status": "READY_FOR_DRAFT",
-                "review_required": False,
-                "review_reason": None,
-                "product_metadata": product_metadata,
                 "updated_at": utc_now(),
             }
         )
-        .eq(
-            "internal_product_id",
-            product[
-                "internal_product_id"
-            ],
-        )
+        .eq("internal_product_id", internal_product_id)
         .execute()
     )
 
     if not response.data:
-        raise RuntimeError(
-            "Internal product readiness update returned no data."
-        )
+        raise RuntimeError("Draft readiness update returned no data.")
 
 
 def main() -> None:
-    """Check one internal product for WooCommerce draft readiness."""
+    """Check one product and optionally mark it ready for draft creation."""
     load_dotenv()
+    args = parse_arguments()
 
     print("=" * 72)
     print("WOOCOMMERCE DRAFT READINESS CHECKER")
     print("=" * 72)
-    print(
-        f"Version: {CHECKER_VERSION}"
-    )
+    print(f"Version: {SCRIPT_VERSION}")
 
     repository = SupabaseRepository()
-
-    print(
-        "Searching for a product to check..."
-    )
-
-    product = get_product_to_check(
-        repository
-    )
+    product = get_product(repository, args.product_code)
 
     if product is None:
-        print(
-            "No internal product requiring a readiness check was found."
-        )
+        print("No product requires a draft readiness check.")
         return
 
     candidate = get_candidate(
-        repository=repository,
-        candidate_id=product[
-            "candidate_id"
-        ],
+        repository,
+        product.get("candidate_id"),
+    )
+    approved_content = get_approved_content(
+        repository,
+        product["internal_product_id"],
+    )
+    selected_images = get_selected_main_images(
+        repository,
+        product["internal_product_id"],
     )
 
-    content = get_approved_content(
-        repository=repository,
-        internal_product_id=product[
-            "internal_product_id"
-        ],
-    )
-
-    image = get_selected_main_image(
-        repository=repository,
-        candidate_id=product[
-            "candidate_id"
-        ],
-    )
-
-    result = evaluate_readiness(
-        product=product,
-        candidate=candidate,
-        content=content,
-        image=image,
+    blockers, warnings = evaluate_readiness(
+        product,
+        candidate,
+        approved_content,
+        selected_images,
     )
 
     print_result(
-        product=product,
-        candidate=candidate,
-        content=content,
-        image=image,
-        result=result,
+        product,
+        candidate,
+        approved_content,
+        selected_images,
+        blockers,
+        warnings,
     )
 
-    if not result[
-        "is_ready"
-    ]:
+    if blockers:
+        print()
+        print("The product was not updated because blocking issues remain.")
+        return
+
+    if product.get("woocommerce_status") == "READY_FOR_DRAFT":
+        print()
+        print("Product is already marked as READY_FOR_DRAFT.")
+        return
+
+    if args.confirm_ready:
+        confirmation = "READY"
+    elif args.non_interactive:
         print()
         print(
-            "The product was not updated because blocking "
-            "issues remain."
+            "The product is ready, but --confirm-ready was not supplied. "
+            "No database changes were made."
         )
         return
+    else:
+        confirmation = normalize_confirmation(
+            input(
+                "Type READY or READY_FOR_DRAFT to mark this product as "
+                "READY_FOR_DRAFT, or press Enter to cancel: "
+            )
+        )
 
-    print()
-
-    confirmation = input(
-        "Type READY to mark this product as READY_FOR_DRAFT, "
-        "or press Enter to cancel: "
-    ).strip().upper()
-
-    if confirmation != "READY":
+    if confirmation not in VALID_CONFIRMATIONS:
+        print()
         print(
-            "Draft readiness update was cancelled."
+            "Invalid confirmation. Enter READY or READY_FOR_DRAFT."
         )
+        print(
+            f"Received value: {confirmation or '[empty]'}"
+        )
+        print("Draft readiness update was cancelled.")
         return
 
-    if content is None or image is None:
-        raise RuntimeError(
-            "Approved content and main image are required."
-        )
-
-    save_ready_status(
-        repository=repository,
-        product=product,
-        content=content,
-        image=image,
-        result=result,
+    mark_ready(
+        repository,
+        product["internal_product_id"],
     )
 
     print()
-    print(
-        "WooCommerce status changed to READY_FOR_DRAFT."
-    )
-
-    print(
-        "Pricing remains optional for draft creation "
-        "and must be reviewed before publishing."
-    )
-
-    print()
-    print(
-        "Draft readiness check completed successfully."
-    )
+    print("Product marked as READY_FOR_DRAFT.")
 
 
 if __name__ == "__main__":
     try:
         main()
-
     except KeyboardInterrupt:
         print()
-        print(
-            "Draft readiness check was cancelled by the user."
-        )
+        print("Draft readiness check was cancelled by the user.")
         sys.exit(130)
-
     except Exception as error:
         print()
-        print(
-            "Draft readiness check failed."
-        )
-        print(
-            f"Error type: {type(error).__name__}"
-        )
-        print(
-            f"Error details: {error}"
-        )
+        print("Draft readiness check failed.")
+        print(f"Error type: {type(error).__name__}")
+        print(f"Error details: {error}")
         sys.exit(1)

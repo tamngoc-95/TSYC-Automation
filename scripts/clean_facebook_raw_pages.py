@@ -1,3 +1,4 @@
+import argparse
 import re
 import sys
 import unicodedata
@@ -15,7 +16,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 BATCH_CODE = "FB-2026-001"
-CLEANING_METHOD = "facebook_rule_based_cleaner_v0.2.0"
+CLEANING_METHOD = "facebook_rule_based_cleaner_v0.3.0"
 
 
 EXACT_LINES_TO_REMOVE = {
@@ -68,6 +69,63 @@ CONTENT_END_MARKERS = (
     "Bình luận dưới tên ",
     "Bạn đang bình luận dưới tên ",
 )
+
+
+def normalize_confirmation(
+    value: str | None,
+) -> str:
+    """Normalize confirmation values across case, spaces, and hyphens."""
+    if not value:
+        return ""
+
+    return (
+        value.strip()
+        .upper()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Clean one or more Facebook raw pages using rule-based cleaning."
+        )
+    )
+
+    parser.add_argument(
+        "--raw-page-id",
+        help="Process one exact Facebook raw page UUID.",
+    )
+
+    parser.add_argument(
+        "--source-url-id",
+        help="Process raw pages linked to one exact source URL UUID.",
+    )
+
+    parser.add_argument(
+        "--action",
+        choices=["SAVE", "REVIEW", "SKIP"],
+        help=(
+            "Apply one action without prompting. SAVE keeps the validation "
+            "result, REVIEW forces REVIEW_REQUIRED, SKIP makes no changes."
+        ),
+    )
+
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow explicit reprocessing of pages already marked CLEANED.",
+    )
+
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Disable prompts. Requires a selector and --action.",
+    )
+
+    return parser.parse_args()
 
 
 def remove_invisible_unicode_characters(
@@ -387,34 +445,42 @@ def validate_cleaned_text(
 def get_pending_raw_pages(
     repository: SupabaseRepository,
     batch_id: str,
+    raw_page_id: str | None = None,
+    source_url_id: str | None = None,
+    include_cleaned: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return Facebook raw pages waiting for cleaning."""
-    response = (
+    """Return Facebook raw pages available for cleaning."""
+    statuses = [
+        "PENDING",
+        "REVIEW_REQUIRED",
+    ]
+
+    if include_cleaned:
+        statuses.append("CLEANED")
+
+    query = (
         repository.client
         .table("raw_pages")
         .select(
             "raw_page_id, source_url_id, page_url, raw_title, "
             "raw_text, collector_name, collector_version, "
-            "cleaning_status"
-        )
-        .eq(
-            "batch_id",
-            batch_id,
-        )
-        .eq(
-            "page_type",
-            "FACEBOOK_POST",
-        )
-        .in_(
-            "cleaning_status",
-            [
-                "PENDING",
-                "REVIEW_REQUIRED",
-            ],
-        )
-        .order(
+            "cleaning_status, cleaned_text, cleaning_method, cleaned_at, "
             "collected_at"
         )
+        .eq("batch_id", batch_id)
+        .eq("page_type", "FACEBOOK_POST")
+        .in_("cleaning_status", statuses)
+    )
+
+    if raw_page_id:
+        query = query.eq("raw_page_id", raw_page_id)
+
+    if source_url_id:
+        query = query.eq("source_url_id", source_url_id)
+
+    response = (
+        query
+        .order("collected_at")
         .execute()
     )
 
@@ -496,6 +562,9 @@ def process_raw_page(
     repository: SupabaseRepository,
     batch_id: str,
     raw_page: dict[str, Any],
+    action: str | None = None,
+    non_interactive: bool = False,
+    force: bool = False,
 ) -> None:
     """Clean and update one Facebook raw page."""
     raw_page_id = raw_page[
@@ -506,6 +575,24 @@ def process_raw_page(
         raw_page.get("raw_text")
         or ""
     )
+
+    current_status = str(
+        raw_page.get("cleaning_status")
+        or ""
+    ).strip().upper()
+
+    if current_status == "CLEANED" and not force:
+        print()
+        print(
+            "Skipping page because cleaning_status is already CLEANED. "
+            "Use --force to reprocess it explicitly."
+        )
+        return
+
+    if not raw_text.strip():
+        raise RuntimeError(
+            "Facebook raw page contains no raw_text."
+        )
 
     print()
     print("=" * 70)
@@ -569,17 +656,25 @@ def process_raw_page(
 
         print("-" * 70)
 
-        confirmation = input(
-            "Type SAVE to store this cleaned text, "
-            "SKIP to leave the current status unchanged, "
-            "or REVIEW to save as REVIEW_REQUIRED: "
-        ).strip().upper()
+        if action:
+            confirmation = normalize_confirmation(action)
+
+        elif non_interactive:
+            confirmation = ""
+
+        else:
+            confirmation = normalize_confirmation(
+                input(
+                    "Type SAVE to store this cleaned text, "
+                    "SKIP to leave the current status unchanged, "
+                    "or REVIEW to save as REVIEW_REQUIRED: "
+                )
+            )
 
         if confirmation == "SKIP" or not confirmation:
             print(
                 "Skipped. Cleaning status was not changed."
             )
-
             return
 
         if confirmation == "REVIEW":
@@ -591,15 +686,12 @@ def process_raw_page(
                     "The cleaned text failed validation "
                     "and cannot be saved as CLEANED."
                 )
-
                 cleaning_status = "REVIEW_REQUIRED"
 
         else:
             print(
-                "Unsupported input. "
-                "Cleaning status was not changed."
+                "Unsupported input. Cleaning status was not changed."
             )
-
             return
 
         updated_page = update_cleaned_page(
@@ -669,10 +761,23 @@ def process_raw_page(
 
 
 def main() -> None:
-    """Clean Facebook raw pages for the pilot batch."""
+    """Clean Facebook raw pages for the configured batch."""
     load_dotenv(
         PROJECT_ROOT / ".env"
     )
+
+    args = parse_arguments()
+
+    if args.non_interactive:
+        if not (args.raw_page_id or args.source_url_id):
+            raise RuntimeError(
+                "--non-interactive requires --raw-page-id or --source-url-id."
+            )
+
+        if not args.action:
+            raise RuntimeError(
+                "--non-interactive requires --action."
+            )
 
     print(
         "Facebook raw page cleaner started."
@@ -689,17 +794,16 @@ def main() -> None:
     )
 
     if batch is None:
-        print(
+        raise RuntimeError(
             f"Batch was not found: {BATCH_CODE}"
         )
 
-        sys.exit(1)
-
     raw_pages = get_pending_raw_pages(
         repository=repository,
-        batch_id=batch[
-            "batch_id"
-        ],
+        batch_id=batch["batch_id"],
+        raw_page_id=args.raw_page_id,
+        source_url_id=args.source_url_id,
+        include_cleaned=args.force,
     )
 
     print(
@@ -708,19 +812,31 @@ def main() -> None:
     )
 
     if not raw_pages:
+        if args.raw_page_id or args.source_url_id:
+            raise RuntimeError(
+                "No Facebook raw page matched the supplied selector "
+                "and cleaning-status requirements."
+            )
+
         print(
             "No Facebook raw pages require cleaning."
         )
-
         return
+
+    if args.non_interactive and len(raw_pages) > 1:
+        raise RuntimeError(
+            "Multiple raw pages matched in non-interactive mode. "
+            "Use --raw-page-id to select one exact page."
+        )
 
     for raw_page in raw_pages:
         process_raw_page(
             repository=repository,
-            batch_id=batch[
-                "batch_id"
-            ],
+            batch_id=batch["batch_id"],
             raw_page=raw_page,
+            action=args.action,
+            non_interactive=args.non_interactive,
+            force=args.force,
         )
 
     print()
@@ -730,4 +846,25 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+
+    except KeyboardInterrupt:
+        print()
+        print(
+            "Facebook raw page cleaning was cancelled by the user."
+        )
+        sys.exit(130)
+
+    except Exception as error:
+        print()
+        print(
+            "Facebook raw page cleaning failed."
+        )
+        print(
+            f"Error type: {type(error).__name__}"
+        )
+        print(
+            f"Error details: {error}"
+        )
+        sys.exit(1)

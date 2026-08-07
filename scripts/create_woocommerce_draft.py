@@ -1,3 +1,4 @@
+import argparse
 import html
 import mimetypes
 import os
@@ -19,7 +20,14 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 CREATOR_NAME = "woocommerce_draft_creator"
-CREATOR_VERSION = "1.1.1"
+CREATOR_VERSION = "1.2.0"
+
+VALID_CONFIRMATIONS = {
+    "UPLOAD_AND_CREATE",
+    "CREATE",
+    "CREATE_DRAFT",
+    "DRAFT",
+}
 
 SUPPORTED_IMAGE_TYPES = {
     "image/jpeg": ".jpg",
@@ -65,6 +73,48 @@ class WordPressMediaError(Exception):
 def utc_now() -> str:
     """Return the current UTC timestamp."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_confirmation(
+    value: str | None,
+) -> str:
+    """Normalize confirmation values across case, spaces, and hyphens."""
+    if not value:
+        return ""
+
+    return (
+        value.strip()
+        .upper()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Upload validated images and create one WooCommerce product draft."
+        )
+    )
+    parser.add_argument(
+        "--product-code",
+        help="Create the draft for one exact internal product code.",
+    )
+    parser.add_argument(
+        "--confirm-create",
+        action="store_true",
+        help="Confirm draft creation without an interactive prompt.",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Disable interactive input. Use with --product-code and "
+            "--confirm-create for automation."
+        ),
+    )
+    return parser.parse_args()
 
 
 def get_required_environment_variable(
@@ -167,9 +217,10 @@ def sanitize_file_name(
 
 def get_ready_product(
     repository: SupabaseRepository,
+    product_code: str | None,
 ) -> dict[str, Any] | None:
-    """Return one internal product ready for WooCommerce draft creation."""
-    response = (
+    """Return one exact or next internal product ready for draft creation."""
+    query = (
         repository.client
         .table("internal_products")
         .select(
@@ -191,35 +242,33 @@ def get_ready_product(
             "pricing_status,"
             "woocommerce_status,"
             "review_required,"
-            "product_metadata"
+            "product_metadata,"
+            "created_at"
         )
-        .eq(
-            "is_active",
-            True,
-        )
-        .eq(
-            "woocommerce_status",
-            "READY_FOR_DRAFT",
-        )
-        .eq(
-            "review_required",
-            False,
-        )
-        .order(
-            "created_at",
-            desc=False,
-        )
+        .eq("is_active", True)
+        .eq("woocommerce_status", "READY_FOR_DRAFT")
+        .eq("review_required", False)
+    )
+
+    if product_code:
+        query = query.eq("product_code", product_code)
+
+    response = (
+        query
+        .order("created_at", desc=False)
         .limit(1)
         .execute()
     )
 
     rows = response.data or []
 
-    if not rows:
-        return None
+    if product_code and not rows:
+        raise RuntimeError(
+            "No READY_FOR_DRAFT internal product was found for "
+            f"product code: {product_code}"
+        )
 
-    return rows[0]
-
+    return rows[0] if rows else None
 
 def get_approved_content(
     repository: SupabaseRepository,
@@ -1291,7 +1340,7 @@ def build_woocommerce_payload(
         for media in uploaded_media
     ]
 
-    return {
+    payload = {
         "name": content[
             "product_name"
         ],
@@ -1342,6 +1391,29 @@ def build_woocommerce_payload(
             },
         ],
     }
+
+    if payload.get("status") != "draft":
+        raise RuntimeError(
+            "Safety guard failed: WooCommerce product status must be draft."
+        )
+
+    forbidden_price_fields = {
+        "regular_price",
+        "sale_price",
+        "price",
+    }
+
+    included_price_fields = forbidden_price_fields.intersection(
+        payload.keys()
+    )
+
+    if included_price_fields:
+        raise RuntimeError(
+            "Safety guard failed: draft payload must not include price fields. "
+            f"Found: {sorted(included_price_fields)}"
+        )
+
+    return payload
 
 
 def save_request_payload(
@@ -1733,6 +1805,19 @@ def main() -> None:
         PROJECT_ROOT / ".env"
     )
 
+    args = parse_arguments()
+
+    if args.non_interactive:
+        if not args.product_code:
+            raise RuntimeError(
+                "--non-interactive requires --product-code."
+            )
+
+        if not args.confirm_create:
+            raise RuntimeError(
+                "--non-interactive requires --confirm-create."
+            )
+
     print("=" * 72)
     print("WOOCOMMERCE DRAFT CREATOR")
     print("=" * 72)
@@ -1780,7 +1865,8 @@ def main() -> None:
     repository = SupabaseRepository()
 
     product = get_ready_product(
-        repository
+        repository=repository,
+        product_code=args.product_code,
     )
 
     if product is None:
@@ -1814,16 +1900,20 @@ def main() -> None:
             "No validated publishable product image was found."
         )
 
-    if not any(
-        bool(
+    selected_main_images = [
+        image
+        for image in images
+        if bool(
             image.get(
                 "is_selected_main_image"
             )
         )
-        for image in images
-    ):
+    ]
+
+    if len(selected_main_images) != 1:
         raise RuntimeError(
-            "A selected main product image was not found."
+            "Exactly one selected main product image is required. "
+            f"Found: {len(selected_main_images)}"
         )
 
     existing_sync = get_existing_sync(
@@ -1891,16 +1981,33 @@ def main() -> None:
 
     print()
 
-    confirmation = input(
-        "Type UPLOAD_AND_CREATE to upload images and create "
-        "the WooCommerce draft, or press Enter to cancel: "
-    ).strip().upper()
+    if args.confirm_create:
+        confirmation = "UPLOAD_AND_CREATE"
 
-    if confirmation != "UPLOAD_AND_CREATE":
+    elif args.non_interactive:
+        confirmation = ""
+
+    else:
+        confirmation = normalize_confirmation(
+            input(
+                "Type UPLOAD_AND_CREATE, CREATE, CREATE_DRAFT, or DRAFT "
+                "to upload images and create the WooCommerce draft, "
+                "or press Enter to cancel: "
+            )
+        )
+
+    if confirmation not in VALID_CONFIRMATIONS:
+        print()
+        print(
+            "Invalid confirmation. Use UPLOAD_AND_CREATE, CREATE, "
+            "CREATE_DRAFT, or DRAFT."
+        )
+        print(
+            f"Received value: {confirmation or '[empty]'}"
+        )
         print(
             "WooCommerce draft creation was cancelled."
         )
-
         return
 
     if existing_sync is None:
@@ -1935,6 +2042,22 @@ def main() -> None:
             application_password=wordpress_application_password,
             timeout_seconds=timeout_seconds,
         )
+
+        if product.get("woocommerce_status") != "READY_FOR_DRAFT":
+            raise RuntimeError(
+                "Product status changed before draft creation. "
+                "Expected READY_FOR_DRAFT."
+            )
+
+        if product.get("content_status") != "APPROVED":
+            raise RuntimeError(
+                "Internal product content must remain APPROVED."
+            )
+
+        if product.get("image_status") != "APPROVED":
+            raise RuntimeError(
+                "Internal product image status must remain APPROVED."
+            )
 
         woo_payload = build_woocommerce_payload(
             product=product,

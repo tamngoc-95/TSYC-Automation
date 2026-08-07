@@ -1,3 +1,4 @@
+import argparse
 import re
 import sys
 import unicodedata
@@ -16,7 +17,14 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 MATCHER_NAME = "candidate_identity_matcher"
-MATCHER_VERSION = "1.3.0"
+MATCHER_VERSION = "1.4.0"
+
+VALID_CONFIRMATIONS = {
+    "SAVE",
+    "APPLY",
+    "CONFIRM",
+    "SAVE_RESULT",
+}
 
 
 def utc_now() -> str:
@@ -24,6 +32,69 @@ def utc_now() -> str:
     return datetime.now(
         timezone.utc
     ).isoformat()
+
+
+def normalize_confirmation(
+    value: str | None,
+) -> str:
+    """Normalize confirmation values across case, spaces, and hyphens."""
+    if not value:
+        return ""
+
+    return (
+        value.strip()
+        .upper()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Match one product candidate identity using single-source "
+            "or multi-source evidence."
+        )
+    )
+    parser.add_argument(
+        "--candidate-code",
+        help="Process one exact candidate code.",
+    )
+    parser.add_argument(
+        "--candidate-id",
+        help="Process one exact candidate UUID.",
+    )
+    parser.add_argument(
+        "--reference-id",
+        help=(
+            "Process one exact unmatched reference. This forces "
+            "single-reference mode."
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["AUTO", "CONSENSUS", "SINGLE"],
+        default="AUTO",
+        help=(
+            "AUTO prefers multi-source consensus, CONSENSUS requires at least "
+            "two references, SINGLE processes one unmatched reference."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-save",
+        action="store_true",
+        help="Save the calculated identity result without prompting.",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Disable input prompts. Requires a candidate selector and "
+            "--confirm-save."
+        ),
+    )
+    return parser.parse_args()
 
 
 def normalize_text(
@@ -101,14 +172,12 @@ def calculate_similarity(
 
 def get_unmatched_reference(
     repository: SupabaseRepository,
+    candidate_code: str | None = None,
+    candidate_id: str | None = None,
+    reference_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """
-    Return one valid reference waiting for identity matching.
-
-    References without source_url_id are ignored because they cannot
-    be linked safely to candidate_reference_sources.
-    """
-    reference_response = (
+    """Return one valid unmatched reference for one exact or queued candidate."""
+    query = (
         repository.client
         .table("product_references")
         .select(
@@ -133,103 +202,31 @@ def get_unmatched_reference(
             "raw_metadata,"
             "collected_at"
         )
-        .is_(
-            "match_decision",
-            "null",
-        )
-        .not_.is_(
-            "source_url_id",
-            "null",
-        )
-        .order(
-            "source_priority",
-            desc=False,
-        )
-        .order(
-            "collected_at",
-            desc=False,
-        )
-        .limit(20)
+        .is_("match_decision", "null")
+        .not_.is_("source_url_id", "null")
+    )
+
+    if candidate_id:
+        query = query.eq("candidate_id", candidate_id)
+
+    if reference_id:
+        query = query.eq("reference_id", reference_id)
+
+    reference_response = (
+        query
+        .order("source_priority", desc=False)
+        .order("collected_at", desc=False)
+        .limit(50)
         .execute()
     )
 
-    references = (
-        reference_response.data
-        or []
-    )
+    references = reference_response.data or []
 
     for reference in references:
-        candidate_id = reference.get(
-            "candidate_id"
-        )
+        current_candidate_id = reference.get("candidate_id")
+        source_url_id = reference.get("source_url_id")
 
-        source_url_id = reference.get(
-            "source_url_id"
-        )
-
-        if not candidate_id:
-            print(
-                "Skipping reference without candidate_id: "
-                f"{reference.get('reference_id')}"
-            )
-            continue
-
-        if not source_url_id:
-            print(
-                "Skipping reference without source_url_id: "
-                f"{reference.get('reference_id')}"
-            )
-            continue
-
-        discovery_response = (
-            repository.client
-            .table(
-                "candidate_reference_sources"
-            )
-            .select(
-                "discovery_id,"
-                "candidate_id,"
-                "source_url_id,"
-                "discovery_status,"
-                "is_selected_for_crawl"
-            )
-            .eq(
-                "candidate_id",
-                candidate_id,
-            )
-            .eq(
-                "source_url_id",
-                source_url_id,
-            )
-            .limit(1)
-            .execute()
-        )
-
-        discoveries = (
-            discovery_response.data
-            or []
-        )
-
-        if not discoveries:
-            print(
-                "Skipping reference because no matching discovery "
-                "record was found: "
-                f"{reference.get('reference_id')}"
-            )
-            continue
-
-        discovery = discoveries[0]
-
-        if discovery.get(
-            "discovery_status"
-        ) not in {
-            "CRAWLED",
-            "SELECTED",
-        }:
-            print(
-                "Skipping reference with unsupported discovery status: "
-                f"{discovery.get('discovery_status')}"
-            )
+        if not current_candidate_id or not source_url_id:
             continue
 
         candidate_response = (
@@ -260,35 +257,63 @@ def get_unmatched_reference(
                 "source_evidence,"
                 "conflict_fields"
             )
-            .eq(
-                "candidate_id",
-                candidate_id,
-            )
+            .eq("candidate_id", current_candidate_id)
             .limit(1)
             .execute()
         )
 
-        candidates = (
-            candidate_response.data
-            or []
+        candidates = candidate_response.data or []
+        if not candidates:
+            continue
+
+        candidate = candidates[0]
+
+        if candidate_code and candidate.get("candidate_code") != candidate_code:
+            continue
+
+        if candidate.get("identity_status") == "IDENTITY_VERIFIED":
+            raise RuntimeError(
+                "The selected candidate is already IDENTITY_VERIFIED. "
+                "Identity matching will not overwrite a verified candidate."
+            )
+
+        discovery_response = (
+            repository.client
+            .table("candidate_reference_sources")
+            .select(
+                "discovery_id,"
+                "candidate_id,"
+                "source_url_id,"
+                "discovery_status,"
+                "is_selected_for_crawl"
+            )
+            .eq("candidate_id", current_candidate_id)
+            .eq("source_url_id", source_url_id)
+            .limit(1)
+            .execute()
         )
 
-        if not candidates:
-            print(
-                "Skipping reference because the linked candidate "
-                "was not found: "
-                f"{reference.get('reference_id')}"
-            )
+        discoveries = discovery_response.data or []
+        if not discoveries:
+            continue
+
+        discovery = discoveries[0]
+
+        if discovery.get("discovery_status") not in {"CRAWLED", "SELECTED"}:
             continue
 
         return {
-            "candidate": candidates[0],
+            "candidate": candidate,
             "reference": reference,
             "discovery": discovery,
         }
 
-    return None
+    if candidate_code or candidate_id or reference_id:
+        raise RuntimeError(
+            "No valid unmatched reference was found for the supplied selector."
+        )
 
+    return None
 
 def calculate_match(
     candidate: dict[str, Any],
@@ -1082,9 +1107,11 @@ def is_specific_author(value: str | None) -> bool:
 
 def get_pending_consensus_candidate(
     repository: SupabaseRepository,
+    candidate_code: str | None = None,
+    candidate_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Return one pending candidate with at least two collected references."""
-    candidate_response = (
+    """Return one pending candidate with at least two valid references."""
+    query = (
         repository.client
         .table("product_candidates")
         .select(
@@ -1110,26 +1137,35 @@ def get_pending_consensus_candidate(
             "review_reason,"
             "decision_reason,"
             "source_evidence,"
-            "conflict_fields"
+            "conflict_fields,"
+            "updated_at"
         )
-        .eq(
-            "identity_status",
-            "IDENTITY_PENDING",
-        )
-        .order(
-            "updated_at",
-            desc=False,
-        )
+        .eq("identity_status", "IDENTITY_PENDING")
+    )
+
+    if candidate_code:
+        query = query.eq("candidate_code", candidate_code)
+
+    if candidate_id:
+        query = query.eq("candidate_id", candidate_id)
+
+    candidate_response = (
+        query
+        .order("updated_at", desc=False)
         .limit(50)
         .execute()
     )
 
     candidates = candidate_response.data or []
 
-    for candidate in candidates:
-        candidate_id = candidate.get("candidate_id")
+    if (candidate_code or candidate_id) and not candidates:
+        raise RuntimeError(
+            "No IDENTITY_PENDING candidate matched the supplied selector."
+        )
 
-        if not candidate_id:
+    for candidate in candidates:
+        current_candidate_id = candidate.get("candidate_id")
+        if not current_candidate_id:
             continue
 
         reference_response = (
@@ -1158,28 +1194,21 @@ def get_pending_consensus_candidate(
                 "raw_metadata,"
                 "collected_at"
             )
-            .eq(
-                "candidate_id",
-                candidate_id,
-            )
-            .order(
-                "source_priority",
-                desc=False,
-            )
-            .order(
-                "collected_at",
-                desc=False,
-            )
+            .eq("candidate_id", current_candidate_id)
+            .order("source_priority", desc=False)
+            .order("collected_at", desc=False)
             .execute()
         )
 
         references = reference_response.data or []
-
         valid_references = [
             reference
             for reference in references
-            if reference.get("source_url_id")
-            and reference.get("reference_title")
+            if (
+                reference.get("source_url_id")
+                and reference.get("reference_title")
+                and reference.get("match_decision") != "NO_MATCH"
+            )
         ]
 
         if len(valid_references) >= 2:
@@ -1189,7 +1218,6 @@ def get_pending_consensus_candidate(
             }
 
     return None
-
 
 def choose_best_reference(
     references: list[dict[str, Any]],
@@ -1859,92 +1887,145 @@ def update_references_from_consensus(
                 decision=reference_decision,
             )
 
+def resolve_save_confirmation(
+    args: argparse.Namespace,
+    prompt: str,
+) -> bool:
+    """Resolve whether a calculated identity result may be saved."""
+    if args.confirm_save:
+        confirmation = "SAVE"
+    elif args.non_interactive:
+        confirmation = ""
+    else:
+        confirmation = normalize_confirmation(
+            input(prompt)
+        )
+
+    if confirmation not in VALID_CONFIRMATIONS:
+        print()
+        print(
+            "Invalid confirmation. Use SAVE, APPLY, CONFIRM, or SAVE_RESULT."
+        )
+        print(
+            f"Received value: {confirmation or '[empty]'}"
+        )
+        return False
+
+    return True
+
+
 def main() -> None:
     """Match one candidate using multi-source consensus when available."""
     load_dotenv()
+    args = parse_arguments()
+
+    if args.candidate_code and args.candidate_id:
+        raise RuntimeError(
+            "Use either --candidate-code or --candidate-id, not both."
+        )
+
+    if args.reference_id and args.mode == "CONSENSUS":
+        raise RuntimeError(
+            "--reference-id cannot be used with --mode CONSENSUS."
+        )
+
+    if args.reference_id:
+        args.mode = "SINGLE"
+
+    if args.non_interactive:
+        if not (args.candidate_code or args.candidate_id):
+            raise RuntimeError(
+                "--non-interactive requires --candidate-code or --candidate-id."
+            )
+        if not args.confirm_save:
+            raise RuntimeError(
+                "--non-interactive requires --confirm-save."
+            )
 
     print("=" * 72)
     print("CANDIDATE IDENTITY MATCHER")
     print("=" * 72)
-    print(
-        f"Version: {MATCHER_VERSION}"
-    )
+    print(f"Version: {MATCHER_VERSION}")
+    print(f"Mode: {args.mode}")
 
     repository = SupabaseRepository()
 
-    print(
-        "Searching for a pending multi-source identity consensus..."
-    )
-
-    consensus_item = get_pending_consensus_candidate(
-        repository
-    )
-
-    if consensus_item is not None:
-        candidate = consensus_item[
-            "candidate"
-        ]
-        references = consensus_item[
-            "references"
-        ]
-
-        consensus = calculate_consensus_match(
-            candidate=candidate,
-            references=references,
+    if args.mode in {"AUTO", "CONSENSUS"}:
+        print(
+            "Searching for a pending multi-source identity consensus..."
         )
 
-        print_consensus_result(
-            candidate=candidate,
-            consensus=consensus,
+        consensus_item = get_pending_consensus_candidate(
+            repository=repository,
+            candidate_code=args.candidate_code,
+            candidate_id=args.candidate_id,
         )
 
-        print()
+        if consensus_item is not None:
+            candidate = consensus_item["candidate"]
+            references = consensus_item["references"]
+            consensus = calculate_consensus_match(
+                candidate=candidate,
+                references=references,
+            )
+            print_consensus_result(
+                candidate=candidate,
+                consensus=consensus,
+            )
+            print()
 
-        confirmation = input(
-            "Type SAVE to save this consensus result, "
-            "or press Enter to cancel: "
-        ).strip().upper()
+            if not resolve_save_confirmation(
+                args,
+                (
+                    "Type SAVE, APPLY, CONFIRM, or SAVE_RESULT to save "
+                    "this consensus result, or press Enter to cancel: "
+                ),
+            ):
+                print(
+                    "Identity consensus result was not saved."
+                )
+                return
 
-        if confirmation != "SAVE":
+            update_candidate_from_consensus(
+                repository=repository,
+                candidate=candidate,
+                consensus=consensus,
+            )
             print(
-                "Identity consensus result was not saved."
+                "Candidate identity consensus updated."
+            )
+
+            update_references_from_consensus(
+                repository=repository,
+                consensus=consensus,
+            )
+            print(
+                "Reference and discovery statuses updated."
+            )
+            print()
+            print(
+                "Multi-source identity matching completed successfully."
             )
             return
 
-        update_candidate_from_consensus(
-            repository=repository,
-            candidate=candidate,
-            consensus=consensus,
-        )
+        if args.mode == "CONSENSUS":
+            raise RuntimeError(
+                "Consensus mode requires at least two valid references."
+            )
 
         print(
-            "Candidate identity consensus updated."
+            "No pending multi-source candidate was found."
         )
 
-        update_references_from_consensus(
-            repository=repository,
-            consensus=consensus,
-        )
-
-        print(
-            "Reference and discovery statuses updated."
-        )
-
-        print()
-        print(
-            "Multi-source identity matching completed successfully."
-        )
-        return
-
-    print(
-        "No pending multi-source candidate was found."
-    )
     print(
         "Searching for an unmatched product reference..."
     )
 
     queue_item = get_unmatched_reference(
-        repository
+        repository=repository,
+        candidate_code=args.candidate_code,
+        candidate_id=args.candidate_id,
+        reference_id=args.reference_id,
     )
 
     if queue_item is None:
@@ -1953,17 +2034,9 @@ def main() -> None:
         )
         return
 
-    candidate = queue_item[
-        "candidate"
-    ]
-
-    reference = queue_item[
-        "reference"
-    ]
-
-    discovery = queue_item[
-        "discovery"
-    ]
+    candidate = queue_item["candidate"]
+    reference = queue_item["reference"]
+    discovery = queue_item["discovery"]
 
     validate_queue_item(
         candidate=candidate,
@@ -1982,15 +2055,15 @@ def main() -> None:
         discovery=discovery,
         result=result,
     )
-
     print()
 
-    confirmation = input(
-        "Type SAVE to save this identity result, "
-        "or press Enter to cancel: "
-    ).strip().upper()
-
-    if confirmation != "SAVE":
+    if not resolve_save_confirmation(
+        args,
+        (
+            "Type SAVE, APPLY, CONFIRM, or SAVE_RESULT to save "
+            "this identity result, or press Enter to cancel: "
+        ),
+    ):
         print(
             "Identity result was not saved."
         )
@@ -2002,7 +2075,6 @@ def main() -> None:
         reference=reference,
         result=result,
     )
-
     print(
         "Candidate identity status updated."
     )
@@ -2012,7 +2084,6 @@ def main() -> None:
         reference=reference,
         result=result,
     )
-
     print(
         "Product reference match result updated."
     )
@@ -2020,15 +2091,11 @@ def main() -> None:
     update_discovery_status(
         repository=repository,
         discovery=discovery,
-        decision=result[
-            "match_decision"
-        ],
+        decision=result["match_decision"],
     )
-
     print(
         "Discovery status updated."
     )
-
     print()
     print(
         "Identity matching completed successfully."

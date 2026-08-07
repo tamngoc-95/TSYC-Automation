@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import re
 import sys
@@ -22,7 +23,67 @@ BATCH_CODE = "FB-2026-001"
 AUTHORIZED_GROUP_ID = "2415122391976246"
 
 COLLECTOR_NAME = "facebook_permalink_container_collector"
-COLLECTOR_VERSION = "0.3.0"
+COLLECTOR_VERSION = "0.4.0"
+
+
+def normalize_confirmation(
+    value: str | None,
+) -> str:
+    """Normalize confirmation values across case, spaces, and hyphens."""
+    if not value:
+        return ""
+
+    return (
+        value.strip()
+        .upper()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Collect one authorized Facebook group permalink and save "
+            "the selected post container to Supabase."
+        )
+    )
+
+    parser.add_argument(
+        "--source-url-id",
+        help="Process one exact source URL UUID.",
+    )
+
+    parser.add_argument(
+        "--source-url",
+        help="Process one exact authorized Facebook permalink URL.",
+    )
+
+    parser.add_argument(
+        "--confirm-save",
+        action="store_true",
+        help="Confirm saving the collected post without prompting.",
+    )
+
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help=(
+            "Run Chrome headlessly. Manual mode remains visible by default."
+        ),
+    )
+
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Disable input prompts. Requires --source-url-id or --source-url "
+            "and --confirm-save."
+        ),
+    )
+
+    return parser.parse_args()
 
 
 def validate_facebook_post_url(url: str) -> None:
@@ -321,27 +382,16 @@ def select_best_candidate(
     return best_name, best_text
 
 
-def main() -> None:
-    """Collect one pending Facebook post and save it to Supabase."""
-    print("Collector script started.")
-
-    if not PROFILE_DIRECTORY.exists():
-        print("Facebook browser profile was not found.")
-        print(f"Expected path: {PROFILE_DIRECTORY}")
-        sys.exit(1)
-
-    repository = SupabaseRepository()
-
-    batch = repository.get_batch_by_code(
-        BATCH_CODE
-    )
-
-    if batch is None:
-        print(f"Batch was not found: {BATCH_CODE}")
-        sys.exit(1)
-
+def select_pending_source(
+    repository: SupabaseRepository,
+    batch_id: str,
+    source_url_id: str | None = None,
+    source_url: str | None = None,
+    non_interactive: bool = False,
+) -> dict:
+    """Select exactly one pending Facebook source URL."""
     pending_sources = repository.get_pending_source_urls(
-        batch_id=batch["batch_id"],
+        batch_id=batch_id,
         source_type="FACEBOOK_POST",
     )
 
@@ -351,27 +401,183 @@ def main() -> None:
     )
 
     if not pending_sources:
-        print("No pending Facebook source URLs were found.")
-        return
+        raise RuntimeError(
+            "No pending Facebook source URLs were found."
+        )
 
-    source = pending_sources[0]
+    matching_sources = pending_sources
 
-    source_url_id = source["source_url_id"]
-    source_url = source["source_url"]
-    source_name = source.get("source_name")
+    if source_url_id:
+        matching_sources = [
+            item
+            for item in matching_sources
+            if str(item.get("source_url_id")) == source_url_id
+        ]
+
+    if source_url:
+        matching_sources = [
+            item
+            for item in matching_sources
+            if str(item.get("source_url") or "").strip() == source_url.strip()
+        ]
+
+    if source_url_id or source_url:
+        if not matching_sources:
+            raise RuntimeError(
+                "No pending Facebook source matched the supplied selector."
+            )
+
+        if len(matching_sources) > 1:
+            raise RuntimeError(
+                "The supplied selector matched multiple pending Facebook sources."
+            )
+
+        return matching_sources[0]
+
+    if non_interactive:
+        raise RuntimeError(
+            "--non-interactive requires --source-url-id or --source-url."
+        )
+
+    if len(matching_sources) == 1:
+        return matching_sources[0]
+
+    print()
+    print("Pending Facebook sources:")
+
+    for index, item in enumerate(
+        matching_sources,
+        start=1,
+    ):
+        print()
+        print(
+            f"[{index}] {item.get('source_url')}"
+        )
+        print(
+            "    Source URL ID: "
+            f"{item.get('source_url_id')}"
+        )
+        print(
+            "    Reason: "
+            f"{item.get('source_name') or '[not provided]'}"
+        )
+
+    print()
+
+    selection = input(
+        "Enter one source number to collect, "
+        "or press Enter to cancel: "
+    ).strip()
+
+    if not selection:
+        raise KeyboardInterrupt
+
+    try:
+        selected_index = int(selection) - 1
+
+    except ValueError as error:
+        raise ValueError(
+            "The selected source number must be numeric."
+        ) from error
+
+    if (
+        selected_index < 0
+        or selected_index >= len(matching_sources)
+    ):
+        raise ValueError(
+            "The selected source number is outside the available range."
+        )
+
+    return matching_sources[selected_index]
+
+
+def main() -> None:
+    """Collect one pending Facebook post and save it to Supabase."""
+    args = parse_arguments()
+
+    if args.source_url_id and args.source_url:
+        raise RuntimeError(
+            "Use either --source-url-id or --source-url, not both."
+        )
+
+    if args.non_interactive:
+        if not (
+            args.source_url_id
+            or args.source_url
+        ):
+            raise RuntimeError(
+                "--non-interactive requires --source-url-id or --source-url."
+            )
+
+        if not args.confirm_save:
+            raise RuntimeError(
+                "--non-interactive requires --confirm-save."
+            )
+
+    print("Collector script started.")
+    print(
+        f"Version: {COLLECTOR_VERSION}"
+    )
+
+    if not PROFILE_DIRECTORY.exists():
+        raise RuntimeError(
+            "Facebook browser profile was not found. "
+            f"Expected path: {PROFILE_DIRECTORY}"
+        )
+
+    repository = SupabaseRepository()
+
+    batch = repository.get_batch_by_code(
+        BATCH_CODE
+    )
+
+    if batch is None:
+        raise RuntimeError(
+            f"Batch was not found: {BATCH_CODE}"
+        )
+
+    source = select_pending_source(
+        repository=repository,
+        batch_id=batch["batch_id"],
+        source_url_id=args.source_url_id,
+        source_url=args.source_url,
+        non_interactive=args.non_interactive,
+    )
+
+    source_url_id = str(
+        source["source_url_id"]
+    )
+    source_url = str(
+        source["source_url"]
+    )
+    source_name = source.get(
+        "source_name"
+    )
 
     print()
     print("Selected Facebook source:")
-    print(f"  Source URL ID: {source_url_id}")
-    print(f"  URL: {source_url}")
-    print(f"  Reason: {source_name}")
+    print(
+        f"  Source URL ID: {source_url_id}"
+    )
+    print(
+        f"  URL: {source_url}"
+    )
+    print(
+        f"  Reason: {source_name}"
+    )
 
     try:
-        validate_facebook_post_url(source_url)
+        validate_facebook_post_url(
+            source_url
+        )
 
-        post_id = extract_post_id(source_url)
+        post_id = extract_post_id(
+            source_url
+        )
 
-        print(f"Target Facebook post ID: {post_id}")
+        print(
+            f"Target Facebook post ID: {post_id}"
+        )
 
         repository.update_source_url_status(
             source_url_id=source_url_id,
@@ -379,162 +585,208 @@ def main() -> None:
             last_error=None,
         )
 
-        print("Source status updated to IN_PROGRESS.")
+        print(
+            "Source status updated to IN_PROGRESS."
+        )
 
         with sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_DIRECTORY),
                 channel="chrome",
-                headless=False,
-                no_viewport=True,
+                headless=args.headless,
+                no_viewport=not args.headless,
                 locale="de-DE",
             )
 
-            page = (
-                context.pages[0]
-                if context.pages
-                else context.new_page()
-            )
-
-            print("Opening the authorized Facebook post...")
-
-            page.goto(
-                source_url,
-                wait_until="domcontentloaded",
-                timeout=120_000,
-            )
-
-            print(f"Current URL: {page.url}")
-
-            final_url = page.url.lower()
-
-            blocked_indicators = (
-                "login",
-                "checkpoint",
-                "recover",
-            )
-
-            if any(
-                indicator in final_url
-                for indicator in blocked_indicators
-            ):
-                raise RuntimeError(
-                    "Facebook redirected to login or verification."
-                )
-
-            wait_for_facebook_content(page)
-
-            expand_visible_text(page)
-
-            page.wait_for_timeout(3_000)
-
-            container_name, raw_text = select_best_candidate(
-                page=page,
-                post_id=post_id,
-            )
-
-            if len(raw_text) < 80:
-                raise RuntimeError(
-                    "Selected Facebook post text is too short."
-                )
-
-            if contains_full_feed_indicators(raw_text):
-                raise RuntimeError(
-                    "Selected text appears to contain the full Facebook feed."
-                )
-
-            print()
-            print("Selected Facebook text preview:")
-            print("-" * 70)
-            print(raw_text[:2500])
-            print("-" * 70)
-            print()
-
-            confirmation = input(
-                "Type SAVE if this is the correct post, "
-                "or press Enter to cancel: "
-            ).strip()
-
-            if confirmation.upper() != "SAVE":
-                repository.update_source_url_status(
-                    source_url_id=source_url_id,
-                    crawl_status="PENDING",
-                    last_error=(
-                        "Collection cancelled during manual preview."
-                    ),
+            try:
+                page = (
+                    context.pages[0]
+                    if context.pages
+                    else context.new_page()
                 )
 
                 print(
-                    "Collection cancelled. "
-                    "Status restored to PENDING."
+                    "Opening the authorized Facebook post..."
                 )
 
+                page.goto(
+                    source_url,
+                    wait_until="domcontentloaded",
+                    timeout=120_000,
+                )
+
+                print(
+                    f"Current URL: {page.url}"
+                )
+
+                final_url = page.url.lower()
+
+                blocked_indicators = (
+                    "login",
+                    "checkpoint",
+                    "recover",
+                )
+
+                if any(
+                    indicator in final_url
+                    for indicator in blocked_indicators
+                ):
+                    raise RuntimeError(
+                        "Facebook redirected to login or verification."
+                    )
+
+                if post_id not in page.url:
+                    print(
+                        "Warning: the final browser URL does not contain "
+                        "the target post ID. Container validation will still "
+                        "require target-post evidence."
+                    )
+
+                wait_for_facebook_content(
+                    page
+                )
+
+                expand_visible_text(
+                    page
+                )
+
+                page.wait_for_timeout(
+                    3_000
+                )
+
+                container_name, raw_text = select_best_candidate(
+                    page=page,
+                    post_id=post_id,
+                )
+
+                if len(raw_text) < 80:
+                    raise RuntimeError(
+                        "Selected Facebook post text is too short."
+                    )
+
+                if contains_full_feed_indicators(
+                    raw_text
+                ):
+                    raise RuntimeError(
+                        "Selected text appears to contain the full Facebook feed."
+                    )
+
+                print()
+                print(
+                    "Selected Facebook text preview:"
+                )
+                print(
+                    "-" * 70
+                )
+                print(
+                    raw_text[:2500]
+                )
+                print(
+                    "-" * 70
+                )
+                print()
+
+                if args.confirm_save:
+                    confirmation = "SAVE"
+
+                elif args.non_interactive:
+                    confirmation = ""
+
+                else:
+                    confirmation = normalize_confirmation(
+                        input(
+                            "Type SAVE, CONFIRM, or COLLECT to save this post, "
+                            "or press Enter to cancel: "
+                        )
+                    )
+
+                if confirmation not in {
+                    "SAVE",
+                    "CONFIRM",
+                    "COLLECT",
+                }:
+                    repository.update_source_url_status(
+                        source_url_id=source_url_id,
+                        crawl_status="PENDING",
+                        last_error=(
+                            "Collection cancelled during preview."
+                        ),
+                    )
+
+                    print(
+                        "Collection cancelled. Status restored to PENDING."
+                    )
+                    return
+
+                raw_title = page.title()
+
+                content_hash = calculate_content_hash(
+                    raw_text
+                )
+
+                raw_page = repository.save_raw_page(
+                    batch_id=batch["batch_id"],
+                    source_url_id=source_url_id,
+                    page_type="FACEBOOK_POST",
+                    page_url=source_url,
+                    raw_title=raw_title,
+                    raw_text=raw_text,
+                    content_hash=content_hash,
+                    collector_name=COLLECTOR_NAME,
+                    collector_version=COLLECTOR_VERSION,
+                )
+
+                final_source = repository.update_source_url_status(
+                    source_url_id=source_url_id,
+                    crawl_status="COLLECTED",
+                    last_error=None,
+                )
+
+                repository.write_process_log(
+                    batch_id=batch["batch_id"],
+                    process_name="COLLECT_FACEBOOK_POST",
+                    process_step="SAVE_SELECTED_CONTAINER",
+                    log_level="INFO",
+                    status="SUCCESS",
+                    message=(
+                        "Authorized Facebook post container "
+                        "collected successfully."
+                    ),
+                    error_details={
+                        "source_url_id": source_url_id,
+                        "raw_page_id": raw_page["raw_page_id"],
+                        "post_id": post_id,
+                        "container_name": container_name,
+                        "content_length": len(raw_text),
+                        "content_hash": content_hash,
+                        "collector_version": COLLECTOR_VERSION,
+                    },
+                )
+
+                print()
+                print(
+                    "Facebook post collected successfully."
+                )
+                print(
+                    f"Final status: "
+                    f"{final_source.get('crawl_status')}"
+                )
+                print(
+                    f"Raw page ID: "
+                    f"{raw_page['raw_page_id']}"
+                )
+                print(
+                    f"Content length: "
+                    f"{len(raw_text)}"
+                )
+
+            finally:
                 context.close()
-                return
-
-            raw_title = page.title()
-            content_hash = calculate_content_hash(
-                raw_text
-            )
-
-            raw_page = repository.save_raw_page(
-                batch_id=batch["batch_id"],
-                source_url_id=source_url_id,
-                page_type="FACEBOOK_POST",
-                page_url=source_url,
-                raw_title=raw_title,
-                raw_text=raw_text,
-                content_hash=content_hash,
-                collector_name=COLLECTOR_NAME,
-                collector_version=COLLECTOR_VERSION,
-            )
-
-            final_source = repository.update_source_url_status(
-                source_url_id=source_url_id,
-                crawl_status="COLLECTED",
-                last_error=None,
-            )
-
-            repository.write_process_log(
-                batch_id=batch["batch_id"],
-                process_name="COLLECT_FACEBOOK_POST",
-                process_step="SAVE_SELECTED_CONTAINER",
-                log_level="INFO",
-                status="SUCCESS",
-                message=(
-                    "Authorized Facebook post container "
-                    "collected successfully."
-                ),
-                error_details={
-                    "source_url_id": source_url_id,
-                    "raw_page_id": raw_page["raw_page_id"],
-                    "post_id": post_id,
-                    "container_name": container_name,
-                    "content_length": len(raw_text),
-                    "content_hash": content_hash,
-                    "collector_version": COLLECTOR_VERSION,
-                },
-            )
-
-            print()
-            print("Facebook post collected successfully.")
-            print(
-                f"Final status: "
-                f"{final_source.get('crawl_status')}"
-            )
-            print(
-                f"Raw page ID: "
-                f"{raw_page['raw_page_id']}"
-            )
-            print(
-                f"Content length: "
-                f"{len(raw_text)}"
-            )
-
-            context.close()
 
     except Exception as error:
-        error_message = str(error)
+        error_message = str(
+            error
+        )
 
         try:
             repository.update_source_url_status(
@@ -562,17 +814,35 @@ def main() -> None:
         except Exception as logging_error:
             print()
             print(
-                "The collector also failed "
-                "to write its error log."
+                "The collector also failed to write its error log."
             )
-            print(f"Logging error: {logging_error}")
+            print(
+                f"Logging error: {logging_error}"
+            )
 
-        print()
-        print("Facebook post collection failed.")
-        print(f"Error type: {type(error).__name__}")
-        print(f"Error details: {error_message}")
-        sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+
+    except KeyboardInterrupt:
+        print()
+        print(
+            "Facebook post collection was cancelled by the user."
+        )
+        sys.exit(130)
+
+    except Exception as error:
+        print()
+        print(
+            "Facebook post collection failed."
+        )
+        print(
+            f"Error type: {type(error).__name__}"
+        )
+        print(
+            f"Error details: {error}"
+        )
+        sys.exit(1)

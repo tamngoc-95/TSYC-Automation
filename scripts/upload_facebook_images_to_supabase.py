@@ -1,3 +1,4 @@
+import argparse
 import json
 import sys
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ BATCH_CODE = "FB-2026-001"
 STORAGE_BUCKET = "product-images"
 
 UPLOADER_NAME = "facebook_image_supabase_uploader"
-UPLOADER_VERSION = "0.7.0"
+UPLOADER_VERSION = "0.8.0"
 
 LOCAL_IMAGE_ROOT = (
     PROJECT_ROOT
@@ -44,6 +45,72 @@ IMAGE_ROLE = None
 
 # image_status is intentionally omitted from insert payload.
 # The database assigns the valid default value: PENDING.
+
+
+def normalize_confirmation(
+    value: str | None,
+) -> str:
+    """Normalize confirmation values across case, spaces, and hyphens."""
+    if not value:
+        return ""
+
+    return (
+        value.strip()
+        .upper()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Upload selected Facebook images to Supabase Storage "
+            "and create product_images records."
+        )
+    )
+
+    parser.add_argument(
+        "--candidate-code",
+        help="Process one exact candidate code.",
+    )
+
+    parser.add_argument(
+        "--candidate-id",
+        help="Process one exact candidate UUID.",
+    )
+
+    parser.add_argument(
+        "--raw-page-id",
+        help="Process one exact Facebook raw page UUID.",
+    )
+
+    parser.add_argument(
+        "--images",
+        default=None,
+        help=(
+            "Image selection: ALL, one number, comma-separated numbers, "
+            "or ranges such as 1,3-5."
+        ),
+    )
+
+    parser.add_argument(
+        "--confirm-upload",
+        action="store_true",
+        help="Confirm upload without an interactive prompt.",
+    )
+
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Disable input prompts. Requires a selector, --images, "
+            "and --confirm-upload."
+        ),
+    )
+
+    return parser.parse_args()
 
 
 def find_metadata_files() -> list[Path]:
@@ -834,12 +901,21 @@ def get_raw_page_summary(
 def select_raw_page_group(
     repository: SupabaseRepository,
     groups: dict[str, list[dict[str, Any]]],
+    candidate_code: str | None = None,
+    candidate_id: str | None = None,
+    raw_page_id: str | None = None,
+    non_interactive: bool = False,
 ) -> tuple[
     str,
     list[dict[str, Any]],
     dict[str, Any] | None,
 ]:
-    """Allow the user to select exactly one raw-page image group."""
+    """
+    Select exactly one raw-page image group.
+
+    Explicit selectors are preferred for automation. Interactive selection
+    remains available for manual operation.
+    """
     if not groups:
         raise RuntimeError(
             "No valid image metadata groups were found."
@@ -853,72 +929,111 @@ def select_raw_page_group(
         ]
     ] = []
 
-    print()
-    print(
-        "Facebook posts with local images:"
-    )
-
-    for index, raw_page_id in enumerate(
-        sorted(groups),
-        start=1,
-    ):
-        items = groups[
-            raw_page_id
-        ]
+    for current_raw_page_id in sorted(groups):
+        items = groups[current_raw_page_id]
 
         candidate = get_candidate_for_raw_page(
             repository=repository,
-            raw_page_id=raw_page_id,
+            raw_page_id=current_raw_page_id,
         )
 
-        raw_page = get_raw_page_summary(
-            repository=repository,
-            raw_page_id=raw_page_id,
-        )
+        if raw_page_id and current_raw_page_id != raw_page_id:
+            continue
+
+        if candidate_code:
+            if not candidate or candidate.get("candidate_code") != candidate_code:
+                continue
+
+        if candidate_id:
+            if not candidate or candidate.get("candidate_id") != candidate_id:
+                continue
 
         group_entries.append(
             (
-                raw_page_id,
+                current_raw_page_id,
                 items,
                 candidate,
             )
         )
 
-        candidate_code = (
-            candidate.get(
-                "candidate_code"
+    if raw_page_id or candidate_code or candidate_id:
+        if not group_entries:
+            raise RuntimeError(
+                "No local Facebook image group matched the supplied selector."
             )
+
+        if len(group_entries) > 1:
+            raise RuntimeError(
+                "The supplied selector matched multiple raw-page groups. "
+                "Use --raw-page-id to select one exact post."
+            )
+
+        return group_entries[0]
+
+    if non_interactive:
+        raise RuntimeError(
+            "--non-interactive requires --candidate-code, --candidate-id, "
+            "or --raw-page-id."
+        )
+
+    print()
+    print(
+        "Facebook posts with local images:"
+    )
+
+    group_entries = []
+
+    for index, current_raw_page_id in enumerate(
+        sorted(groups),
+        start=1,
+    ):
+        items = groups[current_raw_page_id]
+
+        candidate = get_candidate_for_raw_page(
+            repository=repository,
+            raw_page_id=current_raw_page_id,
+        )
+
+        raw_page = get_raw_page_summary(
+            repository=repository,
+            raw_page_id=current_raw_page_id,
+        )
+
+        group_entries.append(
+            (
+                current_raw_page_id,
+                items,
+                candidate,
+            )
+        )
+
+        candidate_code_value = (
+            candidate.get("candidate_code")
             if candidate
             else "[not linked]"
         )
 
         candidate_title = (
-            candidate.get(
-                "extracted_title"
-            )
+            candidate.get("extracted_title")
             if candidate
             else "[candidate not found]"
         )
 
         page_url = (
-            raw_page.get(
-                "page_url"
-            )
+            raw_page.get("page_url")
             if raw_page
             else (
-                items[0].get(
-                    "facebook_post_url"
-                )
+                items[0].get("facebook_post_url")
                 or "[URL not found]"
             )
         )
 
         print()
         print(
-            f"[{index}] Raw page ID: {raw_page_id}"
+            f"[{index}] Raw page ID: {current_raw_page_id}"
         )
         print(
-            f"    Candidate: {candidate_code}"
+            f"    Candidate: {candidate_code_value}"
         )
         print(
             f"    Title: {candidate_title}"
@@ -941,9 +1056,7 @@ def select_raw_page_group(
         raise KeyboardInterrupt
 
     try:
-        selected_index = int(
-            selection
-        ) - 1
+        selected_index = int(selection) - 1
 
     except ValueError as error:
         raise ValueError(
@@ -952,18 +1065,13 @@ def select_raw_page_group(
 
     if (
         selected_index < 0
-        or selected_index >= len(
-            group_entries
-        )
+        or selected_index >= len(group_entries)
     ):
         raise ValueError(
-            "The selected post number is outside "
-            "the available range."
+            "The selected post number is outside the available range."
         )
 
-    return group_entries[
-        selected_index
-    ]
+    return group_entries[selected_index]
 
 
 def filter_database_duplicates(
@@ -1183,8 +1291,10 @@ def parse_image_selection(
 
 def select_images(
     items: list[dict[str, Any]],
+    selection_value: str | None = None,
+    non_interactive: bool = False,
 ) -> list[dict[str, Any]]:
-    """Allow the user to select images from one raw page."""
+    """Select images interactively or from a command-line selection."""
     if not items:
         return []
 
@@ -1194,12 +1304,21 @@ def select_images(
 
     print()
 
-    selection = input(
-        "Select images using ALL, one number, "
-        "comma-separated numbers, or a range "
-        "(example: 1,3-5). "
-        "Press Enter to cancel: "
-    ).strip()
+    if selection_value is not None:
+        selection = selection_value.strip()
+
+    elif non_interactive:
+        raise RuntimeError(
+            "--non-interactive requires --images."
+        )
+
+    else:
+        selection = input(
+            "Select images using ALL, one number, "
+            "comma-separated numbers, or a range "
+            "(example: 1,3-5). "
+            "Press Enter to cancel: "
+        ).strip()
 
     selected_indexes = parse_image_selection(
         selection=selection,
@@ -1210,6 +1329,40 @@ def select_images(
         items[index]
         for index in selected_indexes
     ]
+
+
+def validate_selected_group(
+    selected_raw_page_id: str,
+    selected_candidate: dict[str, Any] | None,
+    selected_group_items: list[dict[str, Any]],
+) -> None:
+    """Validate that all selected metadata belongs to one raw page."""
+    if not selected_group_items:
+        raise RuntimeError(
+            "Selected raw-page group contains no image metadata."
+        )
+
+    for item in selected_group_items:
+        if item.get("raw_page_id") != selected_raw_page_id:
+            raise RuntimeError(
+                "Image metadata raw_page_id does not match the selected group."
+            )
+
+    source_url_ids = {
+        item.get("source_url_id")
+        for item in selected_group_items
+        if item.get("source_url_id")
+    }
+
+    if len(source_url_ids) > 1:
+        raise RuntimeError(
+            "Selected image metadata contains multiple source_url_id values."
+        )
+
+    if selected_candidate is None:
+        raise RuntimeError(
+            "Selected raw page is not linked to a product candidate."
+        )
 
 
 def print_final_upload_plan(
@@ -1272,6 +1425,34 @@ def main() -> None:
     """Upload selected Facebook images from one raw page to Supabase."""
     load_dotenv()
 
+    args = parse_arguments()
+
+    if args.candidate_code and args.candidate_id:
+        raise RuntimeError(
+            "Use either --candidate-code or --candidate-id, not both."
+        )
+
+    if args.non_interactive:
+        if not (
+            args.candidate_code
+            or args.candidate_id
+            or args.raw_page_id
+        ):
+            raise RuntimeError(
+                "--non-interactive requires --candidate-code, "
+                "--candidate-id, or --raw-page-id."
+            )
+
+        if args.images is None:
+            raise RuntimeError(
+                "--non-interactive requires --images."
+            )
+
+        if not args.confirm_upload:
+            raise RuntimeError(
+                "--non-interactive requires --confirm-upload."
+            )
+
     print(
         "Facebook image Supabase uploader started."
     )
@@ -1315,6 +1496,16 @@ def main() -> None:
     ) = select_raw_page_group(
         repository=repository,
         groups=groups,
+        candidate_code=args.candidate_code,
+        candidate_id=args.candidate_id,
+        raw_page_id=args.raw_page_id,
+        non_interactive=args.non_interactive,
+    )
+
+    validate_selected_group(
+        selected_raw_page_id=selected_raw_page_id,
+        selected_candidate=selected_candidate,
+        selected_group_items=selected_group_items,
     )
 
     (
@@ -1338,7 +1529,9 @@ def main() -> None:
         return
 
     selected_items = select_images(
-        uploadable_items
+        items=uploadable_items,
+        selection_value=args.images,
+        non_interactive=args.non_interactive,
     )
 
     if not selected_items:
@@ -1356,12 +1549,32 @@ def main() -> None:
 
     print()
 
-    confirmation = input(
-        "Type UPLOAD to upload only the images listed above, "
-        "or press Enter to cancel: "
-    ).strip().upper()
+    if args.confirm_upload:
+        confirmation = "UPLOAD"
 
-    if confirmation != "UPLOAD":
+    elif args.non_interactive:
+        confirmation = ""
+
+    else:
+        confirmation = normalize_confirmation(
+            input(
+                "Type UPLOAD, CONFIRM, or UPLOAD_IMAGES to upload only "
+                "the images listed above, or press Enter to cancel: "
+            )
+        )
+
+    if confirmation not in {
+        "UPLOAD",
+        "CONFIRM",
+        "UPLOAD_IMAGES",
+    }:
+        print()
+        print(
+            "Invalid confirmation. Use UPLOAD, CONFIRM, or UPLOAD_IMAGES."
+        )
+        print(
+            f"Received value: {confirmation or '[empty]'}"
+        )
         print(
             "Supabase upload cancelled."
         )

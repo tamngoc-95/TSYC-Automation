@@ -1,3 +1,4 @@
+import argparse
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +14,13 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 CREATOR_NAME = "internal_product_creator"
-CREATOR_VERSION = "1.0.0"
+CREATOR_VERSION = "1.1.0"
+
+VALID_CONFIRMATIONS = {
+    "CREATE",
+    "CREATE_PRODUCT",
+    "CREATE_INTERNAL_PRODUCT",
+}
 
 
 def utc_now() -> str:
@@ -21,6 +28,57 @@ def utc_now() -> str:
     return datetime.now(
         timezone.utc
     ).isoformat()
+
+
+def normalize_confirmation(
+    value: str | None,
+) -> str:
+    """Normalize confirmation values across case, spaces, and hyphens."""
+    if not value:
+        return ""
+
+    return (
+        value.strip()
+        .upper()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create one internal product from an identity-verified candidate."
+        )
+    )
+
+    parser.add_argument(
+        "--candidate-code",
+        help="Process one exact candidate code.",
+    )
+
+    parser.add_argument(
+        "--candidate-id",
+        help="Process one exact candidate UUID.",
+    )
+
+    parser.add_argument(
+        "--confirm-create",
+        action="store_true",
+        help="Confirm internal product creation without prompting.",
+    )
+
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Disable input prompts. Requires a candidate selector and "
+            "--confirm-create."
+        ),
+    )
+
+    return parser.parse_args()
 
 
 def clean_text(
@@ -39,9 +97,15 @@ def clean_text(
 
 def get_verified_candidate(
     repository: SupabaseRepository,
+    candidate_code: str | None = None,
+    candidate_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Return one verified candidate without an internal product."""
-    candidate_response = (
+    """
+    Return one identity-verified candidate without an internal product.
+
+    When a candidate code or ID is supplied, only that candidate is evaluated.
+    """
+    query = (
         repository.client
         .table("product_candidates")
         .select(
@@ -63,12 +127,29 @@ def get_verified_candidate(
             "identity_status,"
             "workflow_status,"
             "identity_confidence,"
-            "source_evidence"
+            "source_evidence,"
+            "created_at"
         )
         .eq(
             "identity_status",
             "IDENTITY_VERIFIED",
         )
+    )
+
+    if candidate_code:
+        query = query.eq(
+            "candidate_code",
+            candidate_code,
+        )
+
+    if candidate_id:
+        query = query.eq(
+            "candidate_id",
+            candidate_id,
+        )
+
+    candidate_response = (
+        query
         .order(
             "created_at",
             desc=False,
@@ -76,10 +157,12 @@ def get_verified_candidate(
         .execute()
     )
 
-    candidates = (
-        candidate_response.data
-        or []
-    )
+    candidates = candidate_response.data or []
+
+    if (candidate_code or candidate_id) and not candidates:
+        raise RuntimeError(
+            "No IDENTITY_VERIFIED candidate matched the supplied selector."
+        )
 
     for candidate in candidates:
         existing_response = (
@@ -98,12 +181,18 @@ def get_verified_candidate(
             .execute()
         )
 
-        existing_rows = (
-            existing_response.data
-            or []
-        )
+        existing_rows = existing_response.data or []
 
         if existing_rows:
+            existing = existing_rows[0]
+
+            if candidate_code or candidate_id:
+                raise RuntimeError(
+                    "An internal product already exists for candidate "
+                    f"{candidate.get('candidate_code')}: "
+                    f"{existing.get('product_code')}"
+                )
+
             print(
                 "Skipping candidate because an internal product "
                 "already exists: "
@@ -114,7 +203,6 @@ def get_verified_candidate(
         return candidate
 
     return None
-
 
 def get_best_matched_reference(
     repository: SupabaseRepository,
@@ -369,6 +457,16 @@ def create_internal_product(
     images: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Create one internal product."""
+    if candidate.get("identity_status") != "IDENTITY_VERIFIED":
+        raise RuntimeError(
+            "Candidate identity must be IDENTITY_VERIFIED."
+        )
+
+    if reference.get("match_decision") != "MATCH":
+        raise RuntimeError(
+            "Primary reference must have match_decision = MATCH."
+        )
+
     title = clean_text(
         candidate.get(
             "verified_title"
@@ -414,50 +512,50 @@ def create_internal_product(
         )
     )
 
-    page_count = (
-        candidate.get(
-            "verified_page_count"
-        )
-        or reference.get(
+    page_count = candidate.get(
+        "verified_page_count"
+    )
+
+    if page_count is None:
+        page_count = reference.get(
             "reference_page_count"
         )
+
+    weight_grams = candidate.get(
+        "verified_weight_grams"
     )
 
-    weight_grams = (
-        candidate.get(
-            "verified_weight_grams"
-        )
-        or reference.get(
+    if weight_grams is None:
+        weight_grams = reference.get(
             "reference_weight_grams"
         )
+
+    length_cm = candidate.get(
+        "verified_length_cm"
     )
 
-    length_cm = (
-        candidate.get(
-            "verified_length_cm"
-        )
-        or reference.get(
+    if length_cm is None:
+        length_cm = reference.get(
             "reference_length_cm"
         )
+
+    width_cm = candidate.get(
+        "verified_width_cm"
     )
 
-    width_cm = (
-        candidate.get(
-            "verified_width_cm"
-        )
-        or reference.get(
+    if width_cm is None:
+        width_cm = reference.get(
             "reference_width_cm"
         )
+
+    height_cm = candidate.get(
+        "verified_height_cm"
     )
 
-    height_cm = (
-        candidate.get(
-            "verified_height_cm"
-        )
-        or reference.get(
+    if height_cm is None:
+        height_cm = reference.get(
             "reference_height_cm"
         )
-    )
 
     cover_price_vnd = reference.get(
         "reference_cover_price_vnd"
@@ -649,6 +747,24 @@ def main() -> None:
     """Create one internal product from one verified candidate."""
     load_dotenv()
 
+    args = parse_arguments()
+
+    if args.candidate_code and args.candidate_id:
+        raise RuntimeError(
+            "Use either --candidate-code or --candidate-id, not both."
+        )
+
+    if args.non_interactive:
+        if not (args.candidate_code or args.candidate_id):
+            raise RuntimeError(
+                "--non-interactive requires --candidate-code or --candidate-id."
+            )
+
+        if not args.confirm_create:
+            raise RuntimeError(
+                "--non-interactive requires --confirm-create."
+            )
+
     print("=" * 72)
     print("INTERNAL PRODUCT CREATOR")
     print("=" * 72)
@@ -663,7 +779,9 @@ def main() -> None:
     )
 
     candidate = get_verified_candidate(
-        repository
+        repository=repository,
+        candidate_code=args.candidate_code,
+        candidate_id=args.candidate_id,
     )
 
     if candidate is None:
@@ -700,12 +818,29 @@ def main() -> None:
 
     print()
 
-    confirmation = input(
-        "Type CREATE to create this internal product, "
-        "or press Enter to cancel: "
-    ).strip().upper()
+    if args.confirm_create:
+        confirmation = "CREATE"
 
-    if confirmation != "CREATE":
+    elif args.non_interactive:
+        confirmation = ""
+
+    else:
+        confirmation = normalize_confirmation(
+            input(
+                "Type CREATE, CREATE_PRODUCT, or CREATE_INTERNAL_PRODUCT "
+                "to create this internal product, or press Enter to cancel: "
+            )
+        )
+
+    if confirmation not in VALID_CONFIRMATIONS:
+        print()
+        print(
+            "Invalid confirmation. Use CREATE, CREATE_PRODUCT, "
+            "or CREATE_INTERNAL_PRODUCT."
+        )
+        print(
+            f"Received value: {confirmation or '[empty]'}"
+        )
         print(
             "Internal product creation was cancelled."
         )

@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import json
 import re
@@ -27,7 +28,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 COLLECTOR_NAME = "reference_metadata_collector"
-COLLECTOR_VERSION = "1.4.0"
+COLLECTOR_VERSION = "1.5.0"
 
 NAVIGATION_TIMEOUT_MS = 60_000
 
@@ -59,6 +60,45 @@ def utc_now_iso() -> str:
     return datetime.now(
         timezone.utc
     ).isoformat()
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Collect normalized metadata from one selected reference source."
+        )
+    )
+
+    parser.add_argument(
+        "--candidate-code",
+        help="Process one exact candidate code.",
+    )
+
+    parser.add_argument(
+        "--candidate-id",
+        help="Process one exact candidate UUID.",
+    )
+
+    parser.add_argument(
+        "--source-url-id",
+        help="Process one exact source URL UUID.",
+    )
+
+    parser.add_argument(
+        "--discovery-id",
+        help="Process one exact candidate reference discovery UUID.",
+    )
+
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Disable any future interactive prompts. A selector is required."
+        ),
+    )
+
+    return parser.parse_args()
 
 
 def normalize_whitespace(
@@ -1342,6 +1382,11 @@ def parse_alpha_books_metadata(
     raw_metadata = {
         "parser_name": "alpha_books",
         "parser_version": "1.0.0",
+        "purchase_price_eligible": False,
+        "source_usage_note": (
+            "This public website is used only for book identity, metadata, "
+            "images, dimensions, weight, and cover-price reference."
+        ),
         "publication_year": publication_year,
         "translator": translator,
         "book_format": book_format,
@@ -1431,13 +1476,19 @@ def validate_alpha_books_metadata(
 
 def select_next_reference_queue_item(
     repository: SupabaseRepository,
+    candidate_code: str | None = None,
+    candidate_id: str | None = None,
+    source_url_id: str | None = None,
+    discovery_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Return the oldest selected reference URL waiting for collection."""
-    discovery_response = (
+    """
+    Return one selected reference URL waiting for collection.
+
+    Optional selectors ensure automation processes the intended candidate/source.
+    """
+    discovery_query = (
         repository.client
-        .table(
-            "candidate_reference_sources"
-        )
+        .table("candidate_reference_sources")
         .select(
             "discovery_id, "
             "candidate_id, "
@@ -1446,25 +1497,35 @@ def select_next_reference_queue_item(
             "is_selected_for_crawl, "
             "created_at"
         )
-        .eq(
-            "discovery_status",
-            "SELECTED",
+        .eq("discovery_status", "SELECTED")
+        .eq("is_selected_for_crawl", True)
+    )
+
+    if candidate_id:
+        discovery_query = discovery_query.eq(
+            "candidate_id",
+            candidate_id,
         )
-        .eq(
-            "is_selected_for_crawl",
-            True,
+
+    if source_url_id:
+        discovery_query = discovery_query.eq(
+            "source_url_id",
+            source_url_id,
         )
-        .order(
-            "created_at",
-            desc=False,
+
+    if discovery_id:
+        discovery_query = discovery_query.eq(
+            "discovery_id",
+            discovery_id,
         )
+
+    discovery_response = (
+        discovery_query
+        .order("created_at", desc=False)
         .execute()
     )
 
-    discovery_records = (
-        discovery_response.data
-        or []
-    )
+    discovery_records = discovery_response.data or []
 
     for discovery in discovery_records:
         source_response = (
@@ -1479,32 +1540,26 @@ def select_next_reference_queue_item(
                 "is_authorized, "
                 "crawl_status"
             )
-            .eq(
-                "source_url_id",
-                discovery["source_url_id"],
-            )
-            .eq(
-                "crawl_status",
-                "PENDING",
-            )
+            .eq("source_url_id", discovery["source_url_id"])
+            .eq("crawl_status", "PENDING")
             .limit(1)
             .execute()
         )
 
-        source_records = (
-            source_response.data
-            or []
-        )
+        source_records = source_response.data or []
 
         if not source_records:
             continue
 
         source = source_records[0]
 
-        if source.get(
-            "source_type"
-        ) not in SUPPORTED_SOURCE_TYPES:
+        if source.get("source_type") not in SUPPORTED_SOURCE_TYPES:
             continue
+
+        if source.get("is_authorized") is False:
+            raise RuntimeError(
+                "Selected source URL is not authorized for collection."
+            )
 
         candidate_response = (
             repository.client
@@ -1514,31 +1569,89 @@ def select_next_reference_queue_item(
                 "candidate_code, "
                 "extracted_title, "
                 "extracted_author, "
-                "possible_isbn"
+                "possible_isbn, "
+                "identity_status, "
+                "workflow_status"
             )
-            .eq(
-                "candidate_id",
-                discovery["candidate_id"],
-            )
+            .eq("candidate_id", discovery["candidate_id"])
             .limit(1)
             .execute()
         )
 
-        candidate_records = (
-            candidate_response.data
-            or []
-        )
+        candidate_records = candidate_response.data or []
 
         if not candidate_records:
+            continue
+
+        candidate = candidate_records[0]
+
+        if candidate_code and candidate.get("candidate_code") != candidate_code:
+            continue
+
+        if candidate_id and candidate.get("candidate_id") != candidate_id:
             continue
 
         return {
             "discovery": discovery,
             "source": source,
-            "candidate": candidate_records[0],
+            "candidate": candidate,
         }
 
+    if candidate_code or candidate_id or source_url_id or discovery_id:
+        raise RuntimeError(
+            "No selected PENDING reference URL matched the supplied selector."
+        )
+
     return None
+
+
+def validate_queue_item_links(
+    queue_item: dict[str, Any],
+) -> None:
+    """Validate candidate, source, and discovery IDs before crawling."""
+    candidate = queue_item["candidate"]
+    source = queue_item["source"]
+    discovery = queue_item["discovery"]
+
+    candidate_id = candidate.get("candidate_id")
+    discovery_candidate_id = discovery.get("candidate_id")
+    source_url_id = source.get("source_url_id")
+    discovery_source_url_id = discovery.get("source_url_id")
+
+    if not candidate_id:
+        raise RuntimeError(
+            "Selected candidate does not contain candidate_id."
+        )
+
+    if not source_url_id:
+        raise RuntimeError(
+            "Selected source does not contain source_url_id."
+        )
+
+    if candidate_id != discovery_candidate_id:
+        raise RuntimeError(
+            "Candidate ID and discovery candidate ID do not match."
+        )
+
+    if source_url_id != discovery_source_url_id:
+        raise RuntimeError(
+            "Source URL ID and discovery source URL ID do not match."
+        )
+
+    if discovery.get("discovery_status") != "SELECTED":
+        raise RuntimeError(
+            "Discovery status must be SELECTED before collection."
+        )
+
+    if discovery.get("is_selected_for_crawl") is not True:
+        raise RuntimeError(
+            "Discovery must be explicitly selected for crawl."
+        )
+
+    if source.get("crawl_status") != "PENDING":
+        raise RuntimeError(
+            "Source crawl status must be PENDING before collection."
+        )
 
 
 def update_source_status(
@@ -1756,102 +1869,85 @@ def save_product_reference(
     dict[str, Any],
     bool,
 ]:
-    """Insert or update one normalized product reference."""
-    source = queue_item[
-        "source"
-    ]
+    """
+    Insert or update one normalized product reference.
 
-    candidate = queue_item[
-        "candidate"
-    ]
-
+    Existing identity decisions are preserved when metadata is refreshed.
+    """
+    source = queue_item["source"]
+    candidate = queue_item["candidate"]
     now = utc_now_iso()
 
+    existing = find_existing_product_reference(
+        repository=repository,
+        candidate_id=candidate["candidate_id"],
+        source_url_id=source["source_url_id"],
+    )
+
+    existing_decision = None
+    existing_confidence = None
+
+    if existing is not None:
+        existing_full_response = (
+            repository.client
+            .table("product_references")
+            .select(
+                "reference_id,"
+                "match_decision,"
+                "match_confidence"
+            )
+            .eq("reference_id", existing["reference_id"])
+            .limit(1)
+            .execute()
+        )
+
+        existing_full_rows = existing_full_response.data or []
+
+        if existing_full_rows:
+            existing_decision = existing_full_rows[0].get(
+                "match_decision"
+            )
+            existing_confidence = existing_full_rows[0].get(
+                "match_confidence"
+            )
+
     payload = {
-        "candidate_id": candidate[
-            "candidate_id"
-        ],
-        "source_url_id": source[
-            "source_url_id"
-        ],
-        "source_type": source[
-            "source_type"
-        ],
-        "source_name": source.get(
-            "source_name"
-        ),
-        "source_url": source.get(
-            "source_url"
-        ),
-        "reference_title": metadata.get(
-            "reference_title"
-        ),
-        "reference_isbn": metadata.get(
-            "reference_isbn"
-        ),
-        "reference_author": metadata.get(
-            "reference_author"
-        ),
-        "reference_publisher": metadata.get(
-            "reference_publisher"
-        ),
-        "reference_page_count": metadata.get(
-            "reference_page_count"
-        ),
-        "reference_weight_grams": metadata.get(
-            "reference_weight_grams"
-        ),
-        "reference_length_cm": metadata.get(
-            "reference_length_cm"
-        ),
-        "reference_width_cm": metadata.get(
-            "reference_width_cm"
-        ),
-        "reference_height_cm": metadata.get(
-            "reference_height_cm"
-        ),
+        "candidate_id": candidate["candidate_id"],
+        "source_url_id": source["source_url_id"],
+        "source_type": source["source_type"],
+        "source_name": source.get("source_name"),
+        "source_url": source.get("source_url"),
+        "reference_title": metadata.get("reference_title"),
+        "reference_isbn": metadata.get("reference_isbn"),
+        "reference_author": metadata.get("reference_author"),
+        "reference_publisher": metadata.get("reference_publisher"),
+        "reference_page_count": metadata.get("reference_page_count"),
+        "reference_weight_grams": metadata.get("reference_weight_grams"),
+        "reference_length_cm": metadata.get("reference_length_cm"),
+        "reference_width_cm": metadata.get("reference_width_cm"),
+        "reference_height_cm": metadata.get("reference_height_cm"),
         "reference_cover_price_vnd": metadata.get(
             "reference_cover_price_vnd"
         ),
-        "reference_description": metadata.get(
-            "reference_description"
-        ),
-        "reference_image_url": metadata.get(
-            "reference_image_url"
-        ),
-        "match_decision": None,
-        "match_confidence": None,
+        "reference_description": metadata.get("reference_description"),
+        "reference_image_url": metadata.get("reference_image_url"),
+        "match_decision": existing_decision,
+        "match_confidence": existing_confidence,
         "source_priority": SOURCE_PRIORITY_BY_TYPE.get(
             source["source_type"],
             5,
         ),
-        "raw_metadata": metadata.get(
-            "raw_metadata",
-            {},
-        ),
+        "raw_metadata": metadata.get("raw_metadata", {}),
         "collected_at": now,
         "updated_at": now,
     }
-
-    existing = find_existing_product_reference(
-        repository=repository,
-        candidate_id=candidate[
-            "candidate_id"
-        ],
-        source_url_id=source[
-            "source_url_id"
-        ],
-    )
 
     if existing is not None:
         response = (
             repository.client
             .table("product_references")
             .update(payload)
-            .eq(
-                "reference_id",
-                existing["reference_id"],
-            )
+            .eq("reference_id", existing["reference_id"])
             .execute()
         )
 
@@ -2161,6 +2257,23 @@ def main() -> None:
     """Collect one selected reference source."""
     load_dotenv()
 
+    args = parse_arguments()
+
+    if args.candidate_code and args.candidate_id:
+        raise RuntimeError(
+            "Use either --candidate-code or --candidate-id, not both."
+        )
+
+    if args.non_interactive and not (
+        args.candidate_code
+        or args.candidate_id
+        or args.source_url_id
+        or args.discovery_id
+    ):
+        raise RuntimeError(
+            "--non-interactive requires at least one selector."
+        )
+
     print(
         "Reference metadata collector started."
     )
@@ -2171,7 +2284,11 @@ def main() -> None:
     repository = SupabaseRepository()
 
     queue_item = select_next_reference_queue_item(
-        repository
+        repository=repository,
+        candidate_code=args.candidate_code,
+        candidate_id=args.candidate_id,
+        source_url_id=args.source_url_id,
+        discovery_id=args.discovery_id,
     )
 
     if queue_item is None:
@@ -2179,6 +2296,10 @@ def main() -> None:
             "No selected pending reference URL was found."
         )
         return
+
+    validate_queue_item_links(
+        queue_item
+    )
 
     print_queue_item(
         queue_item
