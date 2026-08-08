@@ -1,3 +1,4 @@
+import argparse
 import re
 import sys
 import unicodedata
@@ -18,7 +19,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 BATCH_CODE = "FB-2026-001"
 
 COLLECTOR_NAME = "manual_product_reference_collector"
-COLLECTOR_VERSION = "0.8.1"
+COLLECTOR_VERSION = "0.9.0"
 
 SOURCE_TYPES = (
     "PUBLISHER",
@@ -56,6 +57,46 @@ ALLOWED_MATCH_DECISIONS = (
     "NO_MATCH",
     "MANUAL_REVIEW",
 )
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Manually create one product reference and optionally update "
+            "one TSYC product candidate."
+        )
+    )
+
+    selector_group = parser.add_mutually_exclusive_group()
+
+    selector_group.add_argument(
+        "--candidate-code",
+        help="Exact candidate code.",
+    )
+
+    selector_group.add_argument(
+        "--candidate-id",
+        help="Exact candidate UUID.",
+    )
+
+    parser.add_argument(
+        "--confirm-save",
+        action="store_true",
+        help="Confirm the final SAVE action without an interactive prompt.",
+    )
+
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Disable candidate/save prompts. An exact candidate selector "
+            "and --confirm-save are required. Metadata entry remains manual "
+            "unless this script is extended with explicit field arguments."
+        ),
+    )
+
+    return parser.parse_args()
 
 
 def normalize_whitespace(
@@ -361,6 +402,44 @@ def get_candidates(
     )
 
     return response.data or []
+
+
+def resolve_candidate(
+    candidates: list[dict[str, Any]],
+    candidate_code: str | None,
+    candidate_id: str | None,
+    non_interactive: bool,
+) -> dict[str, Any]:
+    """Resolve exactly one candidate or fall back to manual selection."""
+    if candidate_code or candidate_id:
+        matches = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate_code
+                and candidate.get("candidate_code") == candidate_code
+            )
+            or (
+                candidate_id
+                and str(candidate.get("candidate_id")) == str(candidate_id)
+            )
+        ]
+
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Candidate selector did not resolve to exactly one record."
+            )
+
+        return matches[0]
+
+    if non_interactive:
+        raise RuntimeError(
+            "--non-interactive requires --candidate-code or --candidate-id."
+        )
+
+    return select_candidate(
+        candidates
+    )
 
 
 def select_candidate(
@@ -938,6 +1017,12 @@ def build_reference_payload(
             "reviewed_match_decision": match_decision,
         },
         "entered_reference": reference,
+        "purchase_price_eligible": False,
+        "purchase_price_policy_note": (
+            "Manual public/reference metadata is not an official purchase "
+            "price source. Purchase price must come from invoice, confirmed "
+            "purchase order, supplier quotation, or current supplier price list."
+        ),
         "collected_at": collected_at,
     }
 
@@ -982,6 +1067,7 @@ def build_reference_payload(
         "reference_height_cm": reference.get(
             "reference_height_cm"
         ),
+        # Cover price is reference metadata only. It is never purchase price.
         "reference_cover_price_vnd": reference.get(
             "reference_cover_price_vnd"
         ),
@@ -1024,6 +1110,33 @@ def insert_reference(
         )
 
     return records[0]
+
+
+def validate_candidate_update_allowed(
+    candidate: dict[str, Any],
+    match_decision: str,
+) -> None:
+    """
+    Protect already verified candidates from accidental manual overwrite.
+
+    Additional references may be saved for evidence, but a verified candidate
+    must not be rewritten by this legacy/manual collector. Re-verification
+    belongs in the standardized identity-matching workflow.
+    """
+    if candidate.get("identity_status") != "IDENTITY_VERIFIED":
+        return
+
+    if match_decision == "MATCH":
+        raise RuntimeError(
+            "Candidate is already IDENTITY_VERIFIED. Saving another MATCH "
+            "reference is allowed only through the standardized identity "
+            "matching/re-verification workflow, not this manual collector."
+        )
+
+    raise RuntimeError(
+        "Candidate is already IDENTITY_VERIFIED. This manual reference "
+        "workflow cannot downgrade or conflict an already verified identity."
+    )
 
 
 def build_candidate_update(
@@ -1238,6 +1351,21 @@ def delete_reference(
 def main() -> None:
     """Create one reference and update one candidate."""
     load_dotenv()
+    args = parse_arguments()
+
+    if args.non_interactive:
+        if not (
+            args.candidate_code
+            or args.candidate_id
+        ):
+            raise RuntimeError(
+                "--non-interactive requires an exact candidate selector."
+            )
+
+        if not args.confirm_save:
+            raise RuntimeError(
+                "--non-interactive requires --confirm-save."
+            )
 
     print(
         "Product reference workflow started."
@@ -1265,8 +1393,11 @@ def main() -> None:
         f"{len(candidates)}"
     )
 
-    candidate = select_candidate(
-        candidates
+    candidate = resolve_candidate(
+        candidates=candidates,
+        candidate_code=args.candidate_code,
+        candidate_id=args.candidate_id,
+        non_interactive=args.non_interactive,
     )
 
     reference = collect_reference_input(
@@ -1288,6 +1419,11 @@ def main() -> None:
         proposed_decision=evaluation[
             "match_decision"
         ],
+    )
+
+    validate_candidate_update_allowed(
+        candidate=candidate,
+        match_decision=match_decision,
     )
 
     duplicate_reference = (
@@ -1334,10 +1470,17 @@ def main() -> None:
 
     print()
 
-    confirmation = input(
-        "Type SAVE to create this reference and "
-        "update the candidate, or press Enter to cancel: "
-    ).strip().upper()
+    if args.confirm_save:
+        confirmation = "SAVE"
+
+    elif args.non_interactive:
+        confirmation = ""
+
+    else:
+        confirmation = input(
+            "Type SAVE to create this reference and "
+            "update the candidate, or press Enter to cancel: "
+        ).strip().upper()
 
     if confirmation != "SAVE":
         print(

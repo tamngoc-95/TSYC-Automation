@@ -12,7 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.repositories.supabase_repository import SupabaseRepository
 
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.2"
 VALID_CONFIRMATIONS = {"READY", "READY_FOR_DRAFT"}
 
 
@@ -94,7 +94,7 @@ def get_candidate(
 
     response = (
         repository.client
-        .table("candidates")
+        .table("product_candidates")
         .select("candidate_id,identity_status")
         .eq("candidate_id", candidate_id)
         .limit(1)
@@ -126,17 +126,20 @@ def get_approved_content(
 
 def get_selected_main_images(
     repository: SupabaseRepository,
-    internal_product_id: str,
+    candidate_id: str | None,
 ) -> list[dict[str, Any]]:
-    """Return selected main images for validation."""
+    """Return selected main images linked to the product candidate."""
+    if not candidate_id:
+        return []
+
     response = (
         repository.client
         .table("product_images")
         .select(
-            "product_image_id,image_status,is_publish_eligible,"
+            "image_id,candidate_id,image_status,is_publish_eligible,"
             "is_selected_main_image,image_role,usage_rights_status"
         )
-        .eq("internal_product_id", internal_product_id)
+        .eq("candidate_id", candidate_id)
         .eq("is_selected_main_image", True)
         .execute()
     )
@@ -159,7 +162,9 @@ def evaluate_readiness(
         else None
     )
 
-    if identity_status != "IDENTITY_VERIFIED":
+    if candidate is None:
+        blockers.append("Linked product candidate was not found.")
+    elif identity_status != "IDENTITY_VERIFIED":
         blockers.append("Product identity is not verified.")
 
     if product.get("content_status") != "APPROVED":
@@ -225,7 +230,7 @@ def print_result(
     print(f"Image status: {product.get('image_status')}")
     print(
         "Selected main image: "
-        f"{selected_images[0].get('product_image_id') if len(selected_images) == 1 else '[invalid count]'}"
+        f"{selected_images[0].get('image_id') if len(selected_images) == 1 else '[invalid count]'}"
     )
     print(f"Pricing status: {product.get('pricing_status')}")
 
@@ -281,6 +286,11 @@ def main() -> None:
     print("=" * 72)
     print(f"Version: {SCRIPT_VERSION}")
 
+    if args.non_interactive and not args.product_code:
+        raise RuntimeError(
+            "--non-interactive requires --product-code."
+        )
+
     repository = SupabaseRepository()
     product = get_product(repository, args.product_code)
 
@@ -298,7 +308,7 @@ def main() -> None:
     )
     selected_images = get_selected_main_images(
         repository,
-        product["internal_product_id"],
+        product.get("candidate_id"),
     )
 
     blockers, warnings = evaluate_readiness(

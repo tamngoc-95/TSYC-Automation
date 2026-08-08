@@ -14,7 +14,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 CREATOR_NAME = "internal_product_creator"
-CREATOR_VERSION = "1.1.0"
+CREATOR_VERSION = "1.2.0"
 
 VALID_CONFIRMATIONS = {
     "CREATE",
@@ -268,7 +268,14 @@ def get_best_matched_reference(
     if not references:
         return None
 
-    return references[0]
+    reference = references[0]
+
+    if str(reference.get("candidate_id")) != str(candidate_id):
+        raise RuntimeError(
+            "Matched reference candidate_id does not match the requested candidate."
+        )
+
+    return reference
 
 
 def get_candidate_images(
@@ -387,11 +394,31 @@ def determine_metadata_status(
 def determine_image_status(
     images: list[dict[str, Any]],
 ) -> str:
-    """Determine whether images are available."""
-    if not images:
-        return "PENDING"
+    """
+    Determine internal product image workflow status.
 
-    return "AVAILABLE"
+    Images being present is not enough for approval. Exactly one selected
+    main image must already be validated and publish eligible. Otherwise the
+    internal product remains PENDING until review_product_images.py approves it.
+    """
+    approved_main_images = [
+        image
+        for image in images
+        if image.get("image_status") == "VALIDATED"
+        and image.get("is_selected_main_image") is True
+        and image.get("is_publish_eligible") is True
+    ]
+
+    if len(approved_main_images) > 1:
+        raise RuntimeError(
+            "More than one validated publishable main image is linked "
+            "to this candidate."
+        )
+
+    if len(approved_main_images) == 1:
+        return "APPROVED"
+
+    return "PENDING"
 
 
 def build_product_metadata(
@@ -446,6 +473,24 @@ def build_product_metadata(
         "candidate_image_count": len(
             images
         ),
+        "metadata_warnings": [
+            field_name
+            for field_name, field_value in (
+                (
+                    "isbn",
+                    candidate.get("verified_isbn")
+                    or reference.get("reference_isbn")
+                    or candidate.get("possible_isbn"),
+                ),
+                (
+                    "weight_grams",
+                    candidate.get("verified_weight_grams")
+                    if candidate.get("verified_weight_grams") is not None
+                    else reference.get("reference_weight_grams"),
+                ),
+            )
+            if field_value in (None, "")
+        ],
         "created_at": utc_now(),
     }
 
@@ -465,6 +510,18 @@ def create_internal_product(
     if reference.get("match_decision") != "MATCH":
         raise RuntimeError(
             "Primary reference must have match_decision = MATCH."
+        )
+
+    if str(reference.get("candidate_id")) != str(
+        candidate.get("candidate_id")
+    ):
+        raise RuntimeError(
+            "Primary reference is not linked to the selected candidate."
+        )
+
+    if not reference.get("reference_id"):
+        raise RuntimeError(
+            "Primary reference has no reference_id."
         )
 
     title = clean_text(
@@ -641,6 +698,28 @@ def create_internal_product(
         )
 
     return rows[0]
+
+
+def rollback_internal_product(
+    repository: SupabaseRepository,
+    internal_product_id: str,
+) -> None:
+    """Delete a newly created internal product after downstream failure."""
+    response = (
+        repository.client
+        .table("internal_products")
+        .delete()
+        .eq(
+            "internal_product_id",
+            internal_product_id,
+        )
+        .execute()
+    )
+
+    if response.data is None:
+        raise RuntimeError(
+            "Internal product rollback returned no response data."
+        )
 
 
 def update_candidate_workflow(
@@ -857,12 +936,37 @@ def main() -> None:
         "Internal product created."
     )
 
-    update_candidate_workflow(
-        repository=repository,
-        candidate_id=candidate[
-            "candidate_id"
-        ],
-    )
+    try:
+        update_candidate_workflow(
+            repository=repository,
+            candidate_id=candidate[
+                "candidate_id"
+            ],
+        )
+
+    except Exception:
+        internal_product_id = internal_product.get(
+            "internal_product_id"
+        )
+
+        if internal_product_id:
+            print(
+                "Candidate workflow update failed. "
+                "Rolling back the newly created internal product..."
+            )
+
+            rollback_internal_product(
+                repository=repository,
+                internal_product_id=str(
+                    internal_product_id
+                ),
+            )
+
+            print(
+                "Internal product rollback completed."
+            )
+
+        raise
 
     print(
         "Candidate workflow changed to CONTENT_PENDING."

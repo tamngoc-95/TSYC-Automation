@@ -20,7 +20,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 CREATOR_NAME = "woocommerce_draft_creator"
-CREATOR_VERSION = "1.2.0"
+CREATOR_VERSION = "1.3.0"
 
 VALID_CONFIRMATIONS = {
     "UPLOAD_AND_CREATE",
@@ -256,7 +256,7 @@ def get_ready_product(
     response = (
         query
         .order("created_at", desc=False)
-        .limit(1)
+        .limit(2)
         .execute()
     )
 
@@ -266,6 +266,12 @@ def get_ready_product(
         raise RuntimeError(
             "No READY_FOR_DRAFT internal product was found for "
             f"product code: {product_code}"
+        )
+
+    if product_code and len(rows) != 1:
+        raise RuntimeError(
+            "Product code did not resolve to exactly one READY_FOR_DRAFT "
+            "internal product."
         )
 
     return rows[0] if rows else None
@@ -358,7 +364,17 @@ def get_publishable_images(
         .execute()
     )
 
-    images = response.data or []
+    images = [
+        image
+        for image in (response.data or [])
+        if image.get("usage_rights_status")
+        in {
+            "STORE_OWNED",
+            "PUBLISHER_AUTHORIZED",
+            "SUPPLIER_AUTHORIZED",
+            "LICENSED",
+        }
+    ]
 
     return sorted(
         images,
@@ -372,6 +388,70 @@ def get_publishable_images(
             image.get("image_id") or "",
         ),
     )
+
+
+def revalidate_pre_create_state(
+    repository: SupabaseRepository,
+    product_code: str,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    list[dict[str, Any]],
+]:
+    """
+    Reload and validate current Supabase state immediately before Woo creation.
+
+    This prevents a stale in-memory product/content/image snapshot from being
+    used after media upload or another concurrent workflow change.
+    """
+    product = get_ready_product(
+        repository=repository,
+        product_code=product_code,
+    )
+
+    if product is None:
+        raise RuntimeError(
+            "Product is no longer READY_FOR_DRAFT."
+        )
+
+    if product.get("content_status") != "APPROVED":
+        raise RuntimeError(
+            "Internal product content is no longer APPROVED."
+        )
+
+    if product.get("image_status") != "APPROVED":
+        raise RuntimeError(
+            "Internal product image status is no longer APPROVED."
+        )
+
+    content = get_approved_content(
+        repository=repository,
+        internal_product_id=product["internal_product_id"],
+    )
+
+    if content is None:
+        raise RuntimeError(
+            "Approved Vietnamese product content is no longer available."
+        )
+
+    images = get_publishable_images(
+        repository=repository,
+        candidate_id=product["candidate_id"],
+    )
+
+    selected_main_images = [
+        image
+        for image in images
+        if image.get("is_selected_main_image") is True
+    ]
+
+    if len(selected_main_images) != 1:
+        raise RuntimeError(
+            "Exactly one validated publishable selected main image must "
+            "exist immediately before WooCommerce draft creation."
+        )
+
+    return product, content, images
 
 
 def get_existing_sync(
@@ -1654,6 +1734,54 @@ def mark_sync_succeeded(
         )
 
 
+def mark_post_create_recovery_required(
+    repository: SupabaseRepository,
+    sync_id: str,
+    product_response: dict[str, Any],
+    uploaded_media: list[dict[str, Any]],
+    error: Exception,
+) -> None:
+    """
+    Preserve the remote Woo draft identity if local finalization fails.
+
+    The sync remains DRAFT_CREATED because the remote object really exists.
+    Error fields flag that Supabase reconciliation is still required.
+    """
+    response_payload = {
+        "woocommerce_product": product_response,
+        "uploaded_media": uploaded_media,
+        "media_upload_completed": True,
+        "recovery_required": True,
+        "recovery_error": {
+            "exception_type": type(error).__name__,
+            "exception_message": str(error),
+        },
+        "failed_local_finalization_at": utc_now(),
+    }
+
+    (
+        repository.client
+        .table("woocommerce_product_syncs")
+        .update(
+            {
+                "woocommerce_product_id": product_response.get("id"),
+                "woocommerce_status": "DRAFT_CREATED",
+                "product_permalink": product_response.get("permalink"),
+                "response_payload": response_payload,
+                "error_code": "LOCAL_FINALIZATION_FAILED",
+                "error_message": str(error),
+                "synced_at": utc_now(),
+                "updated_at": utc_now(),
+            }
+        )
+        .eq(
+            "sync_id",
+            sync_id,
+        )
+        .execute()
+    )
+
+
 def update_internal_product(
     repository: SupabaseRepository,
     product: dict[str, Any],
@@ -2043,20 +2171,30 @@ def main() -> None:
             timeout_seconds=timeout_seconds,
         )
 
-        if product.get("woocommerce_status") != "READY_FOR_DRAFT":
-            raise RuntimeError(
-                "Product status changed before draft creation. "
-                "Expected READY_FOR_DRAFT."
-            )
+        (
+            product,
+            content,
+            current_images,
+        ) = revalidate_pre_create_state(
+            repository=repository,
+            product_code=product["product_code"],
+        )
 
-        if product.get("content_status") != "APPROVED":
-            raise RuntimeError(
-                "Internal product content must remain APPROVED."
-            )
+        current_image_ids = {
+            str(image.get("image_id"))
+            for image in current_images
+        }
 
-        if product.get("image_status") != "APPROVED":
+        uploaded_image_ids = {
+            str(item.get("image_id"))
+            for item in uploaded_media
+        }
+
+        if current_image_ids != uploaded_image_ids:
             raise RuntimeError(
-                "Internal product image status must remain APPROVED."
+                "Publishable image set changed during WooCommerce media "
+                "preparation. Draft creation was stopped to avoid using "
+                "a stale image set."
             )
 
         woo_payload = build_woocommerce_payload(
@@ -2132,21 +2270,50 @@ def main() -> None:
 
         raise
 
-    mark_sync_succeeded(
-        repository=repository,
-        sync_id=sync[
-            "sync_id"
-        ],
-        product_response=product_response,
-        uploaded_media=uploaded_media,
-    )
+    try:
+        mark_sync_succeeded(
+            repository=repository,
+            sync_id=sync[
+                "sync_id"
+            ],
+            product_response=product_response,
+            uploaded_media=uploaded_media,
+        )
 
-    update_internal_product(
-        repository=repository,
-        product=product,
-        product_response=product_response,
-        uploaded_media=uploaded_media,
-    )
+        update_internal_product(
+            repository=repository,
+            product=product,
+            product_response=product_response,
+            uploaded_media=uploaded_media,
+        )
+
+    except Exception as error:
+        try:
+            mark_post_create_recovery_required(
+                repository=repository,
+                sync_id=sync[
+                    "sync_id"
+                ],
+                product_response=product_response,
+                uploaded_media=uploaded_media,
+                error=error,
+            )
+        except Exception as recovery_error:
+            print()
+            print(
+                "Warning: WooCommerce draft exists, but local recovery "
+                "metadata could not be saved."
+            )
+            print(
+                "Recovery error: "
+                f"{recovery_error}"
+            )
+
+        raise RuntimeError(
+            "WooCommerce draft was created remotely, but local Supabase "
+            "finalization failed. Do not retry draft creation. Run the "
+            "WooCommerce status synchronization/recovery workflow instead."
+        ) from error
 
     print()
     print("=" * 72)

@@ -18,7 +18,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 BATCH_CODE = "FB-2026-001"
 
 EXTRACTOR_NAME = "facebook_cleaned_post_rule_extractor"
-EXTRACTOR_VERSION = "0.9.0"
+EXTRACTOR_VERSION = "1.0.0"
 
 DEFAULT_CANDIDATE_TYPE = "SINGLE_BOOK"
 DEFAULT_WORKFLOW_STATUS = "EXTRACTED"
@@ -136,6 +136,34 @@ def parse_arguments() -> argparse.Namespace:
         ],
         default=DEFAULT_CANDIDATE_TYPE,
         help="Candidate type to assign to the new candidate.",
+    )
+
+    parser.add_argument(
+        "--candidate-title",
+        action="append",
+        default=[],
+        help=(
+            "Explicit candidate title. Repeat this option to create multiple "
+            "candidates from one cleaned Facebook post."
+        ),
+    )
+
+    parser.add_argument(
+        "--candidate-author",
+        action="append",
+        default=[],
+        help=(
+            "Optional author corresponding by position to --candidate-title."
+        ),
+    )
+
+    parser.add_argument(
+        "--possible-isbn",
+        action="append",
+        default=[],
+        help=(
+            "Optional ISBN corresponding by position to --candidate-title."
+        ),
     )
 
     parser.add_argument(
@@ -484,6 +512,93 @@ def extract_book_identity(
     }
 
 
+def build_explicit_extractions(
+    titles: list[str],
+    authors: list[str],
+    isbns: list[str],
+) -> list[dict[str, Any]]:
+    """Build validated candidate extractions from explicit CLI values."""
+    if not titles:
+        return []
+
+    if len(authors) > len(titles):
+        raise RuntimeError(
+            "More --candidate-author values were supplied than --candidate-title values."
+        )
+
+    if len(isbns) > len(titles):
+        raise RuntimeError(
+            "More --possible-isbn values were supplied than --candidate-title values."
+        )
+
+    extractions: list[dict[str, Any]] = []
+
+    for index, raw_title in enumerate(titles):
+        raw_author = (
+            authors[index]
+            if index < len(authors)
+            else None
+        )
+
+        raw_isbn = (
+            isbns[index]
+            if index < len(isbns)
+            else None
+        )
+
+        (
+            cleaned_title,
+            cleaned_author,
+            warnings,
+        ) = validate_extracted_identity(
+            title=raw_title,
+            author=raw_author,
+        )
+
+        possible_isbn = normalize_isbn(
+            raw_isbn
+        )
+
+        if raw_isbn and not possible_isbn:
+            warnings.append(
+                "The supplied ISBN was invalid and was removed."
+            )
+
+        extractions.append(
+            {
+                "extracted_title": cleaned_title,
+                "extracted_author": cleaned_author,
+                "possible_isbn": possible_isbn,
+                "extraction_confidence": 1.0,
+                "matched_pattern": "EXPLICIT_CLI_IDENTITY",
+                "warnings": warnings,
+            }
+        )
+
+    return extractions
+
+
+def ensure_unique_extractions(
+    extractions: list[dict[str, Any]],
+) -> None:
+    """Reject duplicate titles within one extraction run."""
+    seen_titles: set[str] = set()
+
+    for extraction in extractions:
+        normalized_title = normalize_text(
+            extraction.get("extracted_title")
+        ).casefold()
+
+        if normalized_title in seen_titles:
+            raise RuntimeError(
+                "Duplicate candidate titles were supplied for the same raw page."
+            )
+
+        seen_titles.add(
+            normalized_title
+        )
+
+
 def get_batch_by_code(
     repository: SupabaseRepository,
     batch_code: str = BATCH_CODE,
@@ -674,6 +789,37 @@ def find_existing_candidate(
     return None
 
 
+def get_existing_candidates_for_raw_page(
+    repository: SupabaseRepository,
+    raw_page_id: str,
+) -> list[dict[str, Any]]:
+    """Return all candidates already linked to one raw page."""
+    response = (
+        repository.client
+        .table("product_candidates")
+        .select(
+            "candidate_id,"
+            "candidate_code,"
+            "candidate_type,"
+            "extracted_title,"
+            "extracted_author,"
+            "possible_isbn,"
+            "workflow_status"
+        )
+        .eq(
+            "raw_page_id",
+            raw_page_id,
+        )
+        .order(
+            "created_at",
+            desc=False,
+        )
+        .execute()
+    )
+
+    return response.data or []
+
+
 def get_next_candidate_code(
     repository: SupabaseRepository,
     batch_id: str,
@@ -778,13 +924,14 @@ def build_candidate_payload(
     extraction: dict[str, Any],
     candidate_code: str,
     candidate_type: str,
+    combo_group_code: str | None = None,
 ) -> dict[str, Any]:
     """Build a valid product_candidates insert payload."""
     return {
         "batch_id": batch["batch_id"],
         "candidate_code": candidate_code,
         "candidate_type": candidate_type,
-        "combo_group_code": None,
+        "combo_group_code": combo_group_code,
 
         "raw_page_id": raw_page[
             "raw_page_id"
@@ -1101,24 +1248,18 @@ def verify_linked_images(
     return response.data or []
 
 
-def create_candidate_from_page(
+def create_one_candidate(
     repository: SupabaseRepository,
     batch: dict[str, Any],
     raw_page: dict[str, Any],
+    extraction: dict[str, Any],
     candidate_type: str,
+    combo_group_code: str | None,
     confirm_create: bool,
     non_interactive: bool,
+    link_images: bool,
 ) -> str:
-    """Create one candidate and link its source images."""
-    cleaned_text = str(
-        raw_page.get("cleaned_text")
-        or ""
-    ).strip()
-
-    extraction = extract_book_identity(
-        cleaned_text
-    )
-
+    """Create one candidate from one prepared extraction."""
     raw_page_id = str(
         raw_page["raw_page_id"]
     )
@@ -1134,13 +1275,10 @@ def create_candidate_from_page(
     if existing_candidate is not None:
         print()
         print("=" * 78)
-        print(
-            "DUPLICATE CANDIDATE"
-        )
+        print("DUPLICATE CANDIDATE")
         print("=" * 78)
         print(
-            "A candidate already exists for this "
-            "Facebook post and title."
+            "A candidate already exists for this Facebook post and title."
         )
         print(
             "Candidate ID: "
@@ -1154,7 +1292,6 @@ def create_candidate_from_page(
             "Extracted title: "
             f"{existing_candidate.get('extracted_title')}"
         )
-
         return "DUPLICATE_CANDIDATE"
 
     candidate_code = get_next_candidate_code(
@@ -1162,9 +1299,13 @@ def create_candidate_from_page(
         batch_id=batch["batch_id"],
     )
 
-    unlinked_images = find_unlinked_images(
-        repository=repository,
-        raw_page_id=raw_page_id,
+    unlinked_images = (
+        find_unlinked_images(
+            repository=repository,
+            raw_page_id=raw_page_id,
+        )
+        if link_images
+        else []
     )
 
     print_extraction_preview(
@@ -1206,7 +1347,6 @@ def create_candidate_from_page(
         print(
             "Candidate creation cancelled."
         )
-
         return "CANCELLED"
 
     payload = build_candidate_payload(
@@ -1215,6 +1355,7 @@ def create_candidate_from_page(
         extraction=extraction,
         candidate_code=candidate_code,
         candidate_type=candidate_type,
+        combo_group_code=combo_group_code,
     )
 
     candidate = insert_candidate(
@@ -1227,9 +1368,7 @@ def create_candidate_from_page(
     )
 
     print()
-    print(
-        "Candidate created."
-    )
+    print("Candidate created.")
     print(
         f"Candidate ID: {candidate_id}"
     )
@@ -1238,18 +1377,12 @@ def create_candidate_from_page(
         f"{candidate.get('candidate_code')}"
     )
 
-    linked_images: list[
-        dict[str, Any]
-    ] = []
-
     try:
         if unlinked_images:
-            linked_images = (
-                link_images_to_candidate(
-                    repository=repository,
-                    raw_page_id=raw_page_id,
-                    candidate_id=candidate_id,
-                )
+            linked_images = link_images_to_candidate(
+                repository=repository,
+                raw_page_id=raw_page_id,
+                candidate_id=candidate_id,
             )
 
             print(
@@ -1257,23 +1390,25 @@ def create_candidate_from_page(
                 f"{len(linked_images)}"
             )
 
-        else:
+        elif link_images:
             print(
                 "No unlinked images were available."
             )
 
-        verified_candidate = (
-            verify_candidate_result(
-                repository=repository,
-                candidate_id=candidate_id,
+        else:
+            print(
+                "Images were not auto-linked because this raw page "
+                "contains multiple product candidates."
             )
+
+        verified_candidate = verify_candidate_result(
+            repository=repository,
+            candidate_id=candidate_id,
         )
 
-        verified_images = (
-            verify_linked_images(
-                repository=repository,
-                candidate_id=candidate_id,
-            )
+        verified_images = verify_linked_images(
+            repository=repository,
+            candidate_id=candidate_id,
         )
 
     except Exception:
@@ -1326,9 +1461,7 @@ def create_candidate_from_page(
 
     print()
     print("=" * 78)
-    print(
-        "CANDIDATE CREATION RESULT"
-    )
+    print("CANDIDATE CREATION RESULT")
     print("=" * 78)
     print(
         "Candidate ID: "
@@ -1370,8 +1503,110 @@ def create_candidate_from_page(
     return "CREATED"
 
 
+def create_candidates_from_page(
+    repository: SupabaseRepository,
+    batch: dict[str, Any],
+    raw_page: dict[str, Any],
+    candidate_type: str,
+    explicit_extractions: list[dict[str, Any]],
+    confirm_create: bool,
+    non_interactive: bool,
+) -> dict[str, int]:
+    """Create one or more candidates from one cleaned Facebook post."""
+    cleaned_text = str(
+        raw_page.get("cleaned_text")
+        or ""
+    ).strip()
+
+    if not cleaned_text:
+        raise RuntimeError(
+            "The selected raw page does not contain cleaned_text."
+        )
+
+    if explicit_extractions:
+        extractions = explicit_extractions
+    else:
+        extractions = [
+            extract_book_identity(
+                cleaned_text
+            )
+        ]
+
+    ensure_unique_extractions(
+        extractions
+    )
+
+    multi_candidate_run = len(extractions) > 1
+
+    if (
+        multi_candidate_run
+        and candidate_type in {
+            "BOOK_COMBO",
+            "BOOK_SET",
+        }
+    ):
+        raise RuntimeError(
+            "Use one BOOK_COMBO or BOOK_SET candidate for a bundled product. "
+            "Use repeated --candidate-title values only when the Facebook "
+            "post contains multiple distinct sellable products."
+        )
+
+    existing_candidates = get_existing_candidates_for_raw_page(
+        repository=repository,
+        raw_page_id=str(
+            raw_page["raw_page_id"]
+        ),
+    )
+
+    if (
+        existing_candidates
+        and not explicit_extractions
+    ):
+        raise RuntimeError(
+            "This raw page already has candidate records. "
+            "Automatic single-candidate extraction is blocked to avoid "
+            "creating an unintended duplicate. Use explicit --candidate-title "
+            "values if another distinct product must be added."
+        )
+
+    results = {
+        "CREATED": 0,
+        "DUPLICATE_CANDIDATE": 0,
+        "CANCELLED": 0,
+    }
+
+    combo_group_code = None
+
+    if candidate_type in {
+        "BOOK_COMBO",
+        "BOOK_SET",
+    }:
+        combo_group_code = (
+            f"{BATCH_CODE}-GROUP-"
+            f"{str(raw_page['raw_page_id'])[:8]}"
+        )
+
+    for extraction in extractions:
+        status = create_one_candidate(
+            repository=repository,
+            batch=batch,
+            raw_page=raw_page,
+            extraction=extraction,
+            candidate_type=candidate_type,
+            combo_group_code=combo_group_code,
+            confirm_create=confirm_create,
+            non_interactive=non_interactive,
+            link_images=not multi_candidate_run,
+        )
+
+        results[status] += 1
+
+    return results
+
+
+
 def main() -> None:
-    """Create one product candidate from one cleaned Facebook post."""
+    """Create product candidates from one cleaned Facebook post."""
     load_dotenv()
     args = parse_arguments()
 
@@ -1388,6 +1623,12 @@ def main() -> None:
             raise RuntimeError(
                 "--non-interactive requires --confirm-create."
             )
+
+    explicit_extractions = build_explicit_extractions(
+        titles=args.candidate_title,
+        authors=args.candidate_author,
+        isbns=args.possible_isbn,
+    )
 
     print(
         "Facebook cleaned-post candidate extractor started."
@@ -1422,11 +1663,12 @@ def main() -> None:
         non_interactive=args.non_interactive,
     )
 
-    result = create_candidate_from_page(
+    results = create_candidates_from_page(
         repository=repository,
         batch=batch,
         raw_page=selected_raw_page,
         candidate_type=args.candidate_type,
+        explicit_extractions=explicit_extractions,
         confirm_create=args.confirm_create,
         non_interactive=args.non_interactive,
     )
@@ -1437,9 +1679,11 @@ def main() -> None:
         "EXTRACTION RUN SUMMARY"
     )
     print("=" * 78)
-    print(
-        f"Result: {result}"
-    )
+
+    for status, count in results.items():
+        print(
+            f"{status}: {count}"
+        )
 
     print()
     print(

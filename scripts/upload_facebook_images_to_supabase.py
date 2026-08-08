@@ -18,7 +18,7 @@ BATCH_CODE = "FB-2026-001"
 STORAGE_BUCKET = "product-images"
 
 UPLOADER_NAME = "facebook_image_supabase_uploader"
-UPLOADER_VERSION = "0.8.0"
+UPLOADER_VERSION = "0.8.1"
 
 LOCAL_IMAGE_ROOT = (
     PROJECT_ROOT
@@ -346,6 +346,7 @@ def find_existing_database_record(
         .table("product_images")
         .select(
             "image_id, "
+            "candidate_id, "
             "raw_page_id, "
             "image_hash, "
             "storage_bucket, "
@@ -441,10 +442,16 @@ def build_database_payload(
     metadata: dict[str, Any],
     image_path: Path,
     storage_path: str,
+    candidate_id: str,
 ) -> dict[str, Any]:
     """Build a valid product_images insert payload."""
+    if not candidate_id:
+        raise RuntimeError(
+            "candidate_id is required when uploading a candidate image."
+        )
+
     return {
-        "candidate_id": None,
+        "candidate_id": candidate_id,
         "reference_id": None,
 
         "raw_page_id": metadata["raw_page_id"],
@@ -554,6 +561,7 @@ def remove_storage_file(
 def upload_one_image(
     repository: SupabaseRepository,
     metadata_path: Path,
+    candidate_id: str,
 ) -> str:
     """Upload one image and create its database record."""
     metadata = load_json(
@@ -614,12 +622,29 @@ def upload_one_image(
     )
 
     if existing_record is not None:
+        existing_candidate_id = existing_record.get(
+            "candidate_id"
+        )
+
+        if (
+            existing_candidate_id
+            and str(existing_candidate_id) != str(candidate_id)
+        ):
+            raise RuntimeError(
+                "The same raw-page image hash is already linked to "
+                "a different candidate."
+            )
+
         print(
             "Result: DUPLICATE_DATABASE"
         )
         print(
             "Existing image ID: "
             f"{existing_record.get('image_id')}"
+        )
+        print(
+            "Existing candidate ID: "
+            f"{existing_candidate_id or '[not linked]'}"
         )
         print(
             "Existing image status: "
@@ -666,6 +691,7 @@ def upload_one_image(
         metadata=metadata,
         image_path=image_path,
         storage_path=storage_path,
+        candidate_id=candidate_id,
     )
 
     try:
@@ -1077,6 +1103,7 @@ def select_raw_page_group(
 def filter_database_duplicates(
     repository: SupabaseRepository,
     items: list[dict[str, Any]],
+    candidate_id: str,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -1109,6 +1136,19 @@ def filter_database_duplicates(
             )
 
         else:
+            existing_candidate_id = existing_record.get(
+                "candidate_id"
+            )
+
+            if (
+                existing_candidate_id
+                and str(existing_candidate_id) != str(candidate_id)
+            ):
+                raise RuntimeError(
+                    "An existing image from the selected raw page is already "
+                    "linked to a different candidate."
+                )
+
             duplicate_item = dict(
                 item
             )
@@ -1508,12 +1548,17 @@ def main() -> None:
         selected_group_items=selected_group_items,
     )
 
+    selected_candidate_id = str(
+        selected_candidate["candidate_id"]
+    )
+
     (
         uploadable_items,
         duplicate_items,
     ) = filter_database_duplicates(
         repository=repository,
         items=selected_group_items,
+        candidate_id=selected_candidate_id,
     )
 
     print_existing_duplicates(
@@ -1596,6 +1641,7 @@ def main() -> None:
             status = upload_one_image(
                 repository=repository,
                 metadata_path=metadata_path,
+                candidate_id=selected_candidate_id,
             )
 
             results[status] += 1

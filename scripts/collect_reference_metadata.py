@@ -28,7 +28,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 COLLECTOR_NAME = "reference_metadata_collector"
-COLLECTOR_VERSION = "1.5.0"
+COLLECTOR_VERSION = "1.5.1"
 
 NAVIGATION_TIMEOUT_MS = 60_000
 
@@ -1653,6 +1653,16 @@ def validate_queue_item_links(
             "Source crawl status must be PENDING before collection."
         )
 
+    if source.get("source_type") not in SUPPORTED_SOURCE_TYPES:
+        raise RuntimeError(
+            "Selected source type is not supported for metadata collection."
+        )
+
+    if source.get("is_authorized") is False:
+        raise RuntimeError(
+            "Selected source is not authorized for metadata collection."
+        )
+
 
 def update_source_status(
     repository: SupabaseRepository,
@@ -1909,6 +1919,14 @@ def save_product_reference(
             )
             existing_confidence = existing_full_rows[0].get(
                 "match_confidence"
+            )
+
+        if existing_decision is not None:
+            raise RuntimeError(
+                "The existing product reference already has an identity "
+                "match decision. Automatic metadata refresh is blocked "
+                "to prevent stale identity evidence. Re-verification must "
+                "be performed explicitly."
             )
 
     payload = {
@@ -2475,6 +2493,9 @@ def main() -> None:
     )
     print(
         "Discovery status: CRAWLED"
+    )
+    print(
+        "Purchase price eligible: False"
     )
 
     print()

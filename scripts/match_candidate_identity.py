@@ -17,7 +17,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 MATCHER_NAME = "candidate_identity_matcher"
-MATCHER_VERSION = "1.4.0"
+MATCHER_VERSION = "1.4.1"
 
 VALID_CONFIRMATIONS = {
     "SAVE",
@@ -1549,6 +1549,27 @@ def build_consensus_source_evidence(
         "selected_author": consensus.get(
             "specific_author"
         ),
+        "metadata_warnings": [
+            field_name
+            for field_name, value in (
+                (
+                    "isbn",
+                    consensus["best_reference"].get(
+                        "reference_isbn"
+                    )
+                    or candidate.get(
+                        "possible_isbn"
+                    ),
+                ),
+                (
+                    "weight_grams",
+                    consensus["best_reference"].get(
+                        "reference_weight_grams"
+                    ),
+                ),
+            )
+            if not value
+        ],
         "reference_ids": [
             item["reference"].get(
                 "reference_id"
@@ -1597,8 +1618,6 @@ def update_candidate_from_consensus(
     ]
 
     if decision == "MATCH":
-        missing_fields: list[str] = []
-
         verified_isbn = (
             best_reference.get(
                 "reference_isbn"
@@ -1612,26 +1631,10 @@ def update_candidate_from_consensus(
             "reference_weight_grams"
         )
 
-        if not verified_isbn:
-            missing_fields.append("ISBN")
-
-        if not verified_weight:
-            missing_fields.append("weight")
-
-        review_required = bool(
-            missing_fields
-        )
-
-        review_reason = (
-            "Identity verified by multi-source consensus. "
-            + (
-                "The following metadata still requires review: "
-                + ", ".join(missing_fields)
-                + "."
-                if missing_fields
-                else ""
-            )
-        ).strip()
+        # Missing ISBN and weight are metadata warnings only.
+        # They do not block a successfully verified book identity.
+        review_required = False
+        review_reason = None
 
         payload: dict[str, Any] = {
             "identity_status": "IDENTITY_VERIFIED",
@@ -1676,11 +1679,7 @@ def update_candidate_from_consensus(
                 "reference_height_cm"
             ),
             "review_required": review_required,
-            "review_reason": (
-                review_reason
-                if review_required
-                else None
-            ),
+            "review_reason": review_reason,
             "decision_reason": consensus[
                 "match_reason"
             ],

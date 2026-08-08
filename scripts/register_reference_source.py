@@ -1,3 +1,4 @@
+import argparse
 import re
 import sys
 from datetime import datetime, timezone
@@ -22,13 +23,14 @@ from src.repositories.supabase_repository import SupabaseRepository
 BATCH_CODE = "FB-2026-001"
 
 REGISTRAR_NAME = "candidate_reference_source_registrar"
-REGISTRAR_VERSION = "0.9.0"
+REGISTRAR_VERSION = "1.0.0"
 
 SOURCE_TYPES = (
     "PUBLISHER",
     "AUTHORIZED_SUPPLIER",
     "BOOKSTORE",
     "FAHASA",
+    "FACEBOOK",
     "OTHER",
 )
 
@@ -57,6 +59,100 @@ TRACKING_QUERY_PREFIXES = (
     "utm_",
     "_ga",
 )
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Register one candidate reference source for the TSYC pipeline."
+        )
+    )
+
+    selector_group = parser.add_mutually_exclusive_group()
+
+    selector_group.add_argument(
+        "--candidate-code",
+        help="Exact candidate code.",
+    )
+
+    selector_group.add_argument(
+        "--candidate-id",
+        help="Exact candidate UUID.",
+    )
+
+    parser.add_argument(
+        "--source-type",
+        choices=SOURCE_TYPES,
+        help="Reference source type.",
+    )
+
+    parser.add_argument(
+        "--source-name",
+        help="Readable source name.",
+    )
+
+    parser.add_argument(
+        "--source-url",
+        help="Reference source URL.",
+    )
+
+    parser.add_argument(
+        "--discovery-method",
+        choices=DISCOVERY_METHODS,
+        help="How the reference source was discovered.",
+    )
+
+    parser.add_argument(
+        "--discovery-query",
+        help="Optional discovery query.",
+    )
+
+    parser.add_argument(
+        "--discovery-rank",
+        type=int,
+        help="Optional positive discovery rank.",
+    )
+
+    parser.add_argument(
+        "--discovery-confidence",
+        type=float,
+        help="Optional discovery confidence from 0 to 1.",
+    )
+
+    parser.add_argument(
+        "--selection-reason",
+        help="Optional reason for selecting this source.",
+    )
+
+    parser.add_argument(
+        "--authorized",
+        action="store_true",
+        help="Mark the source as authorized/approved.",
+    )
+
+    parser.add_argument(
+        "--select-for-crawl",
+        action="store_true",
+        help="Select this source for metadata crawling.",
+    )
+
+    parser.add_argument(
+        "--confirm-register",
+        action="store_true",
+        help="Confirm registration without interactive input.",
+    )
+
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Disable prompts. Requires an exact candidate selector, "
+            "source type, source URL, and --confirm-register."
+        ),
+    )
+
+    return parser.parse_args()
 
 
 def normalize_whitespace(
@@ -257,6 +353,44 @@ def get_candidates(
     )
 
     return response.data or []
+
+
+def resolve_candidate(
+    candidates: list[dict[str, Any]],
+    candidate_code: str | None,
+    candidate_id: str | None,
+    non_interactive: bool,
+) -> dict[str, Any]:
+    """Resolve exactly one candidate or fall back to manual selection."""
+    if candidate_code or candidate_id:
+        matches = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate_code
+                and candidate.get("candidate_code") == candidate_code
+            )
+            or (
+                candidate_id
+                and str(candidate.get("candidate_id")) == str(candidate_id)
+            )
+        ]
+
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Candidate selector did not resolve to exactly one record."
+            )
+
+        return matches[0]
+
+    if non_interactive:
+        raise RuntimeError(
+            "--non-interactive requires --candidate-code or --candidate-id."
+        )
+
+    return select_candidate(
+        candidates
+    )
 
 
 def select_candidate(
@@ -553,6 +687,7 @@ def get_default_source_name(
         "AUTHORIZED_SUPPLIER": "Authorized Supplier",
         "BOOKSTORE": "Bookstore",
         "FAHASA": "Fahasa",
+        "FACEBOOK": "Facebook",
         "OTHER": "Other",
     }
 
@@ -580,6 +715,99 @@ def build_default_discovery_query(
         for part in parts
         if part
     )
+
+
+def build_registration_from_arguments(
+    args: argparse.Namespace,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a validated registration payload from CLI arguments."""
+    if not args.source_type:
+        raise RuntimeError(
+            "--source-type is required in non-interactive mode."
+        )
+
+    if not args.source_url:
+        raise RuntimeError(
+            "--source-url is required in non-interactive mode."
+        )
+
+    if (
+        args.discovery_rank is not None
+        and args.discovery_rank <= 0
+    ):
+        raise RuntimeError(
+            "--discovery-rank must be greater than zero."
+        )
+
+    if (
+        args.discovery_confidence is not None
+        and not 0 <= args.discovery_confidence <= 1
+    ):
+        raise RuntimeError(
+            "--discovery-confidence must be between 0 and 1."
+        )
+
+    source_name = (
+        normalize_whitespace(
+            args.source_name
+        )
+        or get_default_source_name(
+            args.source_type
+        )
+    )
+
+    discovery_method = (
+        args.discovery_method
+        or "MANUAL"
+    )
+
+    discovery_query = (
+        normalize_whitespace(
+            args.discovery_query
+        )
+        or build_default_discovery_query(
+            candidate
+        )
+        or None
+    )
+
+    # Authorization must always be explicit in automation.
+    # Public Facebook/OTHER sources must never be auto-authorized.
+    is_authorized = bool(
+        args.authorized
+    )
+
+    return {
+        "source_type": args.source_type,
+        "source_name": source_name,
+        "source_url": normalize_url(
+            args.source_url
+        ),
+        "is_authorized": is_authorized,
+        "discovery_method": discovery_method,
+        "discovery_query": discovery_query,
+        "discovery_rank": args.discovery_rank,
+        "discovery_confidence": (
+            round(
+                args.discovery_confidence,
+                4,
+            )
+            if args.discovery_confidence is not None
+            else None
+        ),
+        "discovery_status": (
+            "SELECTED"
+            if args.select_for_crawl
+            else "DISCOVERED"
+        ),
+        "selection_reason": normalize_whitespace(
+            args.selection_reason
+        ) or None,
+        "is_selected_for_crawl": bool(
+            args.select_for_crawl
+        ),
+    }
 
 
 def collect_registration_input(
@@ -1068,6 +1296,21 @@ def print_registration_preview(
 def main() -> None:
     """Register one reference URL for one product candidate."""
     load_dotenv()
+    args = parse_arguments()
+
+    if args.non_interactive:
+        if not args.confirm_register:
+            raise RuntimeError(
+                "--non-interactive requires --confirm-register."
+            )
+
+        if not (
+            args.candidate_code
+            or args.candidate_id
+        ):
+            raise RuntimeError(
+                "--non-interactive requires an exact candidate selector."
+            )
 
     print(
         "Candidate reference source registrar started."
@@ -1095,13 +1338,23 @@ def main() -> None:
         f"{len(candidates)}"
     )
 
-    candidate = select_candidate(
-        candidates
+    candidate = resolve_candidate(
+        candidates=candidates,
+        candidate_code=args.candidate_code,
+        candidate_id=args.candidate_id,
+        non_interactive=args.non_interactive,
     )
 
-    registration = collect_registration_input(
-        candidate
-    )
+    if args.non_interactive:
+        registration = build_registration_from_arguments(
+            args=args,
+            candidate=candidate,
+        )
+
+    else:
+        registration = collect_registration_input(
+            candidate
+        )
 
     print_registration_preview(
         candidate=candidate,
@@ -1110,10 +1363,17 @@ def main() -> None:
 
     print()
 
-    confirmation = input(
-        "Type REGISTER to save this reference source, "
-        "or press Enter to cancel: "
-    ).strip().upper()
+    if args.confirm_register:
+        confirmation = "REGISTER"
+
+    elif args.non_interactive:
+        confirmation = ""
+
+    else:
+        confirmation = input(
+            "Type REGISTER to save this reference source, "
+            "or press Enter to cancel: "
+        ).strip().upper()
 
     if confirmation != "REGISTER":
         print(

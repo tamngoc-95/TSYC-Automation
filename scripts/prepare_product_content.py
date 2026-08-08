@@ -13,7 +13,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 GENERATOR_NAME = "internal_product_content_generator"
-GENERATOR_VERSION = "1.2.0"
+GENERATOR_VERSION = "1.3.0"
 VALID_ACTIONS = {"PREVIEW", "SAVE", "APPROVE", "SKIP"}
 
 
@@ -107,8 +107,19 @@ def get_products(
     if product_code:
         query = query.eq("product_code", product_code)
 
-    response = query.order("created_at", desc=False).execute()
-    return response.data or []
+    response = query.order(
+        "created_at",
+        desc=False,
+    ).execute()
+
+    rows = response.data or []
+
+    if product_code and len(rows) > 1:
+        raise RuntimeError(
+            "Product code did not resolve to exactly one internal product."
+        )
+
+    return rows
 
 
 def get_existing_content(
@@ -321,6 +332,98 @@ def print_preview(
         print(value or "[empty]")
 
 
+def is_generic_safe_draft(
+    content: dict[str, Any],
+    generated: dict[str, Any],
+) -> bool:
+    """
+    Return True when content is still the untouched metadata-only safe draft.
+
+    Generic safe drafts are useful for SAVE/PREVIEW but must never be approved
+    automatically because they contain no verified thematic book description.
+    """
+    fields = (
+        "short_description",
+        "long_description",
+        "author_summary",
+        "seo_description",
+    )
+
+    return all(
+        clean_text(content.get(field))
+        == clean_text(generated.get(field))
+        for field in fields
+    )
+
+
+def validate_approval_content(
+    existing: dict[str, Any] | None,
+    content: dict[str, Any],
+    generated: dict[str, Any],
+) -> None:
+    """Reject approval when the content is still an untouched safe draft."""
+    if not existing:
+        raise RuntimeError(
+            "Content cannot be approved on its first generated metadata-only "
+            "draft. Save it first, enrich it from verified source material, "
+            "then approve the reviewed content."
+        )
+
+    if is_generic_safe_draft(
+        content=content,
+        generated=generated,
+    ):
+        raise RuntimeError(
+            "Content is still the generic metadata-only safe draft. "
+            "Approval is blocked until the book description is enriched "
+            "from verified source material and reviewed."
+        )
+
+
+def restore_existing_content(
+    repository: SupabaseRepository,
+    existing: dict[str, Any],
+) -> None:
+    """Restore the previous content record after a downstream failure."""
+    payload = {
+        key: value
+        for key, value in existing.items()
+        if key not in {
+            "product_content_id",
+            "internal_product_id",
+            "created_at",
+        }
+    }
+
+    (
+        repository.client
+        .table("product_contents")
+        .update(payload)
+        .eq(
+            "product_content_id",
+            existing["product_content_id"],
+        )
+        .execute()
+    )
+
+
+def delete_new_content(
+    repository: SupabaseRepository,
+    product_content_id: str,
+) -> None:
+    """Delete a newly inserted content row after a downstream failure."""
+    (
+        repository.client
+        .table("product_contents")
+        .delete()
+        .eq(
+            "product_content_id",
+            product_content_id,
+        )
+        .execute()
+    )
+
+
 def save_content(
     repository: SupabaseRepository,
     product: dict[str, Any],
@@ -328,7 +431,7 @@ def save_content(
     content: dict[str, Any],
     approve: bool,
 ) -> dict[str, Any]:
-    """Insert or update one Vietnamese content record."""
+    """Insert or update one Vietnamese content record atomically as possible."""
     now = utc_now()
     status = "APPROVED" if approve else "DRAFTED"
 
@@ -336,7 +439,11 @@ def save_content(
         **content,
         "content_language": "vi",
         "content_status": status,
-        "generation_method": "RULE_BASED",
+        "generation_method": (
+            existing.get("generation_method")
+            if existing and existing.get("generation_method")
+            else "RULE_BASED"
+        ),
         "generator_name": GENERATOR_NAME,
         "generator_version": GENERATOR_VERSION,
         "review_required": not approve,
@@ -352,42 +459,93 @@ def save_content(
         "updated_at": now,
     }
 
-    table = repository.client.table("product_contents")
+    table = repository.client.table(
+        "product_contents"
+    )
+
+    inserted_new = existing is None
+    written_row: dict[str, Any] | None = None
 
     if existing:
         response = (
             table.update(payload)
-            .eq("product_content_id", existing["product_content_id"])
+            .eq(
+                "product_content_id",
+                existing["product_content_id"],
+            )
             .execute()
         )
     else:
-        payload["internal_product_id"] = product["internal_product_id"]
-        response = table.insert(payload).execute()
+        payload[
+            "internal_product_id"
+        ] = product[
+            "internal_product_id"
+        ]
+
+        response = (
+            table.insert(payload)
+            .execute()
+        )
 
     rows = response.data or []
 
-    if not rows:
-        raise RuntimeError("Product content write returned no data.")
-
-    internal_response = (
-        repository.client
-        .table("internal_products")
-        .update(
-            {
-                "content_status": status,
-                "updated_at": now,
-            }
-        )
-        .eq("internal_product_id", product["internal_product_id"])
-        .execute()
-    )
-
-    if not internal_response.data:
+    if len(rows) != 1:
         raise RuntimeError(
-            "Internal product content status update returned no data."
+            "Product content write did not return exactly one row."
         )
 
-    return rows[0]
+    written_row = rows[0]
+
+    try:
+        internal_response = (
+            repository.client
+            .table("internal_products")
+            .update(
+                {
+                    "content_status": status,
+                    "updated_at": now,
+                }
+            )
+            .eq(
+                "internal_product_id",
+                product["internal_product_id"],
+            )
+            .execute()
+        )
+
+        internal_rows = (
+            internal_response.data
+            or []
+        )
+
+        if len(internal_rows) != 1:
+            raise RuntimeError(
+                "Internal product content status update did not affect "
+                "exactly one row."
+            )
+
+    except Exception:
+        if written_row:
+            if inserted_new:
+                delete_new_content(
+                    repository=repository,
+                    product_content_id=str(
+                        written_row[
+                            "product_content_id"
+                        ]
+                    ),
+                )
+
+            elif existing:
+                restore_existing_content(
+                    repository=repository,
+                    existing=existing,
+                )
+
+        raise
+
+    return written_row
+
 
 
 def resolve_action(
@@ -448,6 +606,13 @@ def main() -> None:
     if action in {"PREVIEW", "SKIP"}:
         print("No database changes were made.")
         return
+
+    if action == "APPROVE":
+        validate_approval_content(
+            existing=existing,
+            content=content,
+            generated=generated,
+        )
 
     result = save_content(
         repository=repository,

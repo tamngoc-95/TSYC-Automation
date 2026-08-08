@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 from datetime import datetime, timezone
@@ -16,7 +17,42 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 
 SYNC_NAME = "woocommerce_product_status_sync"
-SYNC_VERSION = "1.0.0"
+SYNC_VERSION = "1.1.0"
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Synchronize WooCommerce product statuses into Supabase."
+        )
+    )
+
+    parser.add_argument(
+        "--product-code",
+        help=(
+            "Synchronize one exact internal product code instead of all "
+            "WooCommerce-linked products."
+        ),
+    )
+
+    parser.add_argument(
+        "--confirm-sync",
+        action="store_true",
+        help=(
+            "Confirm synchronization without an interactive prompt."
+        ),
+    )
+
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Disable prompts. Requires --confirm-sync and --product-code."
+        ),
+    )
+
+    return parser.parse_args()
 
 
 def utc_now() -> str:
@@ -92,9 +128,10 @@ def safe_json_response(
 
 def get_sync_records(
     repository: SupabaseRepository,
+    product_code: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return local WooCommerce records that have a product ID."""
-    response = (
+    query = (
         repository.client
         .table("woocommerce_product_syncs")
         .select(
@@ -117,6 +154,38 @@ def get_sync_records(
             "woocommerce_product_id",
             "null",
         )
+    )
+
+    if product_code:
+        product_response = (
+            repository.client
+            .table("internal_products")
+            .select(
+                "internal_product_id,"
+                "product_code"
+            )
+            .eq(
+                "product_code",
+                product_code,
+            )
+            .limit(2)
+            .execute()
+        )
+
+        product_rows = product_response.data or []
+
+        if len(product_rows) != 1:
+            raise RuntimeError(
+                "Product code did not resolve to exactly one internal product."
+            )
+
+        query = query.eq(
+            "internal_product_id",
+            product_rows[0]["internal_product_id"],
+        )
+
+    response = (
+        query
         .order(
             "created_at",
             desc=False,
@@ -124,7 +193,16 @@ def get_sync_records(
         .execute()
     )
 
-    return response.data or []
+    rows = response.data or []
+
+    if product_code and len(rows) != 1:
+        raise RuntimeError(
+            "The selected internal product does not have exactly one "
+            "WooCommerce synchronization record with a remote product ID."
+        )
+
+    return rows
+
 
 
 def get_internal_product(
@@ -236,8 +314,8 @@ def map_remote_status(
     return mapping.get(
         remote_status or "",
         (
-            "FAILED",
-            "FAILED",
+            "REVIEW_REQUIRED",
+            "REVIEW_REQUIRED",
         ),
     )
 
@@ -300,29 +378,38 @@ def build_updated_metadata(
     return product_metadata
 
 
-def update_sync_record(
-    repository: SupabaseRepository,
-    sync_record: dict[str, Any],
+def clear_recovery_marker(
+    response_payload: Any,
     remote_product: dict[str, Any],
-    local_sync_status: str,
-) -> None:
-    """Update the local WooCommerce synchronization record."""
-    existing_response_payload = sync_record.get(
-        "response_payload"
-    )
-
+) -> dict[str, Any]:
+    """Clear create-draft recovery flags after successful remote reconciliation."""
     if isinstance(
-        existing_response_payload,
+        response_payload,
         dict,
     ):
-        response_payload = dict(
-            existing_response_payload
+        normalized = dict(
+            response_payload
+        )
+    else:
+        normalized = {}
+
+    if normalized.get(
+        "recovery_required"
+    ) is True:
+        normalized[
+            "recovery_required"
+        ] = False
+        normalized[
+            "recovered_at"
+        ] = utc_now()
+        normalized[
+            "recovery_resolution"
+        ] = (
+            "WooCommerce product was found remotely and local state "
+            "was reconciled by the status synchronization workflow."
         )
 
-    else:
-        response_payload = {}
-
-    response_payload[
+    normalized[
         "latest_status_check"
     ] = {
         "sync_name": SYNC_NAME,
@@ -330,6 +417,23 @@ def update_sync_record(
         "checked_at": utc_now(),
         "woocommerce_product": remote_product,
     }
+
+    return normalized
+
+
+def update_sync_record(
+    repository: SupabaseRepository,
+    sync_record: dict[str, Any],
+    remote_product: dict[str, Any],
+    local_sync_status: str,
+) -> None:
+    """Update the local WooCommerce synchronization record."""
+    response_payload = clear_recovery_marker(
+        response_payload=sync_record.get(
+            "response_payload"
+        ),
+        remote_product=remote_product,
+    )
 
     response = (
         repository.client
@@ -390,10 +494,14 @@ def update_internal_product(
             "The linked WooCommerce product is currently in Trash."
         )
 
-    elif internal_status == "FAILED":
+    elif internal_status in {
+        "FAILED",
+        "REVIEW_REQUIRED",
+    }:
         review_required = True
         review_reason = (
-            f"Unsupported WooCommerce product status: {remote_status}"
+            f"Unsupported or review-required WooCommerce product status: "
+            f"{remote_status}"
         )
 
     update_payload: dict[str, Any] = {
@@ -407,15 +515,10 @@ def update_internal_product(
         "updated_at": utc_now(),
     }
 
-    # A manually entered WooCommerce price is treated as evidence
-    # that price work has started, but not as automatic approval.
-    if remote_price:
-        if internal_product.get(
-            "pricing_status"
-        ) == "PENDING":
-            update_payload[
-                "pricing_status"
-            ] = "CALCULATED"
+    # WooCommerce prices are observed for audit metadata only.
+    # They must never change internal pricing workflow status automatically.
+    # Purchase price and approved pricing remain controlled by TSYC sources
+    # and the internal pricing workflow.
 
     response = (
         repository.client
@@ -762,6 +865,46 @@ def synchronize_one_product(
 
         return False
 
+    remote_sku = str(
+        response_payload.get("sku")
+        or ""
+    ).strip()
+
+    expected_sku = str(
+        sync_record.get("product_sku")
+        or internal_product.get("product_code")
+        or ""
+    ).strip()
+
+    if (
+        remote_sku
+        and expected_sku
+        and remote_sku != expected_sku
+    ):
+        mark_sync_error(
+            repository=repository,
+            sync_record=sync_record,
+            error_code="SKU_MISMATCH",
+            error_message=(
+                "WooCommerce product SKU does not match the linked "
+                "internal product."
+            ),
+            response_payload=response_payload,
+        )
+
+        print()
+        print(
+            "WooCommerce SKU mismatch detected."
+        )
+        print(
+            f"Expected SKU: {expected_sku}"
+        )
+        print(
+            f"Remote SKU: {remote_sku}"
+        )
+
+        return False
+
     remote_status = response_payload.get(
         "status"
     )
@@ -802,6 +945,18 @@ def main() -> None:
     load_dotenv(
         PROJECT_ROOT / ".env"
     )
+    args = parse_arguments()
+
+    if args.non_interactive:
+        if not args.product_code:
+            raise RuntimeError(
+                "--non-interactive requires --product-code."
+            )
+
+        if not args.confirm_sync:
+            raise RuntimeError(
+                "--non-interactive requires --confirm-sync."
+            )
 
     print("=" * 72)
     print("WOOCOMMERCE PRODUCT STATUS SYNC")
@@ -833,7 +988,8 @@ def main() -> None:
     repository = SupabaseRepository()
 
     sync_records = get_sync_records(
-        repository
+        repository=repository,
+        product_code=args.product_code,
     )
 
     print()
@@ -846,19 +1002,24 @@ def main() -> None:
         print(
             "No synchronized WooCommerce products were found."
         )
-
         return
 
-    confirmation = input(
-        "Type SYNC_STATUS to check and update all product statuses, "
-        "or press Enter to cancel: "
-    ).strip().upper()
+    if args.confirm_sync:
+        confirmation = "SYNC_STATUS"
+
+    elif args.non_interactive:
+        confirmation = ""
+
+    else:
+        confirmation = input(
+            "Type SYNC_STATUS to check and update the selected "
+            "WooCommerce product statuses, or press Enter to cancel: "
+        ).strip().upper()
 
     if confirmation != "SYNC_STATUS":
         print(
             "WooCommerce product status synchronization was cancelled."
         )
-
         return
 
     successful_count = 0
@@ -878,7 +1039,6 @@ def main() -> None:
 
             if was_successful:
                 successful_count += 1
-
             else:
                 failed_count += 1
 
@@ -962,6 +1122,8 @@ def main() -> None:
     print(
         f"Total products checked: {len(sync_records)}"
     )
+
+
 
 
 if __name__ == "__main__":

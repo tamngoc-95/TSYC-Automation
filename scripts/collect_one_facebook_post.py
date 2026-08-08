@@ -23,7 +23,7 @@ BATCH_CODE = "FB-2026-001"
 AUTHORIZED_GROUP_ID = "2415122391976246"
 
 COLLECTOR_NAME = "facebook_permalink_container_collector"
-COLLECTOR_VERSION = "0.4.0"
+COLLECTOR_VERSION = "0.4.1"
 
 
 def normalize_confirmation(
@@ -267,9 +267,9 @@ def wait_for_facebook_content(page: Page) -> None:
 def collect_candidate_containers(
     page: Page,
     post_id: str,
-) -> list[tuple[str, Locator, str, int]]:
+) -> list[tuple[str, Locator, str, int, bool]]:
     """Collect and score possible Facebook post containers."""
-    candidates: list[tuple[str, Locator, str, int]] = []
+    candidates: list[tuple[str, Locator, str, int, bool]] = []
     seen_texts: set[str] = set()
 
     selectors = (
@@ -301,16 +301,19 @@ def collect_candidate_containers(
 
             score = score_candidate_text(text)
 
+            has_target_permalink = False
+
             try:
                 permalink_count = locator.locator(
                     f'a[href*="{post_id}"]'
                 ).count()
 
                 if permalink_count > 0:
+                    has_target_permalink = True
                     score += 10_000
 
             except Exception:
-                pass
+                has_target_permalink = False
 
             candidates.append(
                 (
@@ -318,6 +321,7 @@ def collect_candidate_containers(
                     locator,
                     text,
                     score,
+                    has_target_permalink,
                 )
             )
 
@@ -327,6 +331,7 @@ def collect_candidate_containers(
 def select_best_candidate(
     page: Page,
     post_id: str,
+    require_target_permalink: bool = False,
 ) -> tuple[str, str]:
     """Select the most likely Facebook post container."""
     candidates = collect_candidate_containers(
@@ -348,7 +353,7 @@ def select_best_candidate(
     print("Facebook container candidates:")
     print("=" * 70)
 
-    for name, _, text, score in candidates[:8]:
+    for name, _, text, score, has_target_permalink in candidates[:8]:
         preview = text[:350].replace(
             "\n",
             " | ",
@@ -358,6 +363,10 @@ def select_best_candidate(
         print(f"Container: {name}")
         print(f"Length: {len(text)}")
         print(f"Score: {score}")
+        print(
+            "Target permalink evidence: "
+            f"{has_target_permalink}"
+        )
         print(f"Preview: {preview}")
 
     print("=" * 70)
@@ -366,14 +375,25 @@ def select_best_candidate(
         candidate
         for candidate in candidates
         if candidate[3] >= 0
+        and (
+            not require_target_permalink
+            or candidate[4] is True
+        )
     ]
 
     if not valid_candidates:
+        if require_target_permalink:
+            raise RuntimeError(
+                "No suitable Facebook post container contained evidence "
+                "for the target permalink. Non-interactive collection "
+                "was stopped to avoid collecting the wrong Facebook post."
+            )
+
         raise RuntimeError(
             "No suitable Facebook post container could be identified."
         )
 
-    best_name, _, best_text, best_score = valid_candidates[0]
+    best_name, _, best_text, best_score, _ = valid_candidates[0]
 
     print()
     print(f"Selected container: {best_name}")
@@ -657,6 +677,7 @@ def main() -> None:
                 container_name, raw_text = select_best_candidate(
                     page=page,
                     post_id=post_id,
+                    require_target_permalink=args.non_interactive,
                 )
 
                 if len(raw_text) < 80:
