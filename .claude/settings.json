@@ -1,0 +1,119 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "disableAutoMode": "disable",
+    "disableBypassPermissionsMode": "disable",
+    "allow": [
+      "Read(./**)",
+      "Glob",
+      "Grep",
+      "Bash(git status)",
+      "Bash(git status *)",
+      "Bash(git diff)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git diff --check)",
+      "PowerShell(git status)",
+      "PowerShell(git status *)",
+      "PowerShell(git diff)",
+      "PowerShell(git diff *)",
+      "PowerShell(git log *)",
+      "PowerShell(git diff --check)",
+      "Bash(*audit_pipeline_state.py*)",
+      "PowerShell(*audit_pipeline_state.py*)",
+      "Bash(*check_draft_readiness.py --help*)",
+      "PowerShell(*check_draft_readiness.py --help*)",
+      "Bash(* -m py_compile *)",
+      "PowerShell(* -m py_compile *)"
+    ],
+    "ask": [
+      "Edit(./scripts/**)",
+      "Edit(./src/**)",
+      "Edit(./docs/**)",
+      "Edit(./prompts/**)",
+      "Edit(./checklists/**)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "PowerShell(git add *)",
+      "PowerShell(git commit *)",
+      "PowerShell(git push *)",
+      "Bash(*collect_one_facebook_post.py*)",
+      "Bash(*clean_facebook_raw_pages.py*)",
+      "Bash(*create_candidates_from_cleaned_posts.py*)",
+      "Bash(*upload_facebook_images_to_supabase.py*)",
+      "Bash(*register_reference_source.py*)",
+      "Bash(*collect_reference_metadata.py*)",
+      "Bash(*manual_create_product_reference.py*)",
+      "Bash(*match_candidate_identity.py*)",
+      "Bash(*create_internal_product.py*)",
+      "Bash(*review_product_images.py*)",
+      "Bash(*prepare_product_content.py*)",
+      "Bash(*create_woocommerce_draft.py*)",
+      "Bash(*sync_woocommerce_product_status.py*)",
+      "PowerShell(*collect_one_facebook_post.py*)",
+      "PowerShell(*clean_facebook_raw_pages.py*)",
+      "PowerShell(*create_candidates_from_cleaned_posts.py*)",
+      "PowerShell(*upload_facebook_images_to_supabase.py*)",
+      "PowerShell(*register_reference_source.py*)",
+      "PowerShell(*collect_reference_metadata.py*)",
+      "PowerShell(*manual_create_product_reference.py*)",
+      "PowerShell(*match_candidate_identity.py*)",
+      "PowerShell(*create_internal_product.py*)",
+      "PowerShell(*review_product_images.py*)",
+      "PowerShell(*prepare_product_content.py*)",
+      "PowerShell(*create_woocommerce_draft.py*)",
+      "PowerShell(*sync_woocommerce_product_status.py*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./playwright/facebook-profile/**)",
+      "Read(./playwright/.auth/**)",
+      "Read(./secrets/**)",
+      "Edit(./.env)",
+      "Edit(./.env.*)",
+      "Edit(./playwright/facebook-profile/**)",
+      "Edit(./playwright/.auth/**)",
+      "Edit(./secrets/**)",
+      "Edit(./.claude/settings.json)",
+      "Edit(./.claude/agents/**)",
+      "Edit(./.claude/rules/**)",
+      "Edit(./.claude/hooks/**)",
+      "Edit(./CLAUDE.md)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(git clean -fd*)",
+      "Bash(git clean -xdf*)",
+      "Bash(rm -rf *)",
+      "PowerShell(git push --force*)",
+      "PowerShell(git push -f*)",
+      "PowerShell(git reset --hard*)",
+      "PowerShell(git clean -fd*)",
+      "PowerShell(git clean -xdf*)",
+      "PowerShell(Remove-Item * -Recurse -Force*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.venv/Scripts/python.exe",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.claude/hooks/tsyc_pretool_guard.py"
+            ],
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "env": {
+    "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "4",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"
+  }
+}
