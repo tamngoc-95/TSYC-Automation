@@ -13,7 +13,11 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+SCRIPTS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS_DIR))
+
 from src.repositories.supabase_repository import SupabaseRepository
+import register_reference_source
 
 
 BATCH_CODE = "FB-2026-001"
@@ -1030,7 +1034,9 @@ def build_reference_payload(
         "candidate_id": candidate[
             "candidate_id"
         ],
-        "source_url_id": None,
+        "source_url_id": reference[
+            "source_url_id"
+        ],
         "source_type": reference[
             "source_type"
         ],
@@ -1348,6 +1354,64 @@ def delete_reference(
     )
 
 
+def resolve_registered_source(
+    repository: SupabaseRepository,
+    batch_id: str,
+    source_type: str,
+    raw_source_url: str,
+) -> dict[str, Any]:
+    """
+    Resolve a manually entered source URL to an existing registered
+    source_urls row.
+
+    This enforces the provenance invariant required later by
+    create_internal_product.py: a product_references row must trace back
+    to a source_urls row that was already registered (and authorized)
+    through register_reference_source.py. This function never creates a
+    source_urls row itself and never allows a caller to fall back to
+    source_url_id = None.
+    """
+    normalized_url = register_reference_source.normalize_url(
+        raw_source_url
+    )
+
+    existing_source = (
+        register_reference_source.find_existing_source_url(
+            repository=repository,
+            batch_id=batch_id,
+            source_type=source_type,
+            source_url=normalized_url,
+        )
+    )
+
+    if existing_source is None:
+        raise RuntimeError(
+            "No registered source_urls row was found for "
+            f"source_type={source_type!r} and URL={normalized_url!r}. "
+            "Run register_reference_source.py first to register and "
+            "authorize this source, then re-run this script."
+        )
+
+    if existing_source.get("source_type") != source_type:
+        raise RuntimeError(
+            "The registered source_urls row has a different source_type "
+            f"({existing_source.get('source_type')!r}) than the requested "
+            f"source_type ({source_type!r}). Re-register the source with "
+            "the correct source_type before creating a manual reference."
+        )
+
+    if existing_source.get("is_authorized") is not True:
+        raise RuntimeError(
+            "The registered source_urls row is not authorized "
+            f"(source_url_id={existing_source.get('source_url_id')}). "
+            "Run register_reference_source.py with --authorized to "
+            "approve this source before creating a manual product "
+            "reference for it."
+        )
+
+    return existing_source
+
+
 def main() -> None:
     """Create one reference and update one candidate."""
     load_dotenv()
@@ -1403,6 +1467,16 @@ def main() -> None:
     reference = collect_reference_input(
         candidate
     )
+
+    resolved_source = resolve_registered_source(
+        repository=repository,
+        batch_id=batch["batch_id"],
+        source_type=reference["source_type"],
+        raw_source_url=reference["source_url"],
+    )
+
+    reference["source_url"] = resolved_source["source_url"]
+    reference["source_url_id"] = resolved_source["source_url_id"]
 
     evaluation = evaluate_reference_match(
         candidate=candidate,
