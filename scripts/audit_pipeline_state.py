@@ -30,11 +30,13 @@ from src.repositories.supabase_repository import SupabaseRepository
 
 SCRIPT_VERSION = "1.0.1"
 
+# Must exactly match product_images_publish_eligibility_check
+# (migrations/009_add_product_image_review_guards.sql): is_publish_eligible
+# may only be true when usage_rights_status is one of these three values.
 PUBLISHABLE_RIGHTS = {
     "STORE_OWNED",
-    "PUBLISHER_AUTHORIZED",
-    "SUPPLIER_AUTHORIZED",
-    "LICENSED",
+    "PUBLISHER_APPROVED",
+    "SUPPLIER_APPROVED",
 }
 
 FETCH_PAGE_SIZE = 200

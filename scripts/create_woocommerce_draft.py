@@ -364,15 +364,20 @@ def get_publishable_images(
         .execute()
     )
 
+    # Must exactly match product_images_publish_eligibility_check
+    # (migrations/009_add_product_image_review_guards.sql): a row can only
+    # ever have is_publish_eligible = true when usage_rights_status is one
+    # of these three values, so this is a redundant defense-in-depth filter,
+    # not a broadening of what the database and review_product_images.py
+    # already allow. REFERENCE_ONLY and RIGHTS_UNKNOWN remain excluded.
     images = [
         image
         for image in (response.data or [])
         if image.get("usage_rights_status")
         in {
             "STORE_OWNED",
-            "PUBLISHER_AUTHORIZED",
-            "SUPPLIER_AUTHORIZED",
-            "LICENSED",
+            "PUBLISHER_APPROVED",
+            "SUPPLIER_APPROVED",
         }
     ]
 

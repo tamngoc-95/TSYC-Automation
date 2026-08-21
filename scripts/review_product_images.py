@@ -16,15 +16,21 @@ Designed for safe manual use and controlled non-interactive automation.
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 
-from src.supabase_repository import SupabaseRepository
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.repositories.supabase_repository import SupabaseRepository
 
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 
 VALID_IMAGE_ROLES = {
     "FRONT_COVER",
@@ -35,20 +41,26 @@ VALID_IMAGE_ROLES = {
     "OTHER",
 }
 
+# These values must exactly match the product_images.usage_rights_status
+# CHECK constraint (migrations/001_initial_schema.sql). Do not add a value
+# here that the database will reject.
 VALID_RIGHTS_STATUSES = {
     "STORE_OWNED",
-    "PUBLISHER_AUTHORIZED",
-    "SUPPLIER_AUTHORIZED",
-    "LICENSED",
+    "PUBLISHER_APPROVED",
+    "SUPPLIER_APPROVED",
+    "REFERENCE_ONLY",
     "RIGHTS_UNKNOWN",
-    "DO_NOT_USE",
 }
 
+# These must exactly match product_images_publish_eligibility_check
+# (migrations/009_add_product_image_review_guards.sql): is_publish_eligible
+# may only be true when usage_rights_status is one of these three values.
+# REFERENCE_ONLY and RIGHTS_UNKNOWN are intentionally excluded -- they are
+# valid rights statuses but are never publish eligible.
 PUBLISHABLE_RIGHTS_STATUSES = {
     "STORE_OWNED",
-    "PUBLISHER_AUTHORIZED",
-    "SUPPLIER_AUTHORIZED",
-    "LICENSED",
+    "PUBLISHER_APPROVED",
+    "SUPPLIER_APPROVED",
 }
 
 
@@ -210,9 +222,9 @@ def get_candidate_images(
             "is_publish_eligible,"
             "storage_bucket,"
             "storage_path,"
-            "source_image_url,"
-            "width_px,"
-            "height_px,"
+            "source_url,"
+            "width_pixels,"
+            "height_pixels,"
             "image_hash,"
             "created_at,"
             "updated_at"
@@ -362,7 +374,7 @@ def print_candidate_summary(
         )
         print(
             "Dimensions: "
-            f"{image.get('width_px')} x {image.get('height_px')}"
+            f"{image.get('width_pixels')} x {image.get('height_pixels')}"
         )
         print(
             "Storage: "

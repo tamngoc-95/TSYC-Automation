@@ -1,8 +1,10 @@
+import argparse
 import hashlib
 import json
 import mimetypes
 import re
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -103,6 +105,73 @@ CONTENT_TYPE_EXTENSIONS = {
 }
 
 
+def validate_uuid_argument(
+    value: str,
+) -> str:
+    """Validate that a CLI value is a syntactically correct UUID."""
+    try:
+        return str(
+            uuid.UUID(
+                value
+            )
+        )
+
+    except (
+        ValueError,
+        AttributeError,
+        TypeError,
+    ) as error:
+        raise argparse.ArgumentTypeError(
+            f"--raw-page-id must be a valid UUID: {value!r}"
+        ) from error
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Download images from one already-collected, cleaned Facebook "
+            "post using the persistent authenticated Facebook browser "
+            "profile."
+        )
+    )
+
+    parser.add_argument(
+        "--raw-page-id",
+        type=validate_uuid_argument,
+        default=None,
+        help=(
+            "Exact raw_pages.raw_page_id (UUID) to target. Required with "
+            "--non-interactive. When supplied, the interactive batch-wide "
+            "page selection menu is skipped entirely and this exact page "
+            "is used -- there is never a fallback to another page."
+        ),
+    )
+
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Disable all input() prompts (page selection, download "
+            "confirmation, and the closing prompt). Requires "
+            "--raw-page-id and --confirm-download."
+        ),
+    )
+
+    parser.add_argument(
+        "--confirm-download",
+        action="store_true",
+        help=(
+            "Explicit machine-readable confirmation that replaces the "
+            "interactive 'Type DOWNLOAD' prompt. Required with "
+            "--non-interactive; the browser will not be launched in "
+            "non-interactive mode without it."
+        ),
+    )
+
+    return parser.parse_args()
+
+
 def normalize_text(
     value: str | None,
 ) -> str:
@@ -199,6 +268,169 @@ def get_cleaned_raw_pages(
     )
 
     return response.data or []
+
+
+def resolve_exact_raw_page(
+    repository: SupabaseRepository,
+    batch_id: str,
+    raw_page_id: str,
+) -> dict[str, Any]:
+    """
+    Resolve exactly one Facebook raw page by its exact raw_page_id.
+
+    This never falls back to another raw page and never iterates through
+    the batch-wide page list. Each way the requested page can fail to
+    qualify raises a specific, clear error before any browser is opened.
+    """
+    response = (
+        repository.client
+        .table("raw_pages")
+        .select(
+            "raw_page_id, "
+            "batch_id, "
+            "source_url_id, "
+            "page_type, "
+            "page_url, "
+            "raw_title, "
+            "cleaned_text, "
+            "cleaning_status, "
+            "collected_at"
+        )
+        .eq(
+            "raw_page_id",
+            raw_page_id,
+        )
+        .limit(2)
+        .execute()
+    )
+
+    rows = response.data or []
+
+    if not rows:
+        raise RuntimeError(
+            "No raw_pages row was found for the exact raw_page_id: "
+            f"{raw_page_id}"
+        )
+
+    if len(rows) != 1:
+        raise RuntimeError(
+            "raw_page_id did not resolve to exactly one row: "
+            f"{raw_page_id}"
+        )
+
+    raw_page = rows[0]
+
+    if str(raw_page.get("batch_id")) != str(batch_id):
+        raise RuntimeError(
+            "The requested raw_page_id does not belong to batch "
+            f"{BATCH_CODE}: {raw_page_id}"
+        )
+
+    if raw_page.get("page_type") != "FACEBOOK_POST":
+        raise RuntimeError(
+            "The requested raw_page_id is not a Facebook source page "
+            f"(page_type={raw_page.get('page_type')!r}): {raw_page_id}"
+        )
+
+    if raw_page.get("cleaning_status") != "CLEANED":
+        raise RuntimeError(
+            "The requested raw_page_id has not been cleaned "
+            f"(cleaning_status={raw_page.get('cleaning_status')!r}): "
+            f"{raw_page_id}"
+        )
+
+    if not str(raw_page.get("page_url") or "").strip():
+        raise RuntimeError(
+            f"The requested raw_page_id has no page URL: {raw_page_id}"
+        )
+
+    if not str(raw_page.get("cleaned_text") or "").strip():
+        raise RuntimeError(
+            f"The requested raw_page_id has no cleaned text: {raw_page_id}"
+        )
+
+    return raw_page
+
+
+def select_or_resolve_raw_page(
+    repository: SupabaseRepository,
+    batch_id: str,
+    raw_page_id: str | None,
+    non_interactive: bool,
+) -> dict[str, Any]:
+    """
+    Select exactly one raw page.
+
+    When raw_page_id is supplied (interactive or non-interactive), it is
+    resolved exactly with no fallback and the batch-wide menu is skipped.
+    Otherwise, in interactive mode only, this falls back to the existing
+    manual batch-wide menu selection.
+    """
+    if raw_page_id:
+        return resolve_exact_raw_page(
+            repository=repository,
+            batch_id=batch_id,
+            raw_page_id=raw_page_id,
+        )
+
+    if non_interactive:
+        # Backstop only: main() already validates this before any
+        # database or browser work happens.
+        raise RuntimeError(
+            "--non-interactive requires --raw-page-id."
+        )
+
+    raw_pages = get_cleaned_raw_pages(
+        repository=repository,
+        batch_id=batch_id,
+    )
+
+    return select_raw_page(raw_pages)
+
+
+def print_preflight_summary(
+    raw_page: dict[str, Any],
+    batch_code: str,
+    output_directory: Path,
+    non_interactive: bool,
+    confirm_download: bool,
+) -> None:
+    """Print an exact-target preflight summary before launching Playwright."""
+    print()
+    print("=" * 78)
+    print("PREFLIGHT SUMMARY")
+    print("=" * 78)
+    print(
+        "Target raw_page_id: "
+        f"{raw_page.get('raw_page_id')}"
+    )
+    print(
+        f"Batch: {batch_code}"
+    )
+    print(
+        "Source URL: "
+        f"{raw_page.get('page_url')}"
+    )
+    print(
+        "Cleaning status: "
+        f"{raw_page.get('cleaning_status')}"
+    )
+    print(
+        f"Output directory: {output_directory}"
+    )
+    print(
+        "Mode: "
+        f"{'NON_INTERACTIVE' if non_interactive else 'INTERACTIVE'}"
+    )
+
+    if non_interactive:
+        print(
+            "Exact target locked: YES"
+        )
+        print(
+            "Download confirmation supplied: "
+            f"{'YES' if confirm_download else 'NO'}"
+        )
 
 
 def select_raw_page(
@@ -1205,6 +1437,9 @@ def inspect_and_download_images(
     context: BrowserContext,
     page: Page,
     raw_page: dict[str, Any],
+    output_directory: Path,
+    non_interactive: bool = False,
+    confirm_download: bool = False,
 ) -> None:
     """Detect and download usable images for one Facebook post."""
     page_url = str(
@@ -1340,20 +1575,32 @@ def inspect_and_download_images(
         )
 
     print()
-    confirmation = input(
-        "Type DOWNLOAD to save these images locally, "
-        "or press Enter to cancel: "
-    ).strip().upper()
 
-    if confirmation != "DOWNLOAD":
+    if confirm_download:
         print(
-            "Image download cancelled."
+            "Download confirmation supplied via --confirm-download."
+        )
+
+    elif non_interactive:
+        # Backstop only: main() already requires --confirm-download
+        # whenever --non-interactive is used, before Playwright launches.
+        print(
+            "Image download cancelled: no download confirmation "
+            "was supplied."
         )
         return
 
-    output_directory = build_output_directory(
-        raw_page_id=raw_page_id
-    )
+    else:
+        confirmation = input(
+            "Type DOWNLOAD to save these images locally, "
+            "or press Enter to cancel: "
+        ).strip().upper()
+
+        if confirmation != "DOWNLOAD":
+            print(
+                "Image download cancelled."
+            )
+            return
 
     results: list[
         dict[str, Any]
@@ -1486,11 +1733,30 @@ def main() -> None:
     """Run local Facebook image download for one cleaned post."""
     load_dotenv()
 
+    args = parse_arguments()
+
+    # Safety rule: validated before any database call or Playwright
+    # launch. Both flags are required together in non-interactive mode.
+    if args.non_interactive:
+        if not args.raw_page_id:
+            raise RuntimeError(
+                "--non-interactive requires --raw-page-id."
+            )
+
+        if not args.confirm_download:
+            raise RuntimeError(
+                "--non-interactive requires --confirm-download."
+            )
+
     print(
         "Facebook post image downloader started."
     )
     print(
         f"Version: {COLLECTOR_VERSION}"
+    )
+    print(
+        "Mode: "
+        f"{'NON_INTERACTIVE' if args.non_interactive else 'INTERACTIVE'}"
     )
 
     repository = SupabaseRepository()
@@ -1506,18 +1772,25 @@ def main() -> None:
             f"Batch was not found: {BATCH_CODE}"
         )
 
-    raw_pages = get_cleaned_raw_pages(
+    selected_raw_page = select_or_resolve_raw_page(
         repository=repository,
         batch_id=batch["batch_id"],
+        raw_page_id=args.raw_page_id,
+        non_interactive=args.non_interactive,
     )
 
-    print(
-        "Cleaned Facebook pages found: "
-        f"{len(raw_pages)}"
+    output_directory = build_output_directory(
+        raw_page_id=str(
+            selected_raw_page["raw_page_id"]
+        )
     )
 
-    selected_raw_page = select_raw_page(
-        raw_pages
+    print_preflight_summary(
+        raw_page=selected_raw_page,
+        batch_code=BATCH_CODE,
+        output_directory=output_directory,
+        non_interactive=args.non_interactive,
+        confirm_download=args.confirm_download,
     )
 
     with sync_playwright() as playwright:
@@ -1534,11 +1807,15 @@ def main() -> None:
                 context=context,
                 page=page,
                 raw_page=selected_raw_page,
+                output_directory=output_directory,
+                non_interactive=args.non_interactive,
+                confirm_download=args.confirm_download,
             )
 
-            input(
-                "Press Enter to close Chrome..."
-            )
+            if not args.non_interactive:
+                input(
+                    "Press Enter to close Chrome..."
+                )
 
         finally:
             context.close()
