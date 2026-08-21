@@ -2191,7 +2191,7 @@ def main() -> None:
         }
 
         uploaded_image_ids = {
-            str(item.get("image_id"))
+            str(item.get("source_image_id"))
             for item in uploaded_media
         }
 
