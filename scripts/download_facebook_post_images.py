@@ -27,9 +27,12 @@ sys.path.insert(
     str(PROJECT_ROOT),
 )
 
+from src.cli_bootstrap import configure_utf8_console
 from src.repositories.supabase_repository import (
     SupabaseRepository,
 )
+
+configure_utf8_console()
 
 
 BATCH_CODE = "FB-2026-001"

@@ -10,7 +10,10 @@ from playwright.sync_api import Locator, Page, sync_playwright
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.cli_bootstrap import configure_utf8_console
 from src.repositories.supabase_repository import SupabaseRepository
+
+configure_utf8_console()
 
 
 PROFILE_DIRECTORY = (

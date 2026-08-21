@@ -13,7 +13,10 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.cli_bootstrap import configure_utf8_console
 from src.repositories.supabase_repository import SupabaseRepository
+
+configure_utf8_console()
 
 
 MATCHER_NAME = "candidate_identity_matcher"

@@ -55,8 +55,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+from src.cli_bootstrap import configure_utf8_console
 from src.repositories.supabase_repository import SupabaseRepository
 import collect_reference_metadata as reference_metadata
+
+configure_utf8_console()
 
 
 BATCH_CODE = "FB-2026-001"
