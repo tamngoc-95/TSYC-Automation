@@ -1,0 +1,663 @@
+"""Automated tests for scripts/run_batch.py and scripts/pipeline_state.py.
+
+Covers the Phase C P0 batch orchestrator: bounded allowlist enforcement,
+dry-run read-only guarantees, idempotent single-next-stage dispatch, serial
+execution, no-blind-retry stage-failure handling, the audit checkpoint
+(including CLAUDE.md's accepted-warning policy), human gates, recovery
+handling, and the WooCommerce draft-creation authorization gate.
+
+Pure/offline: no live Supabase, no live WooCommerce, no subprocess actually
+spawns .venv/Scripts/python.exe -- every test injects a stub
+subprocess_runner and a FakeSupabaseRepository (Phase B testing
+infrastructure).
+"""
+
+from __future__ import annotations
+
+import subprocess
+import types
+from typing import Any, Callable
+
+import pytest
+
+import run_batch
+from pipeline_state import derive_candidate_state, load_candidate_bundle
+
+from support.fake_supabase import FakeSupabaseRepository
+
+
+CANDIDATE_ID = "22222222-2222-2222-2222-222222222222"
+BATCH_ID = "11111111-1111-1111-1111-111111111111"
+REFERENCE_ID = "33333333-3333-3333-3333-333333333333"
+INTERNAL_PRODUCT_ID = "44444444-4444-4444-4444-444444444444"
+SYNC_ID = "55555555-5555-5555-5555-555555555555"
+CANDIDATE_CODE = "FB-2026-001-CAN-0001"
+PRODUCT_CODE = f"TSYC-{CANDIDATE_CODE}"
+
+
+# --------------------------------------------------------------------------
+# Row builders
+# --------------------------------------------------------------------------
+
+
+def make_candidate(**overrides: Any) -> dict[str, Any]:
+    row = {
+        "candidate_id": CANDIDATE_ID,
+        "candidate_code": CANDIDATE_CODE,
+        "batch_id": BATCH_ID,
+        "identity_status": "IDENTITY_PENDING",
+        "workflow_status": "EXTRACTED",
+    }
+    row.update(overrides)
+    return row
+
+
+def make_reference(**overrides: Any) -> dict[str, Any]:
+    row = {
+        "reference_id": REFERENCE_ID,
+        "candidate_id": CANDIDATE_ID,
+        "match_decision": "MATCH",
+        "source_url_id": "source-url-1",
+    }
+    row.update(overrides)
+    return row
+
+
+def make_internal_product(**overrides: Any) -> dict[str, Any]:
+    row = {
+        "internal_product_id": INTERNAL_PRODUCT_ID,
+        "candidate_id": CANDIDATE_ID,
+        "product_code": PRODUCT_CODE,
+        "isbn": "9786041234567",
+        "weight_grams": 250,
+        "content_status": "APPROVED",
+        "image_status": "APPROVED",
+        "woocommerce_status": "NOT_CREATED",
+    }
+    row.update(overrides)
+    return row
+
+
+def make_sync(**overrides: Any) -> dict[str, Any]:
+    row = {
+        "sync_id": SYNC_ID,
+        "internal_product_id": INTERNAL_PRODUCT_ID,
+        "woocommerce_status": "DRAFT_CREATED",
+        "woocommerce_product_id": 999,
+        "response_payload": {},
+    }
+    row.update(overrides)
+    return row
+
+
+def make_repository(**tables: list[dict[str, Any]]) -> FakeSupabaseRepository:
+    return FakeSupabaseRepository(tables=dict(tables))
+
+
+def make_args(
+    *,
+    dry_run: bool = False,
+    non_interactive: bool = True,
+    allow_woo_draft: bool = False,
+    batch_code: str | None = None,
+) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        dry_run=dry_run,
+        non_interactive=non_interactive,
+        allow_woo_draft=allow_woo_draft,
+        batch_code=batch_code,
+    )
+
+
+def recording_runner(
+    returncode: int = 0,
+    stdout: str = "",
+) -> tuple[Callable[[list[str]], subprocess.CompletedProcess], list[list[str]]]:
+    """A subprocess_runner stub that records every argv and never mutates data."""
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess:
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=returncode,
+            stdout=stdout,
+            stderr="",
+        )
+
+    return runner, calls
+
+
+def always_confirm(_prompt: str) -> bool:
+    return True
+
+
+# --------------------------------------------------------------------------
+# 1. No candidate allowlist supplied => fail before any I/O
+# --------------------------------------------------------------------------
+
+
+def test_no_allowlist_fails_before_any_io():
+    exit_code = run_batch.main(["--max-candidates", "5"])
+    assert exit_code == 2
+
+
+# --------------------------------------------------------------------------
+# 2. Candidate count exceeds --max-candidates => fail before any I/O
+# --------------------------------------------------------------------------
+
+
+def test_allowlist_exceeding_max_candidates_fails():
+    exit_code = run_batch.main(
+        ["--candidate-codes", "A,B,C", "--max-candidates", "2"]
+    )
+    assert exit_code == 2
+
+
+def test_max_candidates_below_one_fails():
+    exit_code = run_batch.main(
+        ["--candidate-code", "A", "--max-candidates", "0"]
+    )
+    assert exit_code == 2
+
+
+# --------------------------------------------------------------------------
+# 3. --dry-run never invokes writers (or the audit checkpoint)
+# --------------------------------------------------------------------------
+
+
+def test_dry_run_never_invokes_a_writer_script():
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+        ],
+        product_references=[make_reference()],
+    )
+    runner, calls = recording_runner()
+
+    exit_code = run_batch.main(
+        [
+            "--candidate-code",
+            CANDIDATE_CODE,
+            "--max-candidates",
+            "1",
+            "--dry-run",
+            "--non-interactive",
+        ],
+        repository=repository,
+        subprocess_runner=runner,
+        confirm=always_confirm,
+    )
+
+    assert exit_code == 0
+    assert calls == []
+
+
+# --------------------------------------------------------------------------
+# 4. A completed stage is not repeated
+# --------------------------------------------------------------------------
+
+
+def test_completed_stage_is_not_repeated():
+    """
+    The candidate already has an internal_products row -- the mandatory
+    gate before create_internal_product.py has already been satisfied and
+    must not be re-run. The next dispatched script must be
+    prepare_product_content.py, never create_internal_product.py again.
+    """
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+        ],
+        product_references=[make_reference()],
+        internal_products=[
+            make_internal_product(content_status="PENDING"),
+        ],
+    )
+    runner, calls = recording_runner()
+    args = make_args()
+
+    report = run_batch.process_one_candidate(
+        CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1].endswith("prepare_product_content.py")
+    assert "create_internal_product.py" not in calls[0][1]
+    assert report.initial_state == "INTERNAL_PRODUCT_CREATED"
+
+
+# --------------------------------------------------------------------------
+# 5. Exactly one next stage is chosen
+# --------------------------------------------------------------------------
+
+
+def test_exactly_one_next_stage_is_chosen():
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+        ],
+        product_references=[make_reference()],
+    )
+    bundle = load_candidate_bundle(repository, CANDIDATE_CODE)
+    state = derive_candidate_state(bundle)
+
+    kind, dispatch, _description = run_batch.decide_action(state, False)
+
+    assert kind == "invoke"
+    assert dispatch is run_batch.AUTOMATABLE_DISPATCH["IDENTITY_VERIFIED"]
+    assert dispatch.script == "create_internal_product.py"
+
+
+# --------------------------------------------------------------------------
+# 6. Writer stages execute serially (never concurrently / never reordered)
+# --------------------------------------------------------------------------
+
+
+def test_writer_stages_execute_serially_in_allowlist_order():
+    other_candidate_id = "66666666-6666-6666-6666-666666666666"
+    other_code = "FB-2026-001-CAN-0002"
+
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+            make_candidate(
+                candidate_id=other_candidate_id,
+                candidate_code=other_code,
+                identity_status="IDENTITY_VERIFIED",
+            ),
+        ],
+        product_references=[
+            make_reference(),
+            make_reference(
+                reference_id="reference-2",
+                candidate_id=other_candidate_id,
+            ),
+        ],
+    )
+    runner, calls = recording_runner()
+
+    exit_code = run_batch.main(
+        [
+            "--candidate-code",
+            CANDIDATE_CODE,
+            "--candidate-code",
+            other_code,
+            "--max-candidates",
+            "2",
+            "--non-interactive",
+        ],
+        repository=repository,
+        subprocess_runner=runner,
+        confirm=always_confirm,
+    )
+
+    assert exit_code == 0
+    # Both candidates dispatched create_internal_product.py exactly once,
+    # strictly in allowlist order -- candidate 1 fully finished (its one
+    # call happened) before candidate 2's call was made.
+    assert len(calls) == 2
+    assert calls[0][-3] == CANDIDATE_CODE
+    assert calls[1][-3] == other_code
+
+
+# --------------------------------------------------------------------------
+# 7. A non-zero stage result stops that candidate immediately (no retry)
+# --------------------------------------------------------------------------
+
+
+def test_nonzero_stage_result_stops_candidate_without_retry():
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+        ],
+        product_references=[make_reference()],
+    )
+    runner, calls = recording_runner(returncode=1, stdout="boom")
+    args = make_args()
+
+    report = run_batch.process_one_candidate(
+        CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert report.result == "STAGE_FAILED"
+    assert len(calls) == 1  # stopped immediately, no blind retry
+
+
+# --------------------------------------------------------------------------
+# 8. Audit error stops the entire batch
+# --------------------------------------------------------------------------
+
+
+def test_audit_error_stops_entire_batch():
+    other_code = "FB-2026-001-CAN-0002"
+    other_candidate_id = "77777777-7777-7777-7777-777777777777"
+
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+            make_candidate(
+                candidate_id=other_candidate_id,
+                candidate_code=other_code,
+                identity_status="IDENTITY_VERIFIED",
+            ),
+        ],
+        product_references=[
+            make_reference(),
+            make_reference(
+                reference_id="reference-2",
+                candidate_id=other_candidate_id,
+            ),
+        ],
+        internal_products=[
+            make_internal_product(content_status="PENDING"),
+        ],
+    )
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess:
+        script = argv[1]
+
+        if script.endswith("prepare_product_content.py"):
+            # Simulate the real script's write: content moves PENDING -> DRAFTED.
+            product = repository.client.tables["internal_products"][0]
+            product["content_status"] = "DRAFTED"
+            repository.client.tables.setdefault(
+                "product_contents", []
+            ).append(
+                {
+                    "product_content_id": "content-1",
+                    "internal_product_id": INTERNAL_PRODUCT_ID,
+                    "content_language": "vi",
+                    "content_status": "DRAFTED",
+                }
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        if script.endswith("audit_pipeline_state.py"):
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                "[1] ERROR | CONTENT_STATUS_MISMATCH\nEntity: x\nDetails: y\n",
+                "",
+            )
+
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    exit_code = run_batch.main(
+        [
+            "--candidate-code",
+            CANDIDATE_CODE,
+            "--candidate-code",
+            other_code,
+            "--max-candidates",
+            "2",
+            "--non-interactive",
+        ],
+        repository=repository,
+        subprocess_runner=runner,
+        confirm=always_confirm,
+    )
+
+    assert exit_code == 1
+
+
+# --------------------------------------------------------------------------
+# 9. Accepted warnings (ISBN/weight) may continue past the audit checkpoint
+# --------------------------------------------------------------------------
+
+
+def test_accepted_warnings_continue_past_audit_checkpoint():
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+        ],
+        product_references=[make_reference()],
+        internal_products=[
+            make_internal_product(content_status="PENDING"),
+        ],
+    )
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess:
+        script = argv[1]
+
+        if script.endswith("prepare_product_content.py"):
+            repository.client.tables["internal_products"][0][
+                "content_status"
+            ] = "DRAFTED"
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        if script.endswith("audit_pipeline_state.py"):
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "[1] WARNING | ISBN_MISSING\nEntity: x\nDetails: y\n"
+                "[2] WARNING | WEIGHT_MISSING\nEntity: x\nDetails: y\n",
+                "",
+            )
+
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    args = make_args()
+    report = run_batch.process_one_candidate(
+        CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert report.result != "AUDIT_FAILED"
+    assert report.actions_executed == ["prepare_product_content.py"]
+    # Content is now DRAFTED -- a human gate for approval, reached only
+    # because the batch was allowed to continue past accepted warnings.
+    assert report.final_state == "CONTENT_DRAFTED"
+    assert report.human_gate is True
+
+
+def test_unaccepted_warning_stops_the_batch():
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+        ],
+        product_references=[make_reference()],
+        internal_products=[
+            make_internal_product(content_status="PENDING"),
+        ],
+    )
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess:
+        script = argv[1]
+
+        if script.endswith("prepare_product_content.py"):
+            repository.client.tables["internal_products"][0][
+                "content_status"
+            ] = "DRAFTED"
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        if script.endswith("audit_pipeline_state.py"):
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "[1] WARNING | APPROVED_AT_MISSING\nEntity: x\nDetails: y\n",
+                "",
+            )
+
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    args = make_args()
+    report = run_batch.process_one_candidate(
+        CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert report.result == "AUDIT_FAILED"
+
+
+# --------------------------------------------------------------------------
+# 10. A human gate stops the candidate without invoking any writer
+# --------------------------------------------------------------------------
+
+
+def test_human_gate_stops_candidate_without_invoking_writer():
+    repository = make_repository(
+        product_candidates=[make_candidate(identity_status="IDENTITY_PENDING")],
+    )
+    runner, calls = recording_runner()
+    args = make_args()
+
+    report = run_batch.process_one_candidate(
+        CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert report.result == "HUMAN_GATE"
+    assert report.initial_state == "EXTRACTED"
+    assert calls == []
+
+
+# --------------------------------------------------------------------------
+# 11. recovery_required prevents any WooCommerce draft retry
+# --------------------------------------------------------------------------
+
+
+def test_recovery_required_prevents_woo_draft_retry():
+    repository = make_repository(
+        product_candidates=[make_candidate(identity_status="IDENTITY_VERIFIED")],
+        product_references=[make_reference()],
+        internal_products=[
+            make_internal_product(woocommerce_status="DRAFT_CREATED"),
+        ],
+        woocommerce_product_syncs=[
+            make_sync(
+                response_payload={"recovery_required": True},
+            ),
+        ],
+    )
+    runner, calls = recording_runner()
+    # Even with explicit authorization, recovery must still stop -- the
+    # derived state is not READY_FOR_DRAFT, so --allow-woo-draft is moot.
+    args = make_args(allow_woo_draft=True)
+
+    report = run_batch.process_one_candidate(
+        CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert report.result == "HUMAN_GATE"
+    assert report.recovery_state == "REMOTE_CREATED_LOCAL_DIRTY"
+    assert calls == []
+
+
+# --------------------------------------------------------------------------
+# 12. READY_FOR_DRAFT without --allow-woo-draft stops as a human gate
+# --------------------------------------------------------------------------
+
+
+def test_ready_for_draft_without_authorization_stops():
+    repository = make_repository(
+        product_candidates=[make_candidate(identity_status="IDENTITY_VERIFIED")],
+        product_references=[make_reference()],
+        internal_products=[
+            make_internal_product(woocommerce_status="READY_FOR_DRAFT"),
+        ],
+    )
+    runner, calls = recording_runner()
+    args = make_args(allow_woo_draft=False)
+
+    report = run_batch.process_one_candidate(
+        CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert report.result == "HUMAN_GATE"
+    assert report.initial_state == "READY_FOR_DRAFT"
+    assert calls == []
+
+
+# --------------------------------------------------------------------------
+# 13. READY_FOR_DRAFT with bounded explicit authorization delegates to
+#     create_woocommerce_draft.py
+# --------------------------------------------------------------------------
+
+
+def test_ready_for_draft_with_authorization_delegates_to_draft_creation():
+    repository = make_repository(
+        product_candidates=[make_candidate(identity_status="IDENTITY_VERIFIED")],
+        product_references=[make_reference()],
+        internal_products=[
+            make_internal_product(woocommerce_status="READY_FOR_DRAFT"),
+        ],
+    )
+    runner, calls = recording_runner()
+    args = make_args(allow_woo_draft=True)
+
+    run_batch.process_one_candidate(
+        CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1].endswith("create_woocommerce_draft.py")
+    assert "--product-code" in calls[0]
+    assert PRODUCT_CODE in calls[0]
+    assert "--confirm-create" in calls[0]
+    assert "--non-interactive" in calls[0]
+
+
+# --------------------------------------------------------------------------
+# 14. DRAFT_CREATED delegates to reconciliation, not creation
+# --------------------------------------------------------------------------
+
+
+def test_draft_created_delegates_to_reconciliation_not_creation():
+    repository = make_repository(
+        product_candidates=[make_candidate(identity_status="IDENTITY_VERIFIED")],
+        product_references=[make_reference()],
+        internal_products=[
+            make_internal_product(woocommerce_status="DRAFT_CREATED"),
+        ],
+        woocommerce_product_syncs=[make_sync()],
+    )
+    runner, calls = recording_runner()
+    # Authorization must not matter here -- DRAFT_CREATED is not
+    # READY_FOR_DRAFT, so create_woocommerce_draft.py must never be called.
+    args = make_args(allow_woo_draft=True)
+
+    run_batch.process_one_candidate(
+        CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1].endswith("sync_woocommerce_product_status.py")
+    assert "create_woocommerce_draft.py" not in calls[0][1]
+
+
+# --------------------------------------------------------------------------
+# 15. No publish/price action exists anywhere in the dispatch table
+# --------------------------------------------------------------------------
+
+
+FORBIDDEN_SUBSTRINGS = (
+    "publish",
+    "PUBLISH",
+    "price",
+    "PRICE",
+    "regular_price",
+    "sale_price",
+)
+
+
+def test_no_publish_or_price_action_in_dispatch_table():
+    sample_state = types.SimpleNamespace(
+        candidate_code=CANDIDATE_CODE,
+        product_code=PRODUCT_CODE,
+    )
+
+    all_entries = list(run_batch.AUTOMATABLE_DISPATCH.values()) + [
+        run_batch.WOO_DRAFT_DISPATCH
+    ]
+
+    assert len(all_entries) >= 6
+
+    for entry in all_entries:
+        assert "publish" not in entry.script.lower()
+
+        built_args = entry.build_args(sample_state)
+
+        for arg in built_args:
+            for forbidden in FORBIDDEN_SUBSTRINGS:
+                assert forbidden not in arg, (
+                    f"{entry.script} arg {arg!r} contains forbidden "
+                    f"substring {forbidden!r}"
+                )
