@@ -24,7 +24,13 @@
       "Bash(*check_draft_readiness.py --help*)",
       "PowerShell(*check_draft_readiness.py --help*)",
       "Bash(* -m py_compile *)",
-      "PowerShell(* -m py_compile *)"
+      "PowerShell(* -m py_compile *)",
+      "mcp__supabase-tsyc__list_tables",
+      "mcp__supabase-tsyc__get_advisors",
+      "mcp__supabase-tsyc__list_extensions",
+      "mcp__supabase-tsyc__list_migrations",
+      "mcp__supabase-tsyc__query_logs",
+      "mcp__supabase-tsyc__search_docs"
     ],
     "ask": [
       "Edit(./scripts/**)",
@@ -38,6 +44,7 @@
       "PowerShell(git add *)",
       "PowerShell(git commit *)",
       "PowerShell(git push *)",
+      "mcp__supabase-tsyc__execute_sql",
       "Bash(*collect_one_facebook_post.py*)",
       "Bash(*clean_facebook_raw_pages.py*)",
       "Bash(*create_candidates_from_cleaned_posts.py*)",
@@ -105,6 +112,19 @@
             "command": "${CLAUDE_PROJECT_DIR}/.venv/Scripts/python.exe",
             "args": [
               "${CLAUDE_PROJECT_DIR}/.claude/hooks/tsyc_pretool_guard.py"
+            ],
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__supabase-tsyc__execute_sql",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.venv/Scripts/python.exe",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.claude/hooks/tsyc_supabase_mcp_guard.py"
             ],
             "timeout": 5
           }
