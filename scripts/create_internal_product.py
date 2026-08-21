@@ -510,6 +510,11 @@ def create_internal_product(
             "Candidate identity must be IDENTITY_VERIFIED."
         )
 
+    if reference is None:
+        raise RuntimeError(
+            "No matched product reference was found for this candidate."
+        )
+
     if reference.get("match_decision") != "MATCH":
         raise RuntimeError(
             "Primary reference must have match_decision = MATCH."
@@ -525,6 +530,11 @@ def create_internal_product(
     if not reference.get("reference_id"):
         raise RuntimeError(
             "Primary reference has no reference_id."
+        )
+
+    if not reference.get("source_url_id"):
+        raise RuntimeError(
+            "Primary reference has no source_url_id."
         )
 
     title = clean_text(

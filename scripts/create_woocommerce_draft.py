@@ -462,6 +462,57 @@ def revalidate_pre_create_state(
     return product, content, images
 
 
+def has_existing_remote_draft(
+    existing_sync: dict[str, Any] | None,
+) -> bool:
+    """
+    Return True when a local sync record already has a remote Woo product ID.
+
+    A populated woocommerce_product_id -- whether from a normal successful
+    run or from mark_post_create_recovery_required() leaving
+    recovery_required=True after an uncertain remote result -- means a
+    WooCommerce product may already exist. Draft creation must never retry
+    in that case.
+    """
+    return bool(
+        existing_sync
+        and existing_sync.get("woocommerce_product_id")
+    )
+
+
+def assert_uploaded_image_set_matches_current(
+    current_images: list[dict[str, Any]],
+    uploaded_media: list[dict[str, Any]],
+) -> None:
+    """
+    Ensure the uploaded WordPress media set still matches the freshly
+    reloaded publishable image set before creating the WooCommerce product.
+
+    This is the exact identifier contract that caused a production bug: the
+    comparison must key uploaded_media items by source_image_id (the local
+    product_images.id recorded when the WordPress attachment was created or
+    reused), never by any WordPress-side identifier such as
+    wordpress_media_id. current_images are keyed by their local image_id,
+    which is the same product_images.id under a different field name.
+    """
+    current_image_ids = {
+        str(image.get("image_id"))
+        for image in current_images
+    }
+
+    uploaded_image_ids = {
+        str(item.get("source_image_id"))
+        for item in uploaded_media
+    }
+
+    if current_image_ids != uploaded_image_ids:
+        raise RuntimeError(
+            "Publishable image set changed during WooCommerce media "
+            "preparation. Draft creation was stopped to avoid using "
+            "a stale image set."
+        )
+
+
 def get_existing_sync(
     repository: SupabaseRepository,
     internal_product_id: str,
@@ -2066,12 +2117,7 @@ def main() -> None:
         sync=existing_sync,
     )
 
-    if (
-        existing_sync
-        and existing_sync.get(
-            "woocommerce_product_id"
-        )
-    ):
+    if has_existing_remote_draft(existing_sync):
         print()
         print(
             "Draft creation stopped because the local sync "
@@ -2188,22 +2234,10 @@ def main() -> None:
             product_code=product["product_code"],
         )
 
-        current_image_ids = {
-            str(image.get("image_id"))
-            for image in current_images
-        }
-
-        uploaded_image_ids = {
-            str(item.get("source_image_id"))
-            for item in uploaded_media
-        }
-
-        if current_image_ids != uploaded_image_ids:
-            raise RuntimeError(
-                "Publishable image set changed during WooCommerce media "
-                "preparation. Draft creation was stopped to avoid using "
-                "a stale image set."
-            )
+        assert_uploaded_image_set_matches_current(
+            current_images=current_images,
+            uploaded_media=uploaded_media,
+        )
 
         woo_payload = build_woocommerce_payload(
             product=product,
