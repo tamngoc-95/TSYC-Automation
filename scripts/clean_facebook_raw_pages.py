@@ -131,6 +131,29 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+
+# Unicode characters that render with zero visual width but do not carry
+# General Category "Cf" (Format) or "Cc" (Control), so the category-based
+# filter below does not remove them on its own.
+#
+# Observed case: Facebook prepends scrambled per-character page metadata
+# (author id / timestamp digits) ahead of real post text as an
+# anti-scraping measure, joining every individual character with
+# U+034F COMBINING GRAPHEME JOINER -- a Unicode joiner explicitly defined
+# to have no visible glyph. Left in place, it survives NFKC normalization
+# and defeats is_single_character_noise() below, because each noise
+# character plus its trailing joiner counts as two characters instead of
+# one, so the noise line is never recognized as isolated single-character
+# noise and reaches downstream title extraction.
+#
+# Extend this set only with characters confirmed present in real collected
+# data -- do not broaden it speculatively, and never add characters used
+# for legitimate Vietnamese diacritics.
+INVISIBLE_NON_FORMAT_CHARACTERS = {
+    "͏",  # COMBINING GRAPHEME JOINER
+}
+
+
 def remove_invisible_unicode_characters(
     value: str,
 ) -> str:
@@ -138,6 +161,9 @@ def remove_invisible_unicode_characters(
     cleaned_characters: list[str] = []
 
     for character in value:
+        if character in INVISIBLE_NON_FORMAT_CHARACTERS:
+            continue
+
         category = unicodedata.category(character)
 
         if category in {

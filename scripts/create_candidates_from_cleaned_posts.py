@@ -15,6 +15,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.cli_bootstrap import configure_utf8_console
 from src.repositories.supabase_repository import SupabaseRepository
 
+from clean_facebook_raw_pages import normalize_unicode_text
+
 configure_utf8_console()
 
 
@@ -400,8 +402,18 @@ def extract_book_identity(
     cleaned_text: str,
 ) -> dict[str, Any]:
     """Extract a conservative book identity from cleaned Facebook text."""
+    # Defensive normalization: strip invisible Unicode formatting/joiner
+    # characters (e.g. Facebook's obfuscation joiner U+034F) before running
+    # the anchored title regexes below. clean_facebook_raw_pages.py already
+    # does this at cleaning time, but title extraction must not silently
+    # trust that every stored cleaned_text row went through the current
+    # cleaner version -- an un-normalized leading noise prefix is exactly
+    # what caused the anchored patterns to miss the real title and fall
+    # through to a garbage mid-text match.
     normalized_text = remove_leading_post_markers(
-        cleaned_text
+        normalize_unicode_text(
+            cleaned_text
+        )
     )
 
     if not normalized_text:
