@@ -14,12 +14,12 @@ columns and are not centralized here.
 
 Source priority mirrors CLAUDE.md section 8.1's book-identity source
 order and manual_create_product_reference.py's exact numeric values (the
-canonical automated-matching implementation). collect_reference_
-metadata.py defines its own narrower priority map (no FACEBOOK entry,
-OTHER=5 instead of 9) -- found during the inventory for this
-centralization but deliberately NOT unified here, since doing so would
-change what priority integer that script writes for OTHER-type
-references, a runtime-behavior change out of scope for this refactor.
+canonical automated-matching implementation): PUBLISHER=1,
+AUTHORIZED_SUPPLIER=2, BOOKSTORE=3, FAHASA=4, FACEBOOK=5, OTHER=9. This
+is the single canonical priority mapping -- every script that creates or
+evaluates product_references (register_reference_source.py,
+manual_create_product_reference.py, collect_reference_metadata.py)
+imports REFERENCE_SOURCE_PRIORITY from here rather than defining its own.
 """
 from __future__ import annotations
 

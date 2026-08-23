@@ -14,15 +14,16 @@ conflated -- they share a column name but not a value set:
   source: migrations/010_create_woocommerce_product_syncs.sql
   (woocommerce_product_syncs_status_check).
 
-Known drift (found during the inventory for this centralization, not
-introduced by it, and deliberately not fixed here -- fixing it would
-change runtime behavior / require a schema decision, both out of scope):
-scripts/sync_woocommerce_product_status.py's map_remote_status() writes
-PENDING_REVIEW, PRIVATE, TRASHED, and a REVIEW_REQUIRED fallback into
-these columns for non-"draft" remote statuses, and mark_product_missing()
-writes MISSING. None of those five values are members of either set
-below. tests/test_domain_constants.py documents this as a known,
-unresolved gap rather than silently certifying it as canonical.
+scripts/sync_woocommerce_product_status.py's map_remote_status() maps a
+remote WooCommerce product status to a confirmed, canonical pair from
+these two enums for exactly two remote statuses ("draft", "publish") --
+see its own docstring and SUPPORTED_REMOTE_STATUS_MAPPING for the exact
+rule and reasoning. Any other remote status is deliberately left
+unmapped: mark_reconciliation_anomaly() leaves both woocommerce_status
+columns untouched and flags the internal product for review instead of
+guessing a value. Neither column is ever written a value outside the
+sets below -- tests/test_sync_woocommerce_product_status.py covers every
+supported and unsupported branch.
 """
 from __future__ import annotations
 

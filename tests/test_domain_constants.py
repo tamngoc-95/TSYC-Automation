@@ -315,9 +315,9 @@ def test_source_priority_values_are_unique_and_lower_is_higher_priority():
     ], "PUBLISHER must outrank OTHER per CLAUDE.md section 8.1"
 
 
-def test_source_priority_matches_manual_create_product_reference_values():
-    """Locks the exact values manual_create_product_reference.py (the
-    canonical automated-matching implementation) uses."""
+def test_source_priority_matches_canonical_tsyc_identity_priority():
+    """Locks the exact canonical values (CLAUDE.md section 8.1 /
+    manual_create_product_reference.py's original implementation)."""
     assert dict(REFERENCE_SOURCE_PRIORITY) == {
         "PUBLISHER": 1,
         "AUTHORIZED_SUPPLIER": 2,
@@ -326,6 +326,24 @@ def test_source_priority_matches_manual_create_product_reference_values():
         "FACEBOOK": 5,
         "OTHER": 9,
     }
+
+
+def test_other_priority_is_not_accidentally_equal_to_facebook_priority():
+    assert (
+        REFERENCE_SOURCE_PRIORITY[SourceType.OTHER]
+        != REFERENCE_SOURCE_PRIORITY[SourceType.FACEBOOK]
+    )
+
+
+def test_collect_reference_metadata_uses_the_canonical_priority_map():
+    """collect_reference_metadata.py previously defined its own, narrower/
+    divergent priority map (OTHER=5, no FACEBOOK entry) -- this locks
+    down that it now imports and uses the same canonical mapping as
+    every other script that creates or evaluates product_references,
+    per the "one canonical product-reference source priority" rule."""
+    import collect_reference_metadata as collector
+
+    assert collector.SOURCE_PRIORITY_BY_TYPE is REFERENCE_SOURCE_PRIORITY
 
 
 # --- Immutability: constants should not be accidentally mutable at the

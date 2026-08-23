@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
-from src.domain.reference_sources import SourceType
+from src.domain.reference_sources import REFERENCE_SOURCE_PRIORITY, SourceType
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -56,20 +56,15 @@ PAGE_TYPE_BY_SOURCE_TYPE = {
     SourceType.FAHASA: "FAHASA_PAGE",
 }
 
-# NOTE: found during the src.domain centralization inventory -- this map's
-# OTHER value (5) and missing FACEBOOK entry differ from
-# src.domain.reference_sources.REFERENCE_SOURCE_PRIORITY (OTHER=9,
-# FACEBOOK=5), the priority map manual_create_product_reference.py uses.
-# Left exactly as-is rather than unified: doing so would change the
-# priority integer this script writes for OTHER-type references, a
-# runtime-behavior change out of scope for this refactor.
-SOURCE_PRIORITY_BY_TYPE = {
-    SourceType.PUBLISHER: 1,
-    SourceType.AUTHORIZED_SUPPLIER: 2,
-    SourceType.BOOKSTORE: 3,
-    SourceType.FAHASA: 4,
-    SourceType.OTHER: 5,
-}
+# Canonical priority map -- see src.domain.reference_sources.
+# REFERENCE_SOURCE_PRIORITY's docstring for the authoritative values.
+# This script's own SUPPORTED_SOURCE_TYPES gate (both call sites below)
+# means OTHER and FACEBOOK can never actually reach a priority lookup
+# here, so switching from the previous local, narrower/divergent map
+# (OTHER=5, no FACEBOOK entry) to the canonical one is a no-op for this
+# script's reachable behavior -- it removes a duplicate definition that
+# could otherwise drift silently, without changing what gets written.
+SOURCE_PRIORITY_BY_TYPE = REFERENCE_SOURCE_PRIORITY
 
 # Domain-scoped image fallback for minhkhai.com.vn. This site exposes no
 # Product JSON-LD, no og:image meta tag, and no class/id/itemprop-hookable
@@ -2035,7 +2030,7 @@ def save_product_reference(
         "match_confidence": existing_confidence,
         "source_priority": SOURCE_PRIORITY_BY_TYPE.get(
             source["source_type"],
-            5,
+            REFERENCE_SOURCE_PRIORITY[SourceType.OTHER],
         ),
         "raw_metadata": metadata.get("raw_metadata", {}),
         "collected_at": now,

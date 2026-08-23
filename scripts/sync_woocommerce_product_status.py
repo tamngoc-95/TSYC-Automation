@@ -283,58 +283,94 @@ def get_woocommerce_product(
     )
 
 
+# Remote WooCommerce statuses this reconciliation workflow has a
+# confirmed, deterministic local mapping for. Deliberately narrow:
+# - "draft" is the only status this automation itself ever creates
+#   (create_woocommerce_draft.py always POSTs status="draft").
+# - "publish" maps 1:1 by name to the canonical WooCommerceStatus.
+#   PUBLISHED (migrations/007_create_internal_products.sql), a
+#   legitimate terminal stage of the existing lifecycle -- this script
+#   never causes a publish, it only observes and records one that
+#   already happened directly in WooCommerce/WordPress, outside this
+#   automation.
+# Every other remote status WordPress/WooCommerce may report (pending,
+# private, trash, or anything else) is deliberately NOT mapped here --
+# see map_remote_status()'s docstring for why guessing a local
+# equivalent for those would be unsafe.
+#
+# Both values are always canonical: the first is a member of
+# WooCommerceSyncStatus (woocommerce_product_syncs.woocommerce_status),
+# the second of WooCommerceStatus (internal_products.woocommerce_status).
+# A successful draft-creation sync attempt remains DRAFT_CREATED from
+# the *sync attempt's own* point of view even after the remote product's
+# lifecycle advances past draft -- "publish" is a later stage of the
+# same already-successful attempt, not a new/different sync outcome.
+SUPPORTED_REMOTE_STATUS_MAPPING = {
+    "draft": (
+        WooCommerceSyncStatus.DRAFT_CREATED,
+        WooCommerceStatus.DRAFT_CREATED,
+    ),
+    "publish": (
+        WooCommerceSyncStatus.DRAFT_CREATED,
+        WooCommerceStatus.PUBLISHED,
+    ),
+}
+
+
+class RemoteStatusMapping:
+    """The result of map_remote_status(): either a confirmed, canonical
+    local status pair, or an explicit "unsupported" marker -- never a
+    guessed value that might not be a member of either column's CHECK
+    constraint."""
+
+    __slots__ = (
+        "supported",
+        "local_sync_status",
+        "internal_status",
+        "remote_status",
+    )
+
+    def __init__(
+        self,
+        supported: bool,
+        local_sync_status: str | None,
+        internal_status: str | None,
+        remote_status: str | None,
+    ) -> None:
+        self.supported = supported
+        self.local_sync_status = local_sync_status
+        self.internal_status = internal_status
+        self.remote_status = remote_status
+
+
 def map_remote_status(
     remote_status: str | None,
-) -> tuple[str, str]:
+) -> RemoteStatusMapping:
     """
-    Map WooCommerce status to local synchronization and workflow statuses.
+    Map a WooCommerce remote product status to local synchronization and
+    workflow statuses -- or report that no confirmed mapping exists.
 
-    The first returned value belongs to woocommerce_product_syncs.
-    The second returned value belongs to internal_products.
+    Remote WooCommerce status and local TSYC workflow status are
+    separate concepts. This function must never invent a mapping for a
+    remote status it was not explicitly given a deterministic rule for:
+    doing so risks writing a value outside the target column's CHECK
+    constraint (a hard Postgres error) or, worse, one that happens to be
+    a *valid* member of the wrong meaning (a silent misrepresentation of
+    the product's real local lifecycle stage). See
+    SUPPORTED_REMOTE_STATUS_MAPPING above for exactly which remote
+    statuses are covered and why.
+
+    Callers must only trust the returned pair when `.supported` is True.
+    When it is False, the caller must not write either woocommerce_
+    status column -- see mark_reconciliation_anomaly().
     """
-    # KNOWN DRIFT (found during the src.domain centralization inventory,
-    # not introduced by it, deliberately not fixed here -- fixing it would
-    # change runtime behavior / require a schema decision, both out of
-    # scope for this refactor): every *second* value below (internal_
-    # products.woocommerce_status) is a canonical member of
-    # WooCommerceStatus. The *first* values (woocommerce_product_syncs.
-    # woocommerce_status) are NOT all canonical members of
-    # WooCommerceSyncStatus -- only "draft" maps to one. PENDING_REVIEW,
-    # PRIVATE, and TRASHED are not in that column's CHECK constraint
-    # (migrations/010_create_woocommerce_product_syncs.sql) and would
-    # raise a Postgres constraint violation if written, as would the
-    # REVIEW_REQUIRED fallback for either column -- see
-    # src/domain/woocommerce_status.py's module docstring.
-    mapping = {
-        "draft": (
-            WooCommerceSyncStatus.DRAFT_CREATED,
-            WooCommerceStatus.DRAFT_CREATED,
-        ),
-        "pending": (
-            "PENDING_REVIEW",
-            WooCommerceStatus.READY_TO_PUBLISH,
-        ),
-        "private": (
-            "PRIVATE",
-            WooCommerceStatus.READY_TO_PUBLISH,
-        ),
-        "publish": (
-            "PUBLISHED",
-            WooCommerceStatus.PUBLISHED,
-        ),
-        "trash": (
-            "TRASHED",
-            WooCommerceStatus.FAILED,
-        ),
-    }
+    mapped = SUPPORTED_REMOTE_STATUS_MAPPING.get(remote_status or "")
 
-    return mapping.get(
-        remote_status or "",
-        (
-            "REVIEW_REQUIRED",
-            "REVIEW_REQUIRED",
-        ),
-    )
+    if mapped is None:
+        return RemoteStatusMapping(False, None, None, remote_status)
+
+    local_sync_status, internal_status = mapped
+    return RemoteStatusMapping(True, local_sync_status, internal_status, remote_status)
 
 
 def build_updated_metadata(
@@ -492,39 +528,20 @@ def update_internal_product(
     remote_product: dict[str, Any],
     internal_status: str,
 ) -> None:
-    """Update the internal product with the actual website status."""
-    remote_status = remote_product.get(
-        "status"
-    )
+    """
+    Update the internal product with the actual website status.
 
-    remote_price = (
-        remote_product.get("regular_price")
-        or remote_product.get("price")
-    )
-
-    review_required = False
-    review_reason = None
-
-    if remote_status == "trash":
-        review_required = True
-        review_reason = (
-            "The linked WooCommerce product is currently in Trash."
-        )
-
-    elif internal_status in {
-        WooCommerceStatus.FAILED,
-        "REVIEW_REQUIRED",
-    }:
-        review_required = True
-        review_reason = (
-            f"Unsupported or review-required WooCommerce product status: "
-            f"{remote_status}"
-        )
-
+    Only ever called for a confirmed SUPPORTED_REMOTE_STATUS_MAPPING
+    outcome (internal_status is DRAFT_CREATED or PUBLISHED) -- an
+    unsupported/ambiguous remote status never reaches this function; see
+    mark_reconciliation_anomaly() instead. review_required is therefore
+    always cleared here: reaching this call means reconciliation
+    succeeded with a confirmed, canonical status.
+    """
     update_payload: dict[str, Any] = {
         "woocommerce_status": internal_status,
-        "review_required": review_required,
-        "review_reason": review_reason,
+        "review_required": False,
+        "review_reason": None,
         "product_metadata": build_updated_metadata(
             internal_product=internal_product,
             remote_product=remote_product,
@@ -593,11 +610,13 @@ def mark_product_missing(
         .table("woocommerce_product_syncs")
         .update(
             {
-                # "MISSING" is not a canonical WooCommerceSyncStatus member
-                # (see map_remote_status's KNOWN DRIFT note above) -- left
-                # as-is, not invented as a domain constant that would not
-                # exist.
-                "woocommerce_status": "MISSING",
+                # A 404 unambiguously means this sync attempt's linked
+                # remote product no longer exists -- a deterministic,
+                # confirmed FAILED outcome for the sync attempt itself
+                # (not a guess), unlike the genuinely ambiguous remote
+                # statuses map_remote_status() deliberately declines to
+                # map.
+                "woocommerce_status": WooCommerceSyncStatus.FAILED,
                 "response_payload": stored_payload,
                 "error_code": "WOOCOMMERCE_PRODUCT_NOT_FOUND",
                 "error_message": (
@@ -710,6 +729,73 @@ def mark_sync_error(
         )
         .execute()
     )
+
+
+def mark_reconciliation_anomaly(
+    repository: SupabaseRepository,
+    sync_record: dict[str, Any],
+    internal_product: dict[str, Any],
+    response_payload: Any,
+    remote_status: str | None,
+) -> None:
+    """
+    Record a WooCommerce remote status this reconciliation workflow has
+    no confirmed local mapping for (map_remote_status().supported is
+    False).
+
+    Remote WooCommerce status and local TSYC workflow status are
+    separate concepts: an unsupported remote status must never be
+    written into either woocommerce_status column -- it would either be
+    rejected outright by that column's CHECK constraint, or (worse) it
+    might coincidentally be a *valid* value for the wrong meaning,
+    silently misrepresenting the product's real local lifecycle stage.
+
+    Neither woocommerce_status column is touched here -- both keep their
+    last confirmed value. Instead this follows the existing review_
+    required/review_reason mechanism (the same one create_internal_
+    product.py, review_product_images.py, and mark_product_missing()
+    above already use for "a human decision is needed here") so the
+    anomaly surfaces through the normal review queue rather than a new,
+    parallel signaling path.
+    """
+    error_message = (
+        "WooCommerce remote status "
+        f"{remote_status!r} has no confirmed local reconciliation "
+        "mapping (see SUPPORTED_REMOTE_STATUS_MAPPING in "
+        "sync_woocommerce_product_status.py). Local woocommerce_status "
+        "was left unchanged on both internal_products and "
+        "woocommerce_product_syncs."
+    )
+
+    mark_sync_error(
+        repository=repository,
+        sync_record=sync_record,
+        error_code="UNSUPPORTED_REMOTE_STATUS",
+        error_message=error_message,
+        response_payload=response_payload,
+    )
+
+    response = (
+        repository.client
+        .table("internal_products")
+        .update(
+            {
+                "review_required": True,
+                "review_reason": error_message,
+                "updated_at": utc_now(),
+            }
+        )
+        .eq(
+            "internal_product_id",
+            internal_product["internal_product_id"],
+        )
+        .execute()
+    )
+
+    if not response.data:
+        raise RuntimeError(
+            "Internal product review-required flag update returned no data."
+        )
 
 
 def print_product_result(
@@ -930,32 +1016,48 @@ def synchronize_one_product(
         "status"
     )
 
-    (
-        local_sync_status,
-        internal_status,
-    ) = map_remote_status(
-        remote_status
-    )
+    mapping = map_remote_status(remote_status)
+
+    if not mapping.supported:
+        mark_reconciliation_anomaly(
+            repository=repository,
+            sync_record=sync_record,
+            internal_product=internal_product,
+            response_payload=response_payload,
+            remote_status=remote_status,
+        )
+
+        print()
+        print(
+            "WooCommerce remote status has no confirmed local mapping "
+            "-- flagged for review, local status unchanged:"
+        )
+        print(f"Remote status: {remote_status!r}")
+        print(
+            f"Product SKU: {expected_sku or sync_record.get('product_sku')}"
+        )
+
+        return False
 
     update_sync_record(
         repository=repository,
         sync_record=sync_record,
         remote_product=response_payload,
-        local_sync_status=local_sync_status,
+        local_sync_status=mapping.local_sync_status,
     )
 
     update_internal_product(
         repository=repository,
         internal_product=internal_product,
         remote_product=response_payload,
-        internal_status=internal_status,
+        internal_status=mapping.internal_status,
     )
 
     print_product_result(
         sync_record=sync_record,
         remote_product=response_payload,
-        local_sync_status=local_sync_status,
-        internal_status=internal_status,
+        local_sync_status=mapping.local_sync_status,
+        internal_status=mapping.internal_status,
     )
 
     return True
