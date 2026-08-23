@@ -17,6 +17,7 @@ from __future__ import annotations
 import subprocess
 import types
 from typing import Any, Callable
+from unittest.mock import patch
 
 import pytest
 
@@ -661,3 +662,92 @@ def test_no_publish_or_price_action_in_dispatch_table():
                     f"{entry.script} arg {arg!r} contains forbidden "
                     f"substring {forbidden!r}"
                 )
+
+
+# --------------------------------------------------------------------------
+# 16. default_subprocess_runner decodes child stdout/stderr as UTF-8
+#
+# Regression coverage for the Windows encoding defect found during the
+# FB-2026-001-CAN-0009/0010/0011 orchestrator pilot: capture_output=True +
+# text=True with no explicit encoding decodes child output using the
+# Windows legacy codepage (cp1252), which mangled Vietnamese titles and
+# crashed a subprocess reader thread with UnicodeDecodeError on byte 0x90.
+# Production DB data was unaffected -- this was a console-capture defect
+# only. Fix: pass encoding="utf-8", errors="replace" explicitly.
+# --------------------------------------------------------------------------
+
+
+def test_default_subprocess_runner_passes_utf8_encoding_and_replace_errors():
+    """subprocess.run must be called with deterministic UTF-8 decoding,
+    never the platform-default locale encoding."""
+    with patch("run_batch.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["dummy"], returncode=0, stdout="", stderr=""
+        )
+
+        run_batch.default_subprocess_runner(["dummy", "arg"])
+
+        assert mock_run.call_count == 1
+        _args, kwargs = mock_run.call_args
+        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["errors"] == "replace"
+        # Unrelated capture behavior must remain unchanged by the fix.
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
+        assert kwargs["cwd"] == run_batch.PROJECT_ROOT
+
+
+def test_default_subprocess_runner_vietnamese_stdout_roundtrips(monkeypatch):
+    """A real child process writing UTF-8 Vietnamese text to stdout must be
+    decoded back to the exact original string, not mojibake."""
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    title = "Giáo Dục Giới Tính - Không Phải Lỗi Của Con"
+
+    result = run_batch.default_subprocess_runner(
+        [str(run_batch.PYTHON_EXE), "-c", f"print({title!r})"]
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == title
+
+
+def test_default_subprocess_runner_malformed_output_cannot_crash_capture():
+    """Invalid UTF-8 bytes in child output (e.g. byte 0x90, which broke
+    cp1252 decoding during the pilot) must never raise UnicodeDecodeError
+    or crash the orchestrator's log capture -- they must be replaced."""
+    result = run_batch.default_subprocess_runner(
+        [
+            str(run_batch.PYTHON_EXE),
+            "-c",
+            "import sys; sys.stdout.buffer.write(bytes([0x90, 0x41, 0x42])); "
+            "sys.stdout.buffer.flush()",
+        ]
+    )
+
+    assert result.returncode == 0
+    # The malformed byte becomes U+FFFD; the well-formed ASCII around it
+    # survives intact -- no exception, no dropped output.
+    assert "�" in result.stdout
+    assert "AB" in result.stdout
+
+
+def test_default_subprocess_runner_return_code_unchanged():
+    result = run_batch.default_subprocess_runner(
+        [str(run_batch.PYTHON_EXE), "-c", "import sys; sys.exit(7)"]
+    )
+
+    assert result.returncode == 7
+
+
+def test_default_subprocess_runner_stdout_stderr_capture_unchanged():
+    result = run_batch.default_subprocess_runner(
+        [
+            str(run_batch.PYTHON_EXE),
+            "-c",
+            "import sys; print('out-line'); print('err-line', file=sys.stderr)",
+        ]
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "out-line"
+    assert result.stderr.strip() == "err-line"
