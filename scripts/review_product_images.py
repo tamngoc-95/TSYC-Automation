@@ -28,9 +28,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.decisions import Outcome
 from src.domain.identity_status import IdentityStatus
 from src.domain.image_status import ImageStatus, InternalProductImageStatus
 from src.domain.rights_status import ALL_RIGHTS_STATUSES, PUBLISHABLE_RIGHTS_STATUSES
+from src.domain.rules import image_rules
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -397,9 +399,18 @@ def validate_approval_request(
             "--rights-status is required for image approval."
         )
 
-    if rights_status not in PUBLISHABLE_RIGHTS_STATUSES:
+    # A human/script explicitly supplying --rights-status is the
+    # established-policy assertion itself (this script's existing trust
+    # model, unchanged) -- policy_established=True here, so this only
+    # adds rule_code tagging to the identical PUBLISHABLE_RIGHTS_STATUSES
+    # check that already existed.
+    rights_decision = image_rules.evaluate_rights_classification(
+        rights_status=rights_status,
+        policy_established=True,
+    )
+    if rights_decision.outcome != Outcome.AUTO_PASS:
         raise RuntimeError(
-            "The selected rights status is not publish eligible."
+            f"[{rights_decision.rule_code}] {rights_decision.reason}"
         )
 
     return find_image(

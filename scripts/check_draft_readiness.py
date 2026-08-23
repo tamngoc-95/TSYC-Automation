@@ -10,10 +10,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
-from src.domain.content_status import ContentStatus, InternalProductContentStatus
-from src.domain.identity_status import IdentityStatus
-from src.domain.image_status import ImageStatus, InternalProductImageStatus
-from src.domain.woocommerce_status import WooCommerceStatus
+from src.domain.content_status import ContentStatus
+from src.domain.decisions import Outcome
+from src.domain.rules import readiness_rules
+from src.domain.woocommerce_status import WooCommerceStatus, WooCommerceSyncStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -156,64 +156,74 @@ def get_selected_main_images(
     return response.data or []
 
 
+def get_woo_sync_state(
+    repository: SupabaseRepository,
+    internal_product_id: str,
+) -> tuple[bool, bool]:
+    """
+    Return (recovery_required, has_created_woo_sync) for one internal
+    product, read from its woocommerce_product_syncs row if any.
+
+    recovery_required mirrors sync_woocommerce_product_status.py's own
+    recovery marker (response_payload.recovery_required). A sync row
+    with a populated woocommerce_product_id means a WooCommerce product
+    may already exist -- READY_FOR_DRAFT must not be re-granted for it.
+    """
+    response = (
+        repository.client
+        .table("woocommerce_product_syncs")
+        .select("woocommerce_product_id,woocommerce_status,response_payload")
+        .eq("internal_product_id", internal_product_id)
+        .limit(1)
+        .execute()
+    )
+    rows = response.data or []
+
+    if not rows:
+        return False, False
+
+    sync = rows[0]
+    response_payload = sync.get("response_payload")
+    recovery_required = bool(
+        isinstance(response_payload, dict)
+        and response_payload.get("recovery_required") is True
+    )
+    has_created_woo_sync = bool(
+        sync.get("woocommerce_product_id")
+        or sync.get("woocommerce_status") == WooCommerceSyncStatus.DRAFT_CREATED
+    )
+
+    return recovery_required, has_created_woo_sync
+
+
 def evaluate_readiness(
     product: dict[str, Any],
     candidate: dict[str, Any] | None,
     approved_content: dict[str, Any] | None,
     selected_images: list[dict[str, Any]],
+    recovery_required: bool = False,
+    has_created_woo_sync: bool = False,
 ) -> tuple[list[str], list[str]]:
-    """Return blocking issues and non-blocking warnings."""
-    blockers: list[str] = []
-    warnings: list[str] = []
-
-    identity_status = (
-        candidate.get("identity_status")
-        if candidate
-        else None
+    """
+    Return (blockers, warnings) via the shared readiness rule engine
+    (src.domain.rules.readiness_rules) -- kept as this exact tuple shape
+    so print_result()/main() below are unaffected by the extraction.
+    """
+    result = readiness_rules.evaluate_readiness(
+        product=product,
+        candidate=candidate,
+        approved_content=approved_content,
+        selected_images=selected_images,
+        recovery_required=recovery_required,
+        has_created_woo_sync=has_created_woo_sync,
     )
 
-    if candidate is None:
-        blockers.append("Linked product candidate was not found.")
-    elif identity_status != IdentityStatus.IDENTITY_VERIFIED:
-        blockers.append("Product identity is not verified.")
-
-    if product.get("content_status") != InternalProductContentStatus.APPROVED:
-        blockers.append("Internal product content is not approved.")
-
-    if approved_content is None:
-        blockers.append("Approved Vietnamese product content was not found.")
-
-    if product.get("image_status") != InternalProductImageStatus.APPROVED:
-        blockers.append("Internal product image status is not approved.")
-
-    if len(selected_images) != 1:
-        blockers.append(
-            "Exactly one selected main image is required."
-        )
+    if result.outcome == Outcome.AUTO_PASS:
+        blockers: list[str] = []
     else:
-        image = selected_images[0]
+        blockers = list(result.evidence.get("blockers") or [result.reason])
 
-        if image.get("image_status") != ImageStatus.VALIDATED:
-            blockers.append("Selected main image is not validated.")
-
-        if image.get("is_publish_eligible") is not True:
-            blockers.append(
-                "Selected main image is not publish eligible."
-            )
-
-    if not product.get("isbn"):
-        warnings.append("ISBN is missing.")
-
-    if product.get("weight_grams") is None:
-        warnings.append("Product weight is missing.")
-
-    if product.get("pricing_status") != "APPROVED":
-        warnings.append(
-            "Pricing is not approved. The shop owner must add or review "
-            "the price before publishing."
-        )
-
-    return blockers, warnings
+    return blockers, list(result.warnings)
 
 
 def print_result(
@@ -320,12 +330,18 @@ def main() -> None:
         repository,
         product.get("candidate_id"),
     )
+    recovery_required, has_created_woo_sync = get_woo_sync_state(
+        repository,
+        product["internal_product_id"],
+    )
 
     blockers, warnings = evaluate_readiness(
         product,
         candidate,
         approved_content,
         selected_images,
+        recovery_required,
+        has_created_woo_sync,
     )
 
     print_result(

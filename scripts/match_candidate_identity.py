@@ -1,9 +1,6 @@
 import argparse
-import re
 import sys
-import unicodedata
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +12,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.identity_status import IdentityStatus, MatchDecision
+from src.domain.rules import identity_rules
+from src.domain.rules.identity_rules import (
+    is_specific_author,
+    normalize_isbn,
+    normalize_text,
+)
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -99,79 +102,6 @@ def parse_arguments() -> argparse.Namespace:
         ),
     )
     return parser.parse_args()
-
-
-def normalize_text(
-    value: str | None,
-) -> str:
-    """Normalize text before identity comparison."""
-    if not value:
-        return ""
-
-    normalized = unicodedata.normalize(
-        "NFD",
-        value,
-    )
-
-    normalized = "".join(
-        character
-        for character in normalized
-        if unicodedata.category(character) != "Mn"
-    )
-
-    normalized = normalized.lower()
-
-    normalized = re.sub(
-        r"[^a-z0-9]+",
-        " ",
-        normalized,
-    )
-
-    return " ".join(
-        normalized.split()
-    )
-
-
-def normalize_isbn(
-    value: str | None,
-) -> str:
-    """Normalize ISBN by removing spaces and separators."""
-    if not value:
-        return ""
-
-    return re.sub(
-        r"[^0-9Xx]",
-        "",
-        value,
-    ).upper()
-
-
-def calculate_similarity(
-    first_value: str | None,
-    second_value: str | None,
-) -> float:
-    """Calculate similarity between two normalized values."""
-    first_normalized = normalize_text(
-        first_value
-    )
-
-    second_normalized = normalize_text(
-        second_value
-    )
-
-    if not first_normalized or not second_normalized:
-        return 0.0
-
-    score = SequenceMatcher(
-        None,
-        first_normalized,
-        second_normalized,
-    ).ratio()
-
-    return round(
-        score,
-        4,
-    )
 
 
 def get_unmatched_reference(
@@ -323,180 +253,33 @@ def calculate_match(
     candidate: dict[str, Any],
     reference: dict[str, Any],
 ) -> dict[str, Any]:
-    """Compare candidate identity data with reference metadata."""
-    candidate_title = candidate.get(
-        "extracted_title"
+    """
+    Compare candidate identity data with reference metadata.
+
+    Delegates to the shared src.domain.rules.identity_rules engine
+    (evaluate_single_reference_identity) rather than reimplementing the
+    comparison independently -- see that function's docstring for the
+    exact thresholds and the ISBN-vs-barcode validity fix. This function
+    keeps its original return shape so every existing caller below is
+    unaffected by the extraction.
+    """
+    decision_result = identity_rules.evaluate_single_reference_identity(
+        candidate=candidate,
+        reference=reference,
     )
-
-    reference_title = reference.get(
-        "reference_title"
-    )
-
-    candidate_author = candidate.get(
-        "extracted_author"
-    )
-
-    reference_author = reference.get(
-        "reference_author"
-    )
-
-    candidate_isbn = normalize_isbn(
-        candidate.get(
-            "possible_isbn"
-        )
-    )
-
-    reference_isbn = normalize_isbn(
-        reference.get(
-            "reference_isbn"
-        )
-    )
-
-    title_similarity = calculate_similarity(
-        candidate_title,
-        reference_title,
-    )
-
-    author_similarity = calculate_similarity(
-        candidate_author,
-        reference_author,
-    )
-
-    isbn_match = bool(
-        candidate_isbn
-        and reference_isbn
-        and candidate_isbn == reference_isbn
-    )
-
-    isbn_conflict = bool(
-        candidate_isbn
-        and reference_isbn
-        and candidate_isbn != reference_isbn
-    )
-
-    decision = MatchDecision.MANUAL_REVIEW
-    confidence = 0.0
-    reason = (
-        "The available metadata is not sufficient "
-        "for an automatic identity decision."
-    )
-
-    if isbn_conflict:
-        decision = MatchDecision.NO_MATCH
-        confidence = 0.99
-        reason = (
-            "Candidate ISBN and reference ISBN are different."
-        )
-
-    elif isbn_match:
-        decision = MatchDecision.MATCH
-        confidence = 0.99
-        reason = (
-            "Candidate ISBN and reference ISBN are identical."
-        )
-
-    elif (
-        title_similarity >= 0.90
-        and author_similarity >= 0.90
-    ):
-        decision = MatchDecision.MATCH
-
-        confidence = round(
-            (
-                title_similarity * 0.65
-                + author_similarity * 0.35
-            ),
-            4,
-        )
-
-        reason = (
-            "Title and author match strongly."
-        )
-
-    elif (
-        title_similarity >= 0.90
-        and (
-            not normalize_text(
-                candidate_author
-            )
-            or not normalize_text(
-                reference_author
-            )
-        )
-    ):
-        decision = MatchDecision.POSSIBLE_MATCH
-
-        confidence = round(
-            title_similarity * 0.85,
-            4,
-        )
-
-        reason = (
-            "Title matches strongly, but author data is missing."
-        )
-
-    elif (
-        title_similarity >= 0.80
-        and author_similarity >= 0.75
-    ):
-        decision = MatchDecision.POSSIBLE_MATCH
-
-        confidence = round(
-            (
-                title_similarity * 0.65
-                + author_similarity * 0.35
-            ),
-            4,
-        )
-
-        reason = (
-            "Title and author are similar, but the evidence "
-            "is not strong enough for automatic verification."
-        )
-
-    elif title_similarity < 0.60:
-        decision = MatchDecision.NO_MATCH
-
-        confidence = round(
-            1 - title_similarity,
-            4,
-        )
-
-        reason = (
-            "Candidate title and reference title are too different."
-        )
-
-    else:
-        decision = MatchDecision.MANUAL_REVIEW
-
-        confidence = round(
-            (
-                title_similarity * 0.65
-                + author_similarity * 0.35
-            ),
-            4,
-        )
-
-        reason = (
-            "The available metadata is not conclusive."
-        )
+    evidence = decision_result.evidence
 
     return {
-        "match_decision": decision,
-        "match_confidence": confidence,
-        "match_reason": reason,
-        "title_similarity": title_similarity,
-        "author_similarity": author_similarity,
-        "isbn_match": isbn_match,
-        "isbn_conflict": isbn_conflict,
-        "candidate_isbn": (
-            candidate_isbn
-            or None
-        ),
-        "reference_isbn": (
-            reference_isbn
-            or None
-        ),
+        "match_decision": evidence["match_decision"],
+        "match_confidence": decision_result.confidence,
+        "match_reason": decision_result.reason,
+        "title_similarity": evidence["title_similarity"],
+        "author_similarity": evidence["author_similarity"],
+        "isbn_match": evidence["isbn_match"],
+        "isbn_conflict": evidence["isbn_conflict"],
+        "candidate_isbn": evidence["candidate_isbn"],
+        "reference_isbn": evidence["reference_isbn"],
+        "rule_code": decision_result.rule_code,
     }
 
 
@@ -1090,25 +873,6 @@ def validate_queue_item(
 
 
 
-GENERIC_AUTHOR_VALUES = {
-    "nhieu tac gia",
-    "dang cap nhat",
-    "khong ro",
-    "unknown",
-    "various authors",
-}
-
-
-def is_specific_author(value: str | None) -> bool:
-    """Return True when an author value names a specific person or group."""
-    normalized = normalize_text(value)
-
-    return bool(
-        normalized
-        and normalized not in GENERIC_AUTHOR_VALUES
-    )
-
-
 def get_pending_consensus_candidate(
     repository: SupabaseRepository,
     candidate_code: str | None = None,
@@ -1360,67 +1124,24 @@ def calculate_consensus_match(
         or references
     )
 
-    if isbn_conflict:
-        decision = MatchDecision.NO_MATCH
-        confidence = 0.99
-        reason = (
-            "References contain conflicting ISBN values."
-        )
+    max_individual_confidence = max(
+        (item["result"]["match_confidence"] for item in reference_results),
+        default=0.0,
+    )
 
-    elif author_conflict:
-        decision = MatchDecision.MANUAL_REVIEW
-        confidence = 0.80
-        reason = (
-            "Strong title matches were found, but specific author "
-            "values conflict across references."
-        )
-
-    elif page_count_conflict:
-        decision = MatchDecision.MANUAL_REVIEW
-        confidence = 0.82
-        reason = (
-            "Strong title matches were found, but page counts "
-            "conflict across references."
-        )
-
-    elif (
-        len(title_matches) >= 2
-        and specific_authors
-    ):
-        decision = MatchDecision.MATCH
-        confidence = 0.96
-        reason = (
-            "Identity was confirmed by multiple independent sources "
-            "with matching titles, consistent metadata, and at least "
-            "one specific author."
-        )
-
-    elif len(title_matches) >= 2:
-        decision = MatchDecision.MATCH
-        confidence = 0.92
-        reason = (
-            "Identity was confirmed by multiple independent sources "
-            "with matching titles and no material metadata conflicts."
-        )
-
-    else:
-        decision = MatchDecision.POSSIBLE_MATCH
-        confidence = max(
-            (
-                item["result"]["match_confidence"]
-                for item in reference_results
-            ),
-            default=0.0,
-        )
-        reason = (
-            "Multi-source evidence is not yet sufficient for "
-            "automatic identity verification."
-        )
+    decision_result = identity_rules.evaluate_consensus_identity(
+        isbn_conflict=isbn_conflict,
+        author_conflict=author_conflict,
+        page_count_conflict=page_count_conflict,
+        matching_reference_count=len(title_matches),
+        has_specific_author=bool(specific_authors),
+        max_individual_confidence=max_individual_confidence,
+    )
 
     return {
-        "match_decision": decision,
-        "match_confidence": confidence,
-        "match_reason": reason,
+        "match_decision": decision_result.evidence["match_decision"],
+        "match_confidence": decision_result.confidence,
+        "match_reason": decision_result.reason,
         "isbn_conflict": isbn_conflict,
         "author_conflict": author_conflict,
         "page_count_conflict": page_count_conflict,
@@ -1434,6 +1155,7 @@ def calculate_consensus_match(
             if specific_authors
             else None
         ),
+        "rule_code": decision_result.rule_code,
     }
 
 

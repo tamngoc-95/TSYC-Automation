@@ -41,6 +41,7 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console  # noqa: E402
+from src.domain.decisions import Outcome  # noqa: E402
 from src.repositories.supabase_repository import SupabaseRepository  # noqa: E402
 
 from pipeline_state import (  # noqa: E402
@@ -193,6 +194,13 @@ class CandidateReport:
     blocked_reason: str | None = None
     warnings: list[str] = field(default_factory=list)
     result: str = ""
+    # The canonical src.domain.decisions.Outcome vocabulary this
+    # candidate's last derived state maps to (AUTO_PASS/AUTO_REJECT/
+    # REVIEW_REQUIRED/BLOCKED) -- reporting only; `result` above (HUMAN_
+    # GATE, STAGE_FAILED, DRY_RUN, ...) remains authoritative for actual
+    # dispatch decisions. See pipeline_state.CandidateState.outcome.
+    outcome: str = Outcome.AUTO_PASS
+    outcome_reason: str | None = None
 
 
 def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
@@ -678,6 +686,8 @@ def process_one_candidate(
             report.blocked = state.blocked
             report.blocked_reason = state.blocked_reason
             report.warnings = state.warnings
+            report.outcome = state.outcome
+            report.outcome_reason = state.outcome_reason
             return report
 
         print_post_block(
@@ -706,6 +716,8 @@ def process_one_candidate(
     report.blocked = state.blocked
     report.blocked_reason = state.blocked_reason
     report.warnings = state.warnings
+    report.outcome = state.outcome
+    report.outcome_reason = state.outcome_reason
 
     return report
 
@@ -718,7 +730,8 @@ def print_summary(reports: list[CandidateReport], requested: int) -> None:
     print("=" * 100)
     print(
         f"{'Candidate':<30} {'Initial state':<22} {'Actions executed':<45} "
-        f"{'Final state':<22} {'Human gate':<11} {'Recovery':<14} {'Result'}"
+        f"{'Final state':<22} {'Human gate':<11} {'Recovery':<14} "
+        f"{'Result':<18} {'Outcome'}"
     )
 
     for report in reports:
@@ -732,7 +745,8 @@ def print_summary(reports: list[CandidateReport], requested: int) -> None:
             f"{report.candidate_code:<30} {report.initial_state:<22} "
             f"{actions:<45} {report.final_state:<22} "
             f"{('yes' if report.human_gate else 'no'):<11} "
-            f"{(report.recovery_state or '-'):<14} {report.result}"
+            f"{(report.recovery_state or '-'):<14} "
+            f"{report.result:<18} {report.outcome}"
         )
 
     processed = [r for r in reports if r.result != "NOT_PROCESSED"]

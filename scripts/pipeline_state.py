@@ -35,6 +35,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.domain.content_status import InternalProductContentStatus
+from src.domain.decisions import Outcome
 from src.domain.identity_status import IdentityStatus, MatchDecision
 from src.domain.image_status import InternalProductImageStatus
 from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
@@ -108,6 +109,37 @@ class CandidateState:
     blocked: bool = False
     blocked_reason: str | None = None
     warnings: list[str] = field(default_factory=list)
+
+    @property
+    def outcome(self) -> str:
+        """
+        Map this derived state onto the canonical
+        src.domain.decisions.Outcome vocabulary (CLAUDE.md decision-
+        engine architecture, section 7): AUTO_PASS / AUTO_REJECT /
+        REVIEW_REQUIRED / BLOCKED.
+
+        A recovery condition or a structural blocker is BLOCKED (a
+        precondition that must be resolved, not a business judgment
+        call); a human gate is REVIEW_REQUIRED; a confirmed terminal
+        rejection is AUTO_REJECT; everything else -- the candidate is
+        clear to advance -- is AUTO_PASS.
+
+        Purely a reporting/consistency view: run_batch.py's own richer
+        `result` vocabulary (HUMAN_GATE, STAGE_FAILED, DRY_RUN, ...)
+        remains authoritative for actual dispatch decisions.
+        """
+        if self.recovery_state is not None or self.blocked:
+            return Outcome.BLOCKED
+        if self.human_gate:
+            return Outcome.REVIEW_REQUIRED
+        if self.derived_state == "DUPLICATE_REJECTED":
+            return Outcome.AUTO_REJECT
+        return Outcome.AUTO_PASS
+
+    @property
+    def outcome_reason(self) -> str | None:
+        """The human-readable reason paired with `.outcome`, if any."""
+        return self.blocked_reason or self.human_gate_reason
 
 
 class CandidateNotFoundError(RuntimeError):

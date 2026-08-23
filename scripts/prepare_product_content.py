@@ -12,6 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.content_status import ContentStatus
+from src.domain.rules import content_rules
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -412,7 +413,15 @@ def validate_approval_content(
     content: dict[str, Any],
     generated: dict[str, Any],
 ) -> None:
-    """Reject approval when the content is still an untouched safe draft."""
+    """
+    Reject approval when content validation does not pass.
+
+    The is-still-a-generic-draft safety check is unchanged; the shared
+    internal-workflow-boilerplate rule (src.domain.rules.content_rules)
+    is a new addition -- CLAUDE.md section 15.1: customer-facing content
+    must never contain internal workflow instructions. Neither check
+    was previously enforced automatically before APPROVE.
+    """
     if not existing:
         raise RuntimeError(
             "Content cannot be approved on its first generated metadata-only "
@@ -428,6 +437,12 @@ def validate_approval_content(
             "Content is still the generic metadata-only safe draft. "
             "Approval is blocked until the book description is enriched "
             "from verified source material and reviewed."
+        )
+
+    boilerplate_check = content_rules.evaluate_internal_boilerplate(content)
+    if not boilerplate_check.is_auto_pass:
+        raise RuntimeError(
+            f"[{boilerplate_check.rule_code}] {boilerplate_check.reason}"
         )
 
 
