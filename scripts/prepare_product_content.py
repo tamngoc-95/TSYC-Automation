@@ -1,8 +1,9 @@
 import argparse
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 
@@ -16,8 +17,34 @@ configure_utf8_console()
 
 
 GENERATOR_NAME = "internal_product_content_generator"
-GENERATOR_VERSION = "1.3.0"
-VALID_ACTIONS = {"PREVIEW", "SAVE", "APPROVE", "SKIP"}
+GENERATOR_VERSION = "1.4.0"
+VALID_ACTIONS = {"PREVIEW", "SAVE", "APPROVE", "REVISE", "SKIP"}
+
+# Customer-facing product_contents fields a human reviewer is allowed to
+# revise through --action REVISE. product_name and author_summary are
+# intentionally excluded: they are derived from verified internal_product
+# identity data (title/author), not reviewer prose, and REVISE must never
+# touch identity-derived fields.
+REVIEWER_EDITABLE_FIELDS = {
+    "short_description",
+    "long_description",
+    "seo_title",
+    "seo_description",
+    "product_details",
+}
+
+# The full set of product_contents free-text fields save_content() writes.
+# REVISE always carries product_name/author_summary over unchanged from the
+# existing row and only ever overrides fields in REVIEWER_EDITABLE_FIELDS.
+CONTENT_TEXT_FIELDS = (
+    "product_name",
+    "short_description",
+    "long_description",
+    "author_summary",
+    "product_details",
+    "seo_title",
+    "seo_description",
+)
 
 
 def utc_now() -> str:
@@ -62,12 +89,32 @@ def parse_arguments() -> argparse.Namespace:
         "--action",
         choices=sorted(VALID_ACTIONS),
         type=str.upper,
-        help="PREVIEW, SAVE, APPROVE, or SKIP.",
+        help="PREVIEW, SAVE, APPROVE, REVISE, or SKIP.",
     )
     parser.add_argument(
         "--non-interactive",
         action="store_true",
         help="Disable input prompts. Requires --product-code and --action.",
+    )
+    parser.add_argument(
+        "--content-file",
+        help=(
+            "Path to a UTF-8 JSON file of reviewer-edited content fields. "
+            "Required for --action REVISE. The JSON root must be an object "
+            "containing only reviewer-editable fields (short_description, "
+            "long_description, seo_title, seo_description, product_details) "
+            "-- all optional; omitted fields keep their current database "
+            "value."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-revise",
+        action="store_true",
+        help=(
+            "Explicit machine-readable confirmation that replaces the "
+            "interactive 'Type REVISE' prompt. Required with "
+            "--non-interactive --action REVISE."
+        ),
     )
     return parser.parse_args()
 
@@ -433,8 +480,17 @@ def save_content(
     existing: dict[str, Any] | None,
     content: dict[str, Any],
     approve: bool,
+    generation_method: str | None = None,
+    review_notes: str | None = None,
 ) -> dict[str, Any]:
-    """Insert or update one Vietnamese content record atomically as possible."""
+    """
+    Insert or update one Vietnamese content record atomically as possible.
+
+    generation_method and review_notes are optional overrides used by
+    --action REVISE to record that a write came from human review rather
+    than the rule-based generator. Callers that omit them (the original
+    SAVE/APPROVE flow) get the original inferred values, unchanged.
+    """
     now = utc_now()
     status = "APPROVED" if approve else "DRAFTED"
 
@@ -443,19 +499,27 @@ def save_content(
         "content_language": "vi",
         "content_status": status,
         "generation_method": (
-            existing.get("generation_method")
-            if existing and existing.get("generation_method")
-            else "RULE_BASED"
+            generation_method
+            if generation_method
+            else (
+                existing.get("generation_method")
+                if existing and existing.get("generation_method")
+                else "RULE_BASED"
+            )
         ),
         "generator_name": GENERATOR_NAME,
         "generator_version": GENERATOR_VERSION,
         "review_required": not approve,
         "review_notes": (
-            "Content reviewed and approved for WooCommerce draft."
-            if approve
+            review_notes
+            if review_notes is not None
             else (
-                "Draft saved. Review the wording, product facts, and topic "
-                "before WooCommerce draft creation."
+                "Content reviewed and approved for WooCommerce draft."
+                if approve
+                else (
+                    "Draft saved. Review the wording, product facts, and "
+                    "topic before WooCommerce draft creation."
+                )
             )
         ),
         "approved_at": now if approve else None,
@@ -551,6 +615,377 @@ def save_content(
 
 
 
+def load_reviewer_content_file(path: Path) -> dict[str, Any]:
+    """
+    Read a reviewer content JSON file as strict UTF-8 and parse its object.
+
+    Fails loudly (RuntimeError) on: a missing file, invalid UTF-8, invalid
+    JSON, or a JSON root that is not an object. Never silently substitutes
+    an empty payload.
+    """
+    try:
+        # utf-8-sig transparently strips a leading UTF-8 byte-order mark
+        # (common from Windows editors like Notepad) while behaving exactly
+        # like plain utf-8 for files that have none. Any other invalid byte
+        # sequence still raises UnicodeDecodeError.
+        raw_text = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            f"Content file was not found: {path}"
+        ) from error
+    except UnicodeDecodeError as error:
+        raise RuntimeError(
+            f"Content file is not valid UTF-8: {path} ({error})"
+        ) from error
+    except OSError as error:
+        raise RuntimeError(
+            f"Content file could not be read: {path} ({error})"
+        ) from error
+
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"Content file is not valid JSON: {path} ({error})"
+        ) from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "Content file JSON root must be an object with reviewer-"
+            f"editable fields: {path}"
+        )
+
+    return payload
+
+
+def validate_reviewer_content_payload(
+    payload: dict[str, Any],
+) -> dict[str, str]:
+    """
+    Validate a reviewer content JSON payload against the REVISE schema.
+
+    Only REVIEWER_EDITABLE_FIELDS may be present -- this is the only
+    boundary that keeps REVISE from writing arbitrary DB columns. Every
+    present field must be a non-null string; a field is left at its current
+    database value by omitting it entirely, not by setting it to null.
+    """
+    unknown_fields = sorted(set(payload) - REVIEWER_EDITABLE_FIELDS)
+
+    if unknown_fields:
+        raise RuntimeError(
+            "Content file contains unsupported field(s): "
+            + ", ".join(unknown_fields)
+            + ". Allowed fields: "
+            + ", ".join(sorted(REVIEWER_EDITABLE_FIELDS))
+        )
+
+    validated: dict[str, str] = {}
+
+    for field, value in payload.items():
+        if value is None:
+            raise RuntimeError(
+                f"Content file field {field!r} is null. Omit the field "
+                "entirely to keep its current value -- REVISE does not "
+                "accept null as 'clear this field'."
+            )
+
+        if not isinstance(value, str):
+            raise RuntimeError(
+                f"Content file field {field!r} must be a string, got "
+                f"{type(value).__name__}."
+            )
+
+        validated[field] = value
+
+    return validated
+
+
+def get_content_for_exact_product(
+    repository: SupabaseRepository,
+    product_code: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """
+    Resolve exactly one internal product by product_code, plus its existing
+    Vietnamese content row if any.
+
+    Uses the same targeting mechanism (get_products) as the rest of the
+    script -- no implicit newest/all selection.
+    """
+    products = get_products(repository, product_code)
+
+    if not products:
+        raise RuntimeError(
+            f"Internal product was not found: {product_code}"
+        )
+
+    product = products[0]
+    existing = get_existing_content(
+        repository,
+        product["internal_product_id"],
+    )
+
+    return product, existing
+
+
+def validate_revise_target(
+    existing: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """
+    Enforce the REVISE safety gates on the existing content row.
+
+    REVISE only ever updates an existing DRAFTED row. It never creates a
+    second content row, and it never touches APPROVED or REJECTED content.
+    """
+    if existing is None:
+        raise RuntimeError(
+            "REVISE requires an existing product_contents row. None was "
+            "found for this product -- run --action SAVE first to create "
+            "the initial draft; REVISE never creates a new content row."
+        )
+
+    status = existing.get("content_status")
+
+    if status == "APPROVED":
+        raise RuntimeError(
+            "REVISE refuses to modify APPROVED content. Approved content "
+            "must never be silently overwritten."
+        )
+
+    if status == "REJECTED":
+        raise RuntimeError(
+            "REVISE refuses to modify REJECTED content."
+        )
+
+    if status != "DRAFTED":
+        raise RuntimeError(
+            f"REVISE requires content_status=DRAFTED, got {status!r}."
+        )
+
+    return existing
+
+
+def build_revised_content_payload(
+    existing: dict[str, Any],
+    validated_payload: dict[str, str],
+) -> dict[str, Any]:
+    """
+    Build the full product_contents text-field payload for a REVISE update.
+
+    Every field starts from the existing row's current value. product_name
+    and author_summary are never reviewer-editable and are always carried
+    over unchanged; only fields present in validated_payload (already
+    restricted to REVIEWER_EDITABLE_FIELDS) are overridden.
+    """
+    revised = {
+        field: existing.get(field)
+        for field in CONTENT_TEXT_FIELDS
+    }
+    revised.update(validated_payload)
+    return revised
+
+
+def diff_content_fields(
+    existing: dict[str, Any],
+    revised: dict[str, Any],
+) -> list[tuple[str, Any, Any]]:
+    """Return (field, old_value, new_value) for reviewer fields that changed."""
+    changes: list[tuple[str, Any, Any]] = []
+
+    for field in sorted(REVIEWER_EDITABLE_FIELDS):
+        old_value = existing.get(field)
+        new_value = revised.get(field)
+
+        if old_value != new_value:
+            changes.append((field, old_value, new_value))
+
+    return changes
+
+
+def print_revise_preview(
+    product: dict[str, Any],
+    existing: dict[str, Any],
+    changes: list[tuple[str, Any, Any]],
+) -> None:
+    """Print the exact field-level diff a REVISE write would apply."""
+    print()
+    print("=" * 78)
+    print("REVISE PREVIEW")
+    print("=" * 78)
+    print(f"Product code: {product.get('product_code')}")
+    print(f"Title: {product.get('title')}")
+    print(f"Current content status: {existing.get('content_status')}")
+
+    if not changes:
+        print()
+        print("No fields changed.")
+        return
+
+    for field, old_value, new_value in changes:
+        print()
+        print("FIELD")
+        print(field)
+        print("OLD VALUE")
+        print(old_value if old_value not in (None, "") else "[empty]")
+        print("NEW VALUE")
+        print(new_value if new_value not in (None, "") else "[empty]")
+
+
+def write_revise_audit_log(
+    repository: SupabaseRepository,
+    product: dict[str, Any],
+    changes: list[tuple[str, Any, Any]],
+) -> None:
+    """
+    Record a process_logs entry for a REVISE write.
+
+    Reuses the existing process_logs table (migrations/001_initial_schema.sql)
+    -- no schema change -- through SupabaseRepository.write_process_log(),
+    the same supported helper method other future writers are expected to
+    use; it also validates that the insert actually returned a row.
+
+    This is called only after save_content() has already committed the
+    content revision. A failure here must never be reported as though the
+    content write itself failed -- see the try/except around this call in
+    run_revise_action().
+    """
+    changed_field_names = ", ".join(field for field, _, _ in changes)
+
+    repository.write_process_log(
+        message=(
+            "Reviewer-supplied content revision applied to "
+            f"{product.get('product_code')}. Changed fields: "
+            f"{changed_field_names}."
+        ),
+        process_name="prepare_product_content",
+        candidate_id=product.get("candidate_id"),
+        process_step="REVISE",
+        log_level="INFO",
+        status="HUMAN_REVIEW",
+    )
+
+
+def run_revise_action(
+    repository: SupabaseRepository,
+    product_code: str | None,
+    content_file: str | None,
+    non_interactive: bool,
+    confirm_revise: bool,
+    prompt: Callable[[str], str] = input,
+) -> dict[str, Any] | None:
+    """
+    Run --action REVISE end to end: resolve target, validate the content
+    file, compute a diff, confirm, write, and log. Returns the written row,
+    or None when the run is a no-op or is cancelled.
+    """
+    if not product_code:
+        raise RuntimeError(
+            "--action REVISE requires --product-code (exact targeting "
+            "only; no implicit newest/all selection)."
+        )
+
+    if not content_file:
+        raise RuntimeError(
+            "--action REVISE requires --content-file."
+        )
+
+    if non_interactive and not confirm_revise:
+        raise RuntimeError(
+            "--non-interactive --action REVISE requires --confirm-revise."
+        )
+
+    product, existing = get_content_for_exact_product(
+        repository=repository,
+        product_code=product_code,
+    )
+    existing = validate_revise_target(existing)
+
+    payload = load_reviewer_content_file(Path(content_file))
+    validated_payload = validate_reviewer_content_payload(payload)
+
+    revised_content = build_revised_content_payload(
+        existing=existing,
+        validated_payload=validated_payload,
+    )
+    changes = diff_content_fields(
+        existing=existing,
+        revised=revised_content,
+    )
+
+    print_revise_preview(
+        product=product,
+        existing=existing,
+        changes=changes,
+    )
+
+    if not changes:
+        print()
+        print("Result: NO_OP -- no field actually changed.")
+        print("No database changes were made.")
+        return None
+
+    if confirm_revise:
+        # non_interactive REVISE always reaches here: the guard above
+        # already raises unless confirm_revise is True in that case.
+        confirmation = "REVISE"
+    else:
+        confirmation = normalize_confirmation(
+            prompt(
+                "Type REVISE, CONFIRM, or UPDATE to write the revised "
+                "content, or press Enter to cancel: "
+            )
+        )
+
+    if confirmation not in {"REVISE", "CONFIRM", "UPDATE"}:
+        print()
+        print("REVISE cancelled. No database changes were made.")
+        return None
+
+    result = save_content(
+        repository=repository,
+        product=product,
+        existing=existing,
+        content=revised_content,
+        approve=False,
+        generation_method="MANUAL",
+        review_notes=(
+            "Revised via HUMAN_REVIEW (REVISE). Changed fields: "
+            + ", ".join(field for field, _, _ in changes)
+            + "."
+        ),
+    )
+
+    # The content revision is already committed at this point. A failure
+    # writing the audit trail must be surfaced clearly but must never be
+    # reported as though the content write itself failed -- an operator
+    # (or a caller checking the exit code) needs to know the revision
+    # succeeded even if this best-effort log entry did not.
+    try:
+        write_revise_audit_log(
+            repository=repository,
+            product=product,
+            changes=changes,
+        )
+    except Exception as error:
+        print()
+        print(
+            "Warning: content revision was saved, but writing the "
+            "process_logs audit entry failed."
+        )
+        print(f"Audit log error type: {type(error).__name__}")
+        print(f"Audit log error details: {error}")
+
+    print()
+    print("=" * 78)
+    print("PRODUCT CONTENT RESULT")
+    print("=" * 78)
+    print(f"Content ID: {result.get('product_content_id')}")
+    print(f"Content status: {result.get('content_status')}")
+    print(f"Review required: {result.get('review_required')}")
+    print("Product content revision completed successfully.")
+
+    return result
+
+
 def resolve_action(
     args: argparse.Namespace,
 ) -> str:
@@ -566,7 +1001,7 @@ def resolve_action(
         return normalize_confirmation(args.action)
 
     value = input(
-        "Type PREVIEW, SAVE, APPROVE, or SKIP: "
+        "Type PREVIEW, SAVE, APPROVE, REVISE, or SKIP: "
     )
     return normalize_confirmation(value)
 
@@ -583,6 +1018,24 @@ def main() -> None:
 
     repository = SupabaseRepository()
 
+    action = resolve_action(args)
+
+    if action not in VALID_ACTIONS:
+        print(
+            "Invalid action. Use PREVIEW, SAVE, APPROVE, REVISE, or SKIP."
+        )
+        return
+
+    if action == "REVISE":
+        run_revise_action(
+            repository=repository,
+            product_code=args.product_code,
+            content_file=args.content_file,
+            non_interactive=args.non_interactive,
+            confirm_revise=args.confirm_revise,
+        )
+        return
+
     selected = select_product_for_review(
         repository=repository,
         product_code=args.product_code,
@@ -597,14 +1050,6 @@ def main() -> None:
     content = merge_with_existing(generated, existing)
 
     print_preview(product, content, existing)
-
-    action = resolve_action(args)
-
-    if action not in VALID_ACTIONS:
-        print(
-            "Invalid action. Use PREVIEW, SAVE, APPROVE, or SKIP."
-        )
-        return
 
     if action in {"PREVIEW", "SKIP"}:
         print("No database changes were made.")
