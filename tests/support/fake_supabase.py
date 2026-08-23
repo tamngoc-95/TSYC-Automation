@@ -221,3 +221,41 @@ class FakeSupabaseRepository:
         tables: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         self.client = FakeSupabaseClient(tables)
+
+    def write_process_log(
+        self,
+        message: str,
+        process_name: str,
+        batch_id: str | None = None,
+        candidate_id: str | None = None,
+        process_step: str | None = None,
+        log_level: str = "INFO",
+        status: str | None = None,
+        error_code: str | None = None,
+        error_details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Mirror SupabaseRepository.write_process_log() for offline tests."""
+        payload = {
+            "batch_id": batch_id,
+            "candidate_id": candidate_id,
+            "process_name": process_name,
+            "process_step": process_step,
+            "log_level": log_level,
+            "status": status,
+            "message": message,
+            "error_code": error_code,
+            "error_details": error_details,
+        }
+
+        response = (
+            self.client.table("process_logs")
+            .insert(payload)
+            .execute()
+        )
+
+        if not response.data:
+            raise RuntimeError(
+                "Process log insertion returned no data."
+            )
+
+        return response.data[0]
