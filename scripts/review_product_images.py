@@ -28,6 +28,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.identity_status import IdentityStatus
+from src.domain.image_status import ImageStatus, InternalProductImageStatus
+from src.domain.rights_status import ALL_RIGHTS_STATUSES, PUBLISHABLE_RIGHTS_STATUSES
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -44,27 +47,9 @@ VALID_IMAGE_ROLES = {
     "OTHER",
 }
 
-# These values must exactly match the product_images.usage_rights_status
-# CHECK constraint (migrations/001_initial_schema.sql). Do not add a value
-# here that the database will reject.
-VALID_RIGHTS_STATUSES = {
-    "STORE_OWNED",
-    "PUBLISHER_APPROVED",
-    "SUPPLIER_APPROVED",
-    "REFERENCE_ONLY",
-    "RIGHTS_UNKNOWN",
-}
-
-# These must exactly match product_images_publish_eligibility_check
-# (migrations/009_add_product_image_review_guards.sql): is_publish_eligible
-# may only be true when usage_rights_status is one of these three values.
-# REFERENCE_ONLY and RIGHTS_UNKNOWN are intentionally excluded -- they are
-# valid rights statuses but are never publish eligible.
-PUBLISHABLE_RIGHTS_STATUSES = {
-    "STORE_OWNED",
-    "PUBLISHER_APPROVED",
-    "SUPPLIER_APPROVED",
-}
+# ALL_RIGHTS_STATUSES / PUBLISHABLE_RIGHTS_STATUSES (imported above) are the
+# canonical src.domain.rights_status source of truth -- see that module's
+# docstring for the exact CHECK constraint each mirrors.
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -105,7 +90,7 @@ def parse_arguments() -> argparse.Namespace:
 
     parser.add_argument(
         "--rights-status",
-        choices=sorted(VALID_RIGHTS_STATUSES),
+        choices=sorted(ALL_RIGHTS_STATUSES),
         help=(
             "Usage-rights status assigned to the selected main image. "
             "Required for approval."
@@ -392,7 +377,7 @@ def validate_approval_request(
     rights_status: str | None,
 ) -> dict[str, Any]:
     """Validate an image approval request and return the selected image."""
-    if candidate.get("identity_status") != "IDENTITY_VERIFIED":
+    if candidate.get("identity_status") != IdentityStatus.IDENTITY_VERIFIED:
         raise RuntimeError(
             "Image approval requires candidate identity_status=IDENTITY_VERIFIED."
         )
@@ -449,7 +434,7 @@ def reject_images(
             .table("product_images")
             .update(
                 {
-                    "image_status": "REJECTED",
+                    "image_status": ImageStatus.REJECTED,
                     "is_main_image_candidate": False,
                     "is_selected_main_image": False,
                     "is_publish_eligible": False,
@@ -504,7 +489,7 @@ def approve_main_image(
             {
                 "image_role": main_role,
                 "usage_rights_status": rights_status,
-                "image_status": "VALIDATED",
+                "image_status": ImageStatus.VALIDATED,
                 "is_main_image_candidate": True,
                 "is_selected_main_image": True,
                 "is_publish_eligible": True,
@@ -543,7 +528,7 @@ def synchronize_internal_product_image_status(
     selected_publishable = [
         image
         for image in images
-        if image.get("image_status") == "VALIDATED"
+        if image.get("image_status") == ImageStatus.VALIDATED
         and image.get("is_selected_main_image") is True
         and image.get("is_publish_eligible") is True
         and image.get("usage_rights_status") in PUBLISHABLE_RIGHTS_STATUSES
@@ -555,9 +540,9 @@ def synchronize_internal_product_image_status(
         )
 
     image_status = (
-        "APPROVED"
+        InternalProductImageStatus.APPROVED
         if len(selected_publishable) == 1
-        else "PENDING"
+        else InternalProductImageStatus.PENDING
     )
 
     now = datetime.now(
@@ -614,7 +599,7 @@ def verify_final_state(
         selected = selected_main_images[0]
 
         if (
-            selected.get("image_status") != "VALIDATED"
+            selected.get("image_status") != ImageStatus.VALIDATED
             or selected.get("is_publish_eligible") is not True
             or selected.get("usage_rights_status")
             not in PUBLISHABLE_RIGHTS_STATUSES

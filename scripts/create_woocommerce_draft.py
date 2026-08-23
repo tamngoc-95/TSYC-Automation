@@ -17,6 +17,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.content_status import ContentStatus, InternalProductContentStatus
+from src.domain.image_status import ImageStatus, InternalProductImageStatus
+from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
+from src.domain.woocommerce_status import WooCommerceStatus, WooCommerceSyncStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -249,7 +253,7 @@ def get_ready_product(
             "created_at"
         )
         .eq("is_active", True)
-        .eq("woocommerce_status", "READY_FOR_DRAFT")
+        .eq("woocommerce_status", WooCommerceStatus.READY_FOR_DRAFT)
         .eq("review_required", False)
     )
 
@@ -309,7 +313,7 @@ def get_approved_content(
         )
         .eq(
             "content_status",
-            "APPROVED",
+            ContentStatus.APPROVED,
         )
         .eq(
             "review_required",
@@ -362,7 +366,7 @@ def get_publishable_images(
         )
         .eq(
             "image_status",
-            "VALIDATED",
+            ImageStatus.VALIDATED,
         )
         .execute()
     )
@@ -376,12 +380,7 @@ def get_publishable_images(
     images = [
         image
         for image in (response.data or [])
-        if image.get("usage_rights_status")
-        in {
-            "STORE_OWNED",
-            "PUBLISHER_APPROVED",
-            "SUPPLIER_APPROVED",
-        }
+        if image.get("usage_rights_status") in PUBLISHABLE_RIGHTS_STATUSES
     ]
 
     return sorted(
@@ -422,12 +421,12 @@ def revalidate_pre_create_state(
             "Product is no longer READY_FOR_DRAFT."
         )
 
-    if product.get("content_status") != "APPROVED":
+    if product.get("content_status") != InternalProductContentStatus.APPROVED:
         raise RuntimeError(
             "Internal product content is no longer APPROVED."
         )
 
-    if product.get("image_status") != "APPROVED":
+    if product.get("image_status") != InternalProductImageStatus.APPROVED:
         raise RuntimeError(
             "Internal product image status is no longer APPROVED."
         )
@@ -709,7 +708,7 @@ def create_sync_record(
                 "internal_product_id": product[
                     "internal_product_id"
                 ],
-                "woocommerce_status": "PENDING",
+                "woocommerce_status": WooCommerceSyncStatus.PENDING,
                 "product_sku": product[
                     "product_code"
                 ],
@@ -750,7 +749,7 @@ def mark_sync_in_progress(
         .table("woocommerce_product_syncs")
         .update(
             {
-                "woocommerce_status": "IN_PROGRESS",
+                "woocommerce_status": WooCommerceSyncStatus.IN_PROGRESS,
                 "error_code": None,
                 "error_message": None,
                 "sync_attempt_count": attempt_count + 1,
@@ -1731,7 +1730,7 @@ def mark_sync_failed(
         .table("woocommerce_product_syncs")
         .update(
             {
-                "woocommerce_status": "FAILED",
+                "woocommerce_status": WooCommerceSyncStatus.FAILED,
                 "response_payload": response_payload,
                 "error_code": error_code,
                 "error_message": error_message,
@@ -1767,7 +1766,7 @@ def mark_sync_succeeded(
                 "woocommerce_product_id": (
                     product_response.get("id")
                 ),
-                "woocommerce_status": "DRAFT_CREATED",
+                "woocommerce_status": WooCommerceSyncStatus.DRAFT_CREATED,
                 "product_permalink": (
                     product_response.get(
                         "permalink"
@@ -1824,7 +1823,7 @@ def mark_post_create_recovery_required(
         .update(
             {
                 "woocommerce_product_id": product_response.get("id"),
-                "woocommerce_status": "DRAFT_CREATED",
+                "woocommerce_status": WooCommerceSyncStatus.DRAFT_CREATED,
                 "product_permalink": product_response.get("permalink"),
                 "response_payload": response_payload,
                 "error_code": "LOCAL_FINALIZATION_FAILED",
@@ -1893,7 +1892,7 @@ def update_internal_product(
         .table("internal_products")
         .update(
             {
-                "woocommerce_status": "DRAFT_CREATED",
+                "woocommerce_status": WooCommerceStatus.DRAFT_CREATED,
                 "product_metadata": product_metadata,
                 "updated_at": utc_now(),
             }

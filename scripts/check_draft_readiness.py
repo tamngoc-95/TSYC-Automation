@@ -10,6 +10,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.content_status import ContentStatus, InternalProductContentStatus
+from src.domain.identity_status import IdentityStatus
+from src.domain.image_status import ImageStatus, InternalProductImageStatus
+from src.domain.woocommerce_status import WooCommerceStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -69,7 +73,10 @@ def get_product(
         .table("internal_products")
         .select("*")
         .eq("is_active", True)
-        .in_("woocommerce_status", ["NOT_CREATED", "READY_FOR_DRAFT"])
+        .in_(
+            "woocommerce_status",
+            [WooCommerceStatus.NOT_CREATED, WooCommerceStatus.READY_FOR_DRAFT],
+        )
     )
 
     if product_code:
@@ -118,7 +125,7 @@ def get_approved_content(
         .select("product_content_id,content_status,review_required,approved_at")
         .eq("internal_product_id", internal_product_id)
         .eq("content_language", "vi")
-        .eq("content_status", "APPROVED")
+        .eq("content_status", ContentStatus.APPROVED)
         .eq("review_required", False)
         .limit(1)
         .execute()
@@ -167,16 +174,16 @@ def evaluate_readiness(
 
     if candidate is None:
         blockers.append("Linked product candidate was not found.")
-    elif identity_status != "IDENTITY_VERIFIED":
+    elif identity_status != IdentityStatus.IDENTITY_VERIFIED:
         blockers.append("Product identity is not verified.")
 
-    if product.get("content_status") != "APPROVED":
+    if product.get("content_status") != InternalProductContentStatus.APPROVED:
         blockers.append("Internal product content is not approved.")
 
     if approved_content is None:
         blockers.append("Approved Vietnamese product content was not found.")
 
-    if product.get("image_status") != "APPROVED":
+    if product.get("image_status") != InternalProductImageStatus.APPROVED:
         blockers.append("Internal product image status is not approved.")
 
     if len(selected_images) != 1:
@@ -186,7 +193,7 @@ def evaluate_readiness(
     else:
         image = selected_images[0]
 
-        if image.get("image_status") != "VALIDATED":
+        if image.get("image_status") != ImageStatus.VALIDATED:
             blockers.append("Selected main image is not validated.")
 
         if image.get("is_publish_eligible") is not True:
@@ -267,7 +274,7 @@ def mark_ready(
         .table("internal_products")
         .update(
             {
-                "woocommerce_status": "READY_FOR_DRAFT",
+                "woocommerce_status": WooCommerceStatus.READY_FOR_DRAFT,
                 "updated_at": utc_now(),
             }
         )
@@ -335,7 +342,7 @@ def main() -> None:
         print("The product was not updated because blocking issues remain.")
         return
 
-    if product.get("woocommerce_status") == "READY_FOR_DRAFT":
+    if product.get("woocommerce_status") == WooCommerceStatus.READY_FOR_DRAFT:
         print()
         print("Product is already marked as READY_FOR_DRAFT.")
         return

@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.rights_status import RightsStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -39,8 +40,10 @@ ALLOWED_MIME_TYPES = {
     "image/gif",
 }
 
-SOURCE_TYPE = "FACEBOOK"
-USAGE_RIGHTS_STATUS = "RIGHTS_UNKNOWN"
+SOURCE_TYPE = "FACEBOOK"  # product_images.source_type -- a different, wider
+# enum than src.domain.reference_sources.SourceType (which is scoped to
+# product_references.source_type only), so left as a plain literal here.
+USAGE_RIGHTS_STATUS = RightsStatus.RIGHTS_UNKNOWN
 
 # image_role is intentionally NULL because the image
 # has not yet been classified.

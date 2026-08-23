@@ -14,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.woocommerce_status import WooCommerceStatus, WooCommerceSyncStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -291,26 +292,39 @@ def map_remote_status(
     The first returned value belongs to woocommerce_product_syncs.
     The second returned value belongs to internal_products.
     """
+    # KNOWN DRIFT (found during the src.domain centralization inventory,
+    # not introduced by it, deliberately not fixed here -- fixing it would
+    # change runtime behavior / require a schema decision, both out of
+    # scope for this refactor): every *second* value below (internal_
+    # products.woocommerce_status) is a canonical member of
+    # WooCommerceStatus. The *first* values (woocommerce_product_syncs.
+    # woocommerce_status) are NOT all canonical members of
+    # WooCommerceSyncStatus -- only "draft" maps to one. PENDING_REVIEW,
+    # PRIVATE, and TRASHED are not in that column's CHECK constraint
+    # (migrations/010_create_woocommerce_product_syncs.sql) and would
+    # raise a Postgres constraint violation if written, as would the
+    # REVIEW_REQUIRED fallback for either column -- see
+    # src/domain/woocommerce_status.py's module docstring.
     mapping = {
         "draft": (
-            "DRAFT_CREATED",
-            "DRAFT_CREATED",
+            WooCommerceSyncStatus.DRAFT_CREATED,
+            WooCommerceStatus.DRAFT_CREATED,
         ),
         "pending": (
             "PENDING_REVIEW",
-            "READY_TO_PUBLISH",
+            WooCommerceStatus.READY_TO_PUBLISH,
         ),
         "private": (
             "PRIVATE",
-            "READY_TO_PUBLISH",
+            WooCommerceStatus.READY_TO_PUBLISH,
         ),
         "publish": (
             "PUBLISHED",
-            "PUBLISHED",
+            WooCommerceStatus.PUBLISHED,
         ),
         "trash": (
             "TRASHED",
-            "FAILED",
+            WooCommerceStatus.FAILED,
         ),
     }
 
@@ -498,7 +512,7 @@ def update_internal_product(
         )
 
     elif internal_status in {
-        "FAILED",
+        WooCommerceStatus.FAILED,
         "REVIEW_REQUIRED",
     }:
         review_required = True
@@ -579,6 +593,10 @@ def mark_product_missing(
         .table("woocommerce_product_syncs")
         .update(
             {
+                # "MISSING" is not a canonical WooCommerceSyncStatus member
+                # (see map_remote_status's KNOWN DRIFT note above) -- left
+                # as-is, not invented as a domain constant that would not
+                # exist.
                 "woocommerce_status": "MISSING",
                 "response_payload": stored_payload,
                 "error_code": "WOOCOMMERCE_PRODUCT_NOT_FOUND",
@@ -609,7 +627,7 @@ def mark_product_missing(
             .table("internal_products")
             .update(
                 {
-                    "woocommerce_status": "FAILED",
+                    "woocommerce_status": WooCommerceStatus.FAILED,
                     "review_required": True,
                     "review_reason": (
                         "The linked WooCommerce product could not be found."

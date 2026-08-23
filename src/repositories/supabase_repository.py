@@ -5,6 +5,8 @@ from typing import Any
 from dotenv import load_dotenv
 from supabase import Client, create_client
 
+from src.domain.identity_status import IdentityStatus
+
 
 class SupabaseRepository:
     """Provide reusable Supabase database operations for the TSYC pipeline."""
@@ -245,7 +247,7 @@ class SupabaseRepository:
             "combo_group_code": combo_group_code,
             "extracted_title": extracted_title,
             "possible_isbn": possible_isbn,
-            "identity_status": "IDENTITY_PENDING",
+            "identity_status": IdentityStatus.IDENTITY_PENDING,
             "workflow_status": "EXTRACTED",
             "extraction_confidence": extraction_confidence,
             "source_evidence": source_evidence or {},

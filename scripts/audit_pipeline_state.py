@@ -26,6 +26,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.content_status import ContentStatus, InternalProductContentStatus
+from src.domain.identity_status import IdentityStatus, MatchDecision
+from src.domain.image_status import ImageStatus, InternalProductImageStatus
+from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
+from src.domain.woocommerce_status import WooCommerceStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -36,11 +41,8 @@ SCRIPT_VERSION = "1.0.1"
 # Must exactly match product_images_publish_eligibility_check
 # (migrations/009_add_product_image_review_guards.sql): is_publish_eligible
 # may only be true when usage_rights_status is one of these three values.
-PUBLISHABLE_RIGHTS = {
-    "STORE_OWNED",
-    "PUBLISHER_APPROVED",
-    "SUPPLIER_APPROVED",
-}
+# (PUBLISHABLE_RIGHTS_STATUSES, imported above, is the canonical set.)
+PUBLISHABLE_RIGHTS = PUBLISHABLE_RIGHTS_STATUSES
 
 FETCH_PAGE_SIZE = 200
 FETCH_MAX_RETRIES = 4
@@ -362,7 +364,7 @@ def audit_candidate_product_linkage(
 
         if candidate.get(
             "identity_status"
-        ) != "IDENTITY_VERIFIED":
+        ) != IdentityStatus.IDENTITY_VERIFIED:
             add_issue(
                 issues,
                 "ERROR",
@@ -441,7 +443,7 @@ def audit_content(
         if not vi_rows:
             if product.get(
                 "content_status"
-            ) == "APPROVED":
+            ) == InternalProductContentStatus.APPROVED:
                 add_issue(
                     issues,
                     "ERROR",
@@ -472,7 +474,7 @@ def audit_content(
                 ),
             )
 
-        if content_status == "APPROVED":
+        if content_status == ContentStatus.APPROVED:
             if content.get(
                 "review_required"
             ) is True:
@@ -550,7 +552,7 @@ def audit_images(
         approved_main = [
             image
             for image in selected
-            if image.get("image_status") == "VALIDATED"
+            if image.get("image_status") == ImageStatus.VALIDATED
             and image.get("is_publish_eligible") is True
             and image.get(
                 "usage_rights_status"
@@ -577,7 +579,7 @@ def audit_images(
 
         if product.get(
             "image_status"
-        ) == "APPROVED":
+        ) == InternalProductImageStatus.APPROVED:
             if len(approved_main) != 1:
                 add_issue(
                     issues,
@@ -640,14 +642,14 @@ def audit_references(
 
         if candidate.get(
             "identity_status"
-        ) == "IDENTITY_VERIFIED":
+        ) == IdentityStatus.IDENTITY_VERIFIED:
             matched_refs = [
                 ref
                 for ref in refs_by_candidate.get(
                     candidate_id,
                     [],
                 )
-                if ref.get("match_decision") == "MATCH"
+                if ref.get("match_decision") == MatchDecision.MATCH
             ]
 
             if not matched_refs:
@@ -708,7 +710,7 @@ def audit_references(
 
         if reference.get(
             "match_decision"
-        ) != "MATCH":
+        ) != MatchDecision.MATCH:
             add_issue(
                 issues,
                 "ERROR",
@@ -772,7 +774,7 @@ def audit_woocommerce(
 
         if product.get(
             "woocommerce_status"
-        ) == "DRAFT_CREATED":
+        ) == WooCommerceStatus.DRAFT_CREATED:
             if len(syncs_with_remote_id) != 1:
                 add_issue(
                     issues,
@@ -787,7 +789,7 @@ def audit_woocommerce(
 
         if syncs_with_remote_id and product.get(
             "woocommerce_status"
-        ) != "DRAFT_CREATED":
+        ) != WooCommerceStatus.DRAFT_CREATED:
             add_issue(
                 issues,
                 "ERROR",
@@ -834,7 +836,7 @@ def audit_ready_for_draft(
         str(content.get("internal_product_id"))
         for content in contents
         if content.get("content_language") == "vi"
-        and content.get("content_status") == "APPROVED"
+        and content.get("content_status") == ContentStatus.APPROVED
         and content.get("review_required") is False
     }
 
@@ -854,7 +856,7 @@ def audit_ready_for_draft(
     for product in products:
         if product.get(
             "woocommerce_status"
-        ) != "READY_FOR_DRAFT":
+        ) != WooCommerceStatus.READY_FOR_DRAFT:
             continue
 
         product_id = str(
@@ -876,7 +878,7 @@ def audit_ready_for_draft(
 
         if not candidate or candidate.get(
             "identity_status"
-        ) != "IDENTITY_VERIFIED":
+        ) != IdentityStatus.IDENTITY_VERIFIED:
             blockers.append(
                 "identity is not verified"
             )
@@ -892,7 +894,7 @@ def audit_ready_for_draft(
                 candidate_id,
                 [],
             )
-            if image.get("image_status") == "VALIDATED"
+            if image.get("image_status") == ImageStatus.VALIDATED
             and image.get("is_selected_main_image") is True
             and image.get("is_publish_eligible") is True
             and image.get(

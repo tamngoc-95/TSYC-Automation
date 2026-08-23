@@ -18,6 +18,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.reference_sources import (
+    REFERENCE_SOURCE_TYPES as SOURCE_TYPES,
+    SourceType,
+)
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -27,15 +31,6 @@ BATCH_CODE = "FB-2026-001"
 
 REGISTRAR_NAME = "candidate_reference_source_registrar"
 REGISTRAR_VERSION = "1.0.0"
-
-SOURCE_TYPES = (
-    "PUBLISHER",
-    "AUTHORIZED_SUPPLIER",
-    "BOOKSTORE",
-    "FAHASA",
-    "FACEBOOK",
-    "OTHER",
-)
 
 DISCOVERY_METHODS = (
     "MANUAL",
@@ -686,12 +681,12 @@ def get_default_source_name(
 ) -> str:
     """Return a readable default source name."""
     defaults = {
-        "PUBLISHER": "Publisher",
-        "AUTHORIZED_SUPPLIER": "Authorized Supplier",
-        "BOOKSTORE": "Bookstore",
-        "FAHASA": "Fahasa",
-        "FACEBOOK": "Facebook",
-        "OTHER": "Other",
+        SourceType.PUBLISHER: "Publisher",
+        SourceType.AUTHORIZED_SUPPLIER: "Authorized Supplier",
+        SourceType.BOOKSTORE: "Bookstore",
+        SourceType.FAHASA: "Fahasa",
+        SourceType.FACEBOOK: "Facebook",
+        SourceType.OTHER: "Other",
     }
 
     return defaults[source_type]
@@ -887,10 +882,10 @@ def collect_registration_input(
         default_value=(
             source_type
             in {
-                "PUBLISHER",
-                "AUTHORIZED_SUPPLIER",
-                "BOOKSTORE",
-                "FAHASA",
+                SourceType.PUBLISHER,
+                SourceType.AUTHORIZED_SUPPLIER,
+                SourceType.BOOKSTORE,
+                SourceType.FAHASA,
             }
         ),
     )

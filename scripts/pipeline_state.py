@@ -34,17 +34,17 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.domain.content_status import InternalProductContentStatus
+from src.domain.identity_status import IdentityStatus, MatchDecision
+from src.domain.image_status import InternalProductImageStatus
+from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
+from src.domain.woocommerce_status import WooCommerceStatus, WooCommerceSyncStatus
 from src.repositories.supabase_repository import SupabaseRepository  # noqa: E402
 
-
-# Must exactly match product_images_publish_eligibility_check
+# PUBLISHABLE_RIGHTS_STATUSES (imported above) must exactly match
+# product_images_publish_eligibility_check
 # (migrations/009_add_product_image_review_guards.sql), the same set
 # scripts/audit_pipeline_state.py uses.
-PUBLISHABLE_RIGHTS_STATUSES = {
-    "STORE_OWNED",
-    "PUBLISHER_APPROVED",
-    "SUPPLIER_APPROVED",
-}
 
 # Warning codes CLAUDE.md's "Golden principles" #5 and "Audit rule" accept as
 # non-blocking for WooCommerce draft creation. Any WARNING-severity audit
@@ -263,12 +263,12 @@ def _derive_recovery_state(
             return ("RECOVERY_REVIEW_REQUIRED", "REMOTE_CREATED_LOCAL_DIRTY")
 
         if (
-            sync.get("woocommerce_status") == "IN_PROGRESS"
+            sync.get("woocommerce_status") == WooCommerceSyncStatus.IN_PROGRESS
             and not sync.get("woocommerce_product_id")
         ):
             return ("RECOVERY_REVIEW_REQUIRED", "CREATE_RESULT_UNCERTAIN")
 
-        if sync.get("woocommerce_status") == "FAILED":
+        if sync.get("woocommerce_status") == WooCommerceSyncStatus.FAILED:
             payload = response_payload if isinstance(response_payload, dict) else {}
 
             if payload.get("uploaded_media") and not payload.get(
@@ -278,7 +278,7 @@ def _derive_recovery_state(
 
             return ("RECOVERY_REVIEW_REQUIRED", "CREATE_RESULT_UNCERTAIN")
 
-    if internal_product and internal_product.get("woocommerce_status") == "FAILED":
+    if internal_product and internal_product.get("woocommerce_status") == WooCommerceStatus.FAILED:
         return ("RECOVERY_REVIEW_REQUIRED", "RECONCILIATION_REQUIRED")
 
     return None
@@ -304,7 +304,7 @@ def _derive_image_content_state(
     product_code = internal_product.get("product_code")
     warnings = _warnings_for_internal_product(internal_product)
 
-    if internal_product.get("image_status") != "APPROVED":
+    if internal_product.get("image_status") != InternalProductImageStatus.APPROVED:
         if not images:
             return CandidateState(
                 candidate_code=candidate_code,
@@ -356,7 +356,7 @@ def _derive_image_content_state(
 
     content_status = internal_product.get("content_status")
 
-    if content_status == "PENDING":
+    if content_status == InternalProductContentStatus.PENDING:
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,
@@ -365,7 +365,7 @@ def _derive_image_content_state(
             warnings=warnings,
         )
 
-    if content_status == "DRAFTED":
+    if content_status == InternalProductContentStatus.DRAFTED:
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,
@@ -381,7 +381,11 @@ def _derive_image_content_state(
             warnings=warnings,
         )
 
-    if content_status in ("REVIEW_REQUIRED", "REJECTED"):
+    # "REJECTED" is not itself a member of internal_products.content_status
+    # (migrations/007_create_internal_products.sql only allows PENDING,
+    # DRAFTED, REVIEW_REQUIRED, APPROVED) -- kept as a defensive literal
+    # rather than invented as a domain constant that would not exist.
+    if content_status in (InternalProductContentStatus.REVIEW_REQUIRED, "REJECTED"):
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,
@@ -395,7 +399,7 @@ def _derive_image_content_state(
             warnings=warnings,
         )
 
-    if content_status == "APPROVED":
+    if content_status == InternalProductContentStatus.APPROVED:
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,
@@ -430,7 +434,7 @@ def _derive_pre_product_state(
     candidate_id = candidate["candidate_id"]
     identity_status = candidate.get("identity_status")
 
-    if identity_status == "REJECTED":
+    if identity_status == IdentityStatus.REJECTED:
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,
@@ -439,7 +443,7 @@ def _derive_pre_product_state(
             terminal=True,
         )
 
-    if identity_status == "IDENTITY_CONFLICT":
+    if identity_status == IdentityStatus.IDENTITY_CONFLICT:
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,
@@ -453,11 +457,11 @@ def _derive_pre_product_state(
             ),
         )
 
-    if identity_status == "IDENTITY_VERIFIED":
+    if identity_status == IdentityStatus.IDENTITY_VERIFIED:
         match_references = [
             reference
             for reference in references
-            if reference.get("match_decision") == "MATCH"
+            if reference.get("match_decision") == MatchDecision.MATCH
         ]
 
         if match_references:
@@ -483,7 +487,7 @@ def _derive_pre_product_state(
             ),
         )
 
-    if identity_status == "ACCEPTED_WITH_LIMITED_METADATA":
+    if identity_status == IdentityStatus.ACCEPTED_WITH_LIMITED_METADATA:
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,
@@ -498,7 +502,7 @@ def _derive_pre_product_state(
             ),
         )
 
-    if identity_status == "IDENTITY_PENDING":
+    if identity_status == IdentityStatus.IDENTITY_PENDING:
         if references:
             unresolved = [
                 reference
@@ -631,7 +635,10 @@ def derive_candidate_state(
 
     woocommerce_status = internal_product.get("woocommerce_status")
 
-    if woocommerce_status in ("READY_TO_PUBLISH", "PUBLISHED"):
+    if woocommerce_status in (
+        WooCommerceStatus.READY_TO_PUBLISH,
+        WooCommerceStatus.PUBLISHED,
+    ):
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,
@@ -641,7 +648,7 @@ def derive_candidate_state(
             warnings=warnings,
         )
 
-    if woocommerce_status == "DRAFT_CREATED":
+    if woocommerce_status == WooCommerceStatus.DRAFT_CREATED:
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,
@@ -650,7 +657,7 @@ def derive_candidate_state(
             warnings=warnings,
         )
 
-    if woocommerce_status == "READY_FOR_DRAFT":
+    if woocommerce_status == WooCommerceStatus.READY_FOR_DRAFT:
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,

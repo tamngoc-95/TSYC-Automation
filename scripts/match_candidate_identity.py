@@ -14,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.identity_status import IdentityStatus, MatchDecision
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -274,7 +275,7 @@ def get_unmatched_reference(
         if candidate_code and candidate.get("candidate_code") != candidate_code:
             continue
 
-        if candidate.get("identity_status") == "IDENTITY_VERIFIED":
+        if candidate.get("identity_status") == IdentityStatus.IDENTITY_VERIFIED:
             raise RuntimeError(
                 "The selected candidate is already IDENTITY_VERIFIED. "
                 "Identity matching will not overwrite a verified candidate."
@@ -373,7 +374,7 @@ def calculate_match(
         and candidate_isbn != reference_isbn
     )
 
-    decision = "MANUAL_REVIEW"
+    decision = MatchDecision.MANUAL_REVIEW
     confidence = 0.0
     reason = (
         "The available metadata is not sufficient "
@@ -381,14 +382,14 @@ def calculate_match(
     )
 
     if isbn_conflict:
-        decision = "NO_MATCH"
+        decision = MatchDecision.NO_MATCH
         confidence = 0.99
         reason = (
             "Candidate ISBN and reference ISBN are different."
         )
 
     elif isbn_match:
-        decision = "MATCH"
+        decision = MatchDecision.MATCH
         confidence = 0.99
         reason = (
             "Candidate ISBN and reference ISBN are identical."
@@ -398,7 +399,7 @@ def calculate_match(
         title_similarity >= 0.90
         and author_similarity >= 0.90
     ):
-        decision = "MATCH"
+        decision = MatchDecision.MATCH
 
         confidence = round(
             (
@@ -423,7 +424,7 @@ def calculate_match(
             )
         )
     ):
-        decision = "POSSIBLE_MATCH"
+        decision = MatchDecision.POSSIBLE_MATCH
 
         confidence = round(
             title_similarity * 0.85,
@@ -438,7 +439,7 @@ def calculate_match(
         title_similarity >= 0.80
         and author_similarity >= 0.75
     ):
-        decision = "POSSIBLE_MATCH"
+        decision = MatchDecision.POSSIBLE_MATCH
 
         confidence = round(
             (
@@ -454,7 +455,7 @@ def calculate_match(
         )
 
     elif title_similarity < 0.60:
-        decision = "NO_MATCH"
+        decision = MatchDecision.NO_MATCH
 
         confidence = round(
             1 - title_similarity,
@@ -466,7 +467,7 @@ def calculate_match(
         )
 
     else:
-        decision = "MANUAL_REVIEW"
+        decision = MatchDecision.MANUAL_REVIEW
 
         confidence = round(
             (
@@ -733,9 +734,9 @@ def update_candidate_status(
         "match_decision"
     ]
 
-    if decision == "MATCH":
-        identity_status = "IDENTITY_VERIFIED"
-        workflow_status = "IDENTITY_VERIFIED"
+    if decision == MatchDecision.MATCH:
+        identity_status = IdentityStatus.IDENTITY_VERIFIED
+        workflow_status = IdentityStatus.IDENTITY_VERIFIED
         review_required = False
         review_reason = None
         decision_reason = result[
@@ -743,21 +744,21 @@ def update_candidate_status(
         ]
 
     elif decision in {
-        "POSSIBLE_MATCH",
-        "MANUAL_REVIEW",
-        "DIFFERENT_EDITION",
+        MatchDecision.POSSIBLE_MATCH,
+        MatchDecision.MANUAL_REVIEW,
+        MatchDecision.DIFFERENT_EDITION,
     }:
-        identity_status = "IDENTITY_PENDING"
-        workflow_status = "IDENTITY_PENDING"
+        identity_status = IdentityStatus.IDENTITY_PENDING
+        workflow_status = IdentityStatus.IDENTITY_PENDING
         review_required = True
         review_reason = result[
             "match_reason"
         ]
         decision_reason = None
 
-    elif decision == "NO_MATCH":
-        identity_status = "IDENTITY_CONFLICT"
-        workflow_status = "IDENTITY_CONFLICT"
+    elif decision == MatchDecision.NO_MATCH:
+        identity_status = IdentityStatus.IDENTITY_CONFLICT
+        workflow_status = IdentityStatus.IDENTITY_CONFLICT
         review_required = True
         review_reason = result[
             "match_reason"
@@ -789,7 +790,7 @@ def update_candidate_status(
         "updated_at": utc_now(),
     }
 
-    if decision == "MATCH":
+    if decision == MatchDecision.MATCH:
         payload.update(
             {
                 "verified_title": (
@@ -850,7 +851,7 @@ def update_candidate_status(
             }
         )
 
-    elif decision == "NO_MATCH":
+    elif decision == MatchDecision.NO_MATCH:
         payload[
             "conflict_fields"
         ] = build_conflict_fields(
@@ -988,10 +989,10 @@ def update_discovery_status(
             "source_url_id is required."
         )
 
-    if decision == "MATCH":
+    if decision == MatchDecision.MATCH:
         discovery_status = "MATCHED"
 
-    elif decision == "NO_MATCH":
+    elif decision == MatchDecision.NO_MATCH:
         discovery_status = "REJECTED"
 
     else:
@@ -1143,7 +1144,7 @@ def get_pending_consensus_candidate(
             "conflict_fields,"
             "updated_at"
         )
-        .eq("identity_status", "IDENTITY_PENDING")
+        .eq("identity_status", IdentityStatus.IDENTITY_PENDING)
     )
 
     if candidate_code:
@@ -1210,7 +1211,7 @@ def get_pending_consensus_candidate(
             if (
                 reference.get("source_url_id")
                 and reference.get("reference_title")
-                and reference.get("match_decision") != "NO_MATCH"
+                and reference.get("match_decision") != MatchDecision.NO_MATCH
             )
         ]
 
@@ -1360,14 +1361,14 @@ def calculate_consensus_match(
     )
 
     if isbn_conflict:
-        decision = "NO_MATCH"
+        decision = MatchDecision.NO_MATCH
         confidence = 0.99
         reason = (
             "References contain conflicting ISBN values."
         )
 
     elif author_conflict:
-        decision = "MANUAL_REVIEW"
+        decision = MatchDecision.MANUAL_REVIEW
         confidence = 0.80
         reason = (
             "Strong title matches were found, but specific author "
@@ -1375,7 +1376,7 @@ def calculate_consensus_match(
         )
 
     elif page_count_conflict:
-        decision = "MANUAL_REVIEW"
+        decision = MatchDecision.MANUAL_REVIEW
         confidence = 0.82
         reason = (
             "Strong title matches were found, but page counts "
@@ -1386,7 +1387,7 @@ def calculate_consensus_match(
         len(title_matches) >= 2
         and specific_authors
     ):
-        decision = "MATCH"
+        decision = MatchDecision.MATCH
         confidence = 0.96
         reason = (
             "Identity was confirmed by multiple independent sources "
@@ -1395,7 +1396,7 @@ def calculate_consensus_match(
         )
 
     elif len(title_matches) >= 2:
-        decision = "MATCH"
+        decision = MatchDecision.MATCH
         confidence = 0.92
         reason = (
             "Identity was confirmed by multiple independent sources "
@@ -1403,7 +1404,7 @@ def calculate_consensus_match(
         )
 
     else:
-        decision = "POSSIBLE_MATCH"
+        decision = MatchDecision.POSSIBLE_MATCH
         confidence = max(
             (
                 item["result"]["match_confidence"]
@@ -1620,7 +1621,7 @@ def update_candidate_from_consensus(
         "best_reference"
     ]
 
-    if decision == "MATCH":
+    if decision == MatchDecision.MATCH:
         verified_isbn = (
             best_reference.get(
                 "reference_isbn"
@@ -1640,8 +1641,8 @@ def update_candidate_from_consensus(
         review_reason = None
 
         payload: dict[str, Any] = {
-            "identity_status": "IDENTITY_VERIFIED",
-            "workflow_status": "IDENTITY_VERIFIED",
+            "identity_status": IdentityStatus.IDENTITY_VERIFIED,
+            "workflow_status": IdentityStatus.IDENTITY_VERIFIED,
             "identity_confidence": consensus[
                 "match_confidence"
             ],
@@ -1696,10 +1697,10 @@ def update_candidate_from_consensus(
             "updated_at": utc_now(),
         }
 
-    elif decision == "NO_MATCH":
+    elif decision == MatchDecision.NO_MATCH:
         payload = {
-            "identity_status": "IDENTITY_CONFLICT",
-            "workflow_status": "IDENTITY_CONFLICT",
+            "identity_status": IdentityStatus.IDENTITY_CONFLICT,
+            "workflow_status": IdentityStatus.IDENTITY_CONFLICT,
             "identity_confidence": consensus[
                 "match_confidence"
             ],
@@ -1743,8 +1744,8 @@ def update_candidate_from_consensus(
 
     else:
         payload = {
-            "identity_status": "IDENTITY_PENDING",
-            "workflow_status": "IDENTITY_PENDING",
+            "identity_status": IdentityStatus.IDENTITY_PENDING,
+            "workflow_status": IdentityStatus.IDENTITY_PENDING,
             "identity_confidence": consensus[
                 "match_confidence"
             ],
@@ -1799,7 +1800,7 @@ def update_references_from_consensus(
         ]
 
         if (
-            final_decision == "MATCH"
+            final_decision == MatchDecision.MATCH
             and individual_result[
                 "title_similarity"
             ] >= 0.90
@@ -1807,7 +1808,7 @@ def update_references_from_consensus(
                 "isbn_conflict"
             ]
         ):
-            reference_decision = "MATCH"
+            reference_decision = MatchDecision.MATCH
             reference_confidence = max(
                 individual_result[
                     "match_confidence"
@@ -1837,7 +1838,7 @@ def update_references_from_consensus(
             consensus[
                 "match_reason"
             ]
-            if reference_decision == "MATCH"
+            if reference_decision == MatchDecision.MATCH
             else individual_result[
                 "match_reason"
             ]

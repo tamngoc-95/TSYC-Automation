@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.content_status import ContentStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -216,7 +217,7 @@ def select_product_for_review(
         if existing:
             status = existing.get("content_status")
 
-            if status in {"APPROVED", "REJECTED"}:
+            if status in {ContentStatus.APPROVED, ContentStatus.REJECTED}:
                 print(
                     "Skipping product because finalized Vietnamese content "
                     f"already exists: {product.get('product_code')} ({status})"
@@ -492,7 +493,11 @@ def save_content(
     SAVE/APPROVE flow) get the original inferred values, unchanged.
     """
     now = utc_now()
-    status = "APPROVED" if approve else "DRAFTED"
+    # Written to both product_contents.content_status and
+    # internal_products.content_status below -- APPROVED/DRAFTED are valid
+    # members of both (src.domain.content_status) enums, so one shared
+    # string is correct for both writes.
+    status = ContentStatus.APPROVED if approve else ContentStatus.DRAFTED
 
     payload = {
         **content,
@@ -745,18 +750,18 @@ def validate_revise_target(
 
     status = existing.get("content_status")
 
-    if status == "APPROVED":
+    if status == ContentStatus.APPROVED:
         raise RuntimeError(
             "REVISE refuses to modify APPROVED content. Approved content "
             "must never be silently overwritten."
         )
 
-    if status == "REJECTED":
+    if status == ContentStatus.REJECTED:
         raise RuntimeError(
             "REVISE refuses to modify REJECTED content."
         )
 
-    if status != "DRAFTED":
+    if status != ContentStatus.DRAFTED:
         raise RuntimeError(
             f"REVISE requires content_status=DRAFTED, got {status!r}."
         )

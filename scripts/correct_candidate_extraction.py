@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.identity_status import IdentityStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
 from create_candidates_from_cleaned_posts import extract_book_identity
@@ -28,7 +29,7 @@ CORRECTION_METHOD = "facebook_candidate_title_correction_v1.0.0"
 # evidence silently. This script refuses outright rather than guessing
 # whether a later state is still "safe" to touch.
 ALLOWED_WORKFLOW_STATUS = "EXTRACTED"
-ALLOWED_IDENTITY_STATUS = "IDENTITY_PENDING"
+ALLOWED_IDENTITY_STATUS = IdentityStatus.IDENTITY_PENDING
 
 
 def normalize_confirmation(

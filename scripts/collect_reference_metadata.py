@@ -25,6 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.reference_sources import SourceType
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -35,26 +36,39 @@ COLLECTOR_VERSION = "1.5.1"
 
 NAVIGATION_TIMEOUT_MS = 60_000
 
+# Deliberately narrower than src.domain.reference_sources.
+# ALL_REFERENCE_SOURCE_TYPES -- this script only crawls source pages for
+# these 4 types; FACEBOOK and OTHER references are collected through other
+# workflows, not this one. Names reference SourceType to avoid a typo
+# drifting from the canonical spelling; the subset itself is intentional
+# and specific to this script.
 SUPPORTED_SOURCE_TYPES = {
-    "PUBLISHER",
-    "AUTHORIZED_SUPPLIER",
-    "BOOKSTORE",
-    "FAHASA",
+    SourceType.PUBLISHER,
+    SourceType.AUTHORIZED_SUPPLIER,
+    SourceType.BOOKSTORE,
+    SourceType.FAHASA,
 }
 
 PAGE_TYPE_BY_SOURCE_TYPE = {
-    "PUBLISHER": "PUBLISHER_PAGE",
-    "AUTHORIZED_SUPPLIER": "SUPPLIER_PAGE",
-    "BOOKSTORE": "BOOKSTORE_PAGE",
-    "FAHASA": "FAHASA_PAGE",
+    SourceType.PUBLISHER: "PUBLISHER_PAGE",
+    SourceType.AUTHORIZED_SUPPLIER: "SUPPLIER_PAGE",
+    SourceType.BOOKSTORE: "BOOKSTORE_PAGE",
+    SourceType.FAHASA: "FAHASA_PAGE",
 }
 
+# NOTE: found during the src.domain centralization inventory -- this map's
+# OTHER value (5) and missing FACEBOOK entry differ from
+# src.domain.reference_sources.REFERENCE_SOURCE_PRIORITY (OTHER=9,
+# FACEBOOK=5), the priority map manual_create_product_reference.py uses.
+# Left exactly as-is rather than unified: doing so would change the
+# priority integer this script writes for OTHER-type references, a
+# runtime-behavior change out of scope for this refactor.
 SOURCE_PRIORITY_BY_TYPE = {
-    "PUBLISHER": 1,
-    "AUTHORIZED_SUPPLIER": 2,
-    "BOOKSTORE": 3,
-    "FAHASA": 4,
-    "OTHER": 5,
+    SourceType.PUBLISHER: 1,
+    SourceType.AUTHORIZED_SUPPLIER: 2,
+    SourceType.BOOKSTORE: 3,
+    SourceType.FAHASA: 4,
+    SourceType.OTHER: 5,
 }
 
 # Domain-scoped image fallback for minhkhai.com.vn. This site exposes no

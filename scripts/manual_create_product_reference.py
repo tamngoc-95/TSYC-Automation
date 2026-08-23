@@ -17,6 +17,12 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.identity_status import IdentityStatus, MatchDecision
+from src.domain.reference_sources import (
+    REFERENCE_SOURCE_PRIORITY as SOURCE_PRIORITIES,
+    REFERENCE_SOURCE_TYPES as SOURCE_TYPES,
+    SourceType,
+)
 from src.repositories.supabase_repository import SupabaseRepository
 import register_reference_source
 
@@ -28,41 +34,25 @@ BATCH_CODE = "FB-2026-001"
 COLLECTOR_NAME = "manual_product_reference_collector"
 COLLECTOR_VERSION = "0.9.0"
 
-SOURCE_TYPES = (
-    "PUBLISHER",
-    "AUTHORIZED_SUPPLIER",
-    "BOOKSTORE",
-    "FAHASA",
-    "FACEBOOK",
-    "OTHER",
-)
-
 DEFAULT_SOURCE_TYPE_NUMBER = 4
 
 SOURCE_NAME_DEFAULTS = {
-    "PUBLISHER": "Publisher",
-    "AUTHORIZED_SUPPLIER": "Authorized Supplier",
-    "BOOKSTORE": "Bookstore",
-    "FAHASA": "Fahasa",
-    "FACEBOOK": "Facebook",
-    "OTHER": "Other",
+    SourceType.PUBLISHER: "Publisher",
+    SourceType.AUTHORIZED_SUPPLIER: "Authorized Supplier",
+    SourceType.BOOKSTORE: "Bookstore",
+    SourceType.FAHASA: "Fahasa",
+    SourceType.FACEBOOK: "Facebook",
+    SourceType.OTHER: "Other",
 }
 
-SOURCE_PRIORITIES = {
-    "PUBLISHER": 1,
-    "AUTHORIZED_SUPPLIER": 2,
-    "BOOKSTORE": 3,
-    "FAHASA": 4,
-    "FACEBOOK": 5,
-    "OTHER": 9,
-}
-
+# Order matters here (displayed as a numbered menu) -- kept as an explicit
+# tuple rather than the unordered ALL_MATCH_DECISIONS frozenset.
 ALLOWED_MATCH_DECISIONS = (
-    "MATCH",
-    "POSSIBLE_MATCH",
-    "DIFFERENT_EDITION",
-    "NO_MATCH",
-    "MANUAL_REVIEW",
+    MatchDecision.MATCH,
+    MatchDecision.POSSIBLE_MATCH,
+    MatchDecision.DIFFERENT_EDITION,
+    MatchDecision.NO_MATCH,
+    MatchDecision.MANUAL_REVIEW,
 )
 
 
@@ -778,14 +768,14 @@ def evaluate_reference_match(
     ]
 
     if isbn_exact_match is False:
-        match_decision = "DIFFERENT_EDITION"
+        match_decision = MatchDecision.DIFFERENT_EDITION
 
     elif (
         isbn_exact_match is True
         and title_similarity is not None
         and title_similarity >= 0.85
     ):
-        match_decision = "MATCH"
+        match_decision = MatchDecision.MATCH
 
     elif (
         title_similarity is not None
@@ -793,25 +783,25 @@ def evaluate_reference_match(
         and author_similarity is not None
         and author_similarity >= 0.80
         and source_type in {
-            "PUBLISHER",
-            "AUTHORIZED_SUPPLIER",
-            "BOOKSTORE",
-            "FAHASA",
+            SourceType.PUBLISHER,
+            SourceType.AUTHORIZED_SUPPLIER,
+            SourceType.BOOKSTORE,
+            SourceType.FAHASA,
         }
     ):
-        match_decision = "MATCH"
+        match_decision = MatchDecision.MATCH
 
     elif (
         title_similarity is not None
         and title_similarity >= 0.70
     ):
-        match_decision = "POSSIBLE_MATCH"
+        match_decision = MatchDecision.POSSIBLE_MATCH
 
     elif title_similarity is None:
-        match_decision = "MANUAL_REVIEW"
+        match_decision = MatchDecision.MANUAL_REVIEW
 
     else:
-        match_decision = "NO_MATCH"
+        match_decision = MatchDecision.NO_MATCH
 
     return {
         "match_decision": match_decision,
@@ -1132,10 +1122,10 @@ def validate_candidate_update_allowed(
     must not be rewritten by this legacy/manual collector. Re-verification
     belongs in the standardized identity-matching workflow.
     """
-    if candidate.get("identity_status") != "IDENTITY_VERIFIED":
+    if candidate.get("identity_status") != IdentityStatus.IDENTITY_VERIFIED:
         return
 
-    if match_decision == "MATCH":
+    if match_decision == MatchDecision.MATCH:
         raise RuntimeError(
             "Candidate is already IDENTITY_VERIFIED. Saving another MATCH "
             "reference is allowed only through the standardized identity "
@@ -1158,7 +1148,7 @@ def build_candidate_update(
         timezone.utc
     ).isoformat()
 
-    if match_decision == "MATCH":
+    if match_decision == MatchDecision.MATCH:
         return {
             "verified_title": reference.get(
                 "reference_title"
@@ -1187,8 +1177,8 @@ def build_candidate_update(
             "verified_height_cm": reference.get(
                 "reference_height_cm"
             ),
-            "identity_status": "IDENTITY_VERIFIED",
-            "workflow_status": "IDENTITY_VERIFIED",
+            "identity_status": IdentityStatus.IDENTITY_VERIFIED,
+            "workflow_status": IdentityStatus.IDENTITY_VERIFIED,
             "identity_confidence": match_confidence,
             "review_required": False,
             "review_reason": None,
@@ -1200,12 +1190,12 @@ def build_candidate_update(
         }
 
     if match_decision in {
-        "POSSIBLE_MATCH",
-        "MANUAL_REVIEW",
+        MatchDecision.POSSIBLE_MATCH,
+        MatchDecision.MANUAL_REVIEW,
     }:
         return {
-            "identity_status": "IDENTITY_PENDING",
-            "workflow_status": "IDENTITY_PENDING",
+            "identity_status": IdentityStatus.IDENTITY_PENDING,
+            "workflow_status": IdentityStatus.IDENTITY_PENDING,
             "identity_confidence": match_confidence,
             "review_required": True,
             "review_reason": (
@@ -1219,8 +1209,8 @@ def build_candidate_update(
         }
 
     return {
-        "identity_status": "IDENTITY_CONFLICT",
-        "workflow_status": "IDENTITY_CONFLICT",
+        "identity_status": IdentityStatus.IDENTITY_CONFLICT,
+        "workflow_status": IdentityStatus.IDENTITY_CONFLICT,
         "identity_confidence": match_confidence,
         "review_required": True,
         "review_reason": (

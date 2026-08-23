@@ -11,6 +11,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.identity_status import IdentityStatus, MatchDecision
+from src.domain.image_status import ImageStatus, InternalProductImageStatus
+from src.domain.content_status import InternalProductContentStatus
+from src.domain.woocommerce_status import WooCommerceStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -135,7 +139,7 @@ def get_verified_candidate(
         )
         .eq(
             "identity_status",
-            "IDENTITY_VERIFIED",
+            IdentityStatus.IDENTITY_VERIFIED,
         )
     )
 
@@ -245,7 +249,7 @@ def get_best_matched_reference(
         )
         .eq(
             "match_decision",
-            "MATCH",
+            MatchDecision.MATCH,
         )
         .not_.is_(
             "source_url_id",
@@ -407,7 +411,7 @@ def determine_image_status(
     approved_main_images = [
         image
         for image in images
-        if image.get("image_status") == "VALIDATED"
+        if image.get("image_status") == ImageStatus.VALIDATED
         and image.get("is_selected_main_image") is True
         and image.get("is_publish_eligible") is True
     ]
@@ -419,9 +423,9 @@ def determine_image_status(
         )
 
     if len(approved_main_images) == 1:
-        return "APPROVED"
+        return InternalProductImageStatus.APPROVED
 
-    return "PENDING"
+    return InternalProductImageStatus.PENDING
 
 
 def build_product_metadata(
@@ -505,7 +509,7 @@ def create_internal_product(
     images: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Create one internal product."""
-    if candidate.get("identity_status") != "IDENTITY_VERIFIED":
+    if candidate.get("identity_status") != IdentityStatus.IDENTITY_VERIFIED:
         raise RuntimeError(
             "Candidate identity must be IDENTITY_VERIFIED."
         )
@@ -515,7 +519,7 @@ def create_internal_product(
             "No matched product reference was found for this candidate."
         )
 
-    if reference.get("match_decision") != "MATCH":
+    if reference.get("match_decision") != MatchDecision.MATCH:
         raise RuntimeError(
             "Primary reference must have match_decision = MATCH."
         )
@@ -683,8 +687,8 @@ def create_internal_product(
         "metadata_status": metadata_status,
         "pricing_status": "PENDING",
         "image_status": image_status,
-        "content_status": "PENDING",
-        "woocommerce_status": "NOT_CREATED",
+        "content_status": InternalProductContentStatus.PENDING,
+        "woocommerce_status": WooCommerceStatus.NOT_CREATED,
         "review_required": review_required,
         "review_reason": review_reason,
         "is_active": True,

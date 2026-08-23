@@ -56,6 +56,8 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.identity_status import IdentityStatus, MatchDecision
+from src.domain.reference_sources import REFERENCE_SOURCE_PRIORITY, SourceType
 from src.repositories.supabase_repository import SupabaseRepository
 import collect_reference_metadata as reference_metadata
 
@@ -68,8 +70,11 @@ STORAGE_BUCKET = "product-images"
 COLLECTOR_NAME = "bookstore_product_image_downloader"
 COLLECTOR_VERSION = "0.1.0"
 
-SOURCE_TYPE = "BOOKSTORE"
-BOOKSTORE_SOURCE_PRIORITY = 3
+SOURCE_TYPE = "BOOKSTORE"  # product_images.source_type -- a different,
+# wider enum than src.domain.reference_sources.SourceType (which is
+# scoped to product_references.source_type only), so left as a plain
+# literal here.
+BOOKSTORE_SOURCE_PRIORITY = REFERENCE_SOURCE_PRIORITY[SourceType.BOOKSTORE]
 
 LOCAL_IMAGE_ROOT = (
     PROJECT_ROOT
@@ -210,7 +215,7 @@ def resolve_candidate(
 
     candidate = rows[0]
 
-    if candidate.get("identity_status") != "IDENTITY_VERIFIED":
+    if candidate.get("identity_status") != IdentityStatus.IDENTITY_VERIFIED:
         raise RuntimeError(
             "Candidate identity_status is not IDENTITY_VERIFIED "
             f"(current: {candidate.get('identity_status')!r}): "
@@ -243,7 +248,7 @@ def resolve_match_bookstore_reference(
         )
         .eq(
             "match_decision",
-            "MATCH",
+            MatchDecision.MATCH,
         )
         .execute()
     )
@@ -264,7 +269,7 @@ def resolve_match_bookstore_reference(
 
     reference = rows[0]
 
-    if reference.get("source_type") != "BOOKSTORE":
+    if reference.get("source_type") != SourceType.BOOKSTORE:
         raise RuntimeError(
             "The MATCH product_reference is not source_type BOOKSTORE "
             f"(found: {reference.get('source_type')!r})."
