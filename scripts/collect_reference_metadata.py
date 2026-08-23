@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from dotenv import load_dotenv
 from playwright.sync_api import (
@@ -56,6 +56,16 @@ SOURCE_PRIORITY_BY_TYPE = {
     "FAHASA": 4,
     "OTHER": 5,
 }
+
+# Domain-scoped image fallback for minhkhai.com.vn. This site exposes no
+# Product JSON-LD, no og:image meta tag, and no class/id/itemprop-hookable
+# markup around its cover image -- the <img> tag is bare, inside classless
+# table cells. The only reliable signal is structural: the full-size cover
+# always lives at /hinhlon/{isbn}.jpg, where {isbn} is the same "isbn"
+# query parameter already present on the registered product page URL.
+MINHKHAI_HOSTNAME = "minhkhai.com.vn"
+MINHKHAI_ISBN_QUERY_PARAM = "isbn"
+MINHKHAI_ISBN_PATTERN = re.compile(r"^\d{13}$")
 
 
 def utc_now_iso() -> str:
@@ -728,6 +738,54 @@ def extract_description(
     )
 
 
+def extract_minhkhai_image_url(
+    page: Page,
+) -> str | None:
+    """
+    Domain-scoped fallback: derive the full-size cover URL for
+    minhkhai.com.vn from its "isbn" query parameter.
+
+    Activates only for hostname minhkhai.com.vn, with a strictly
+    validated identifier. Never guesses for any other domain, and never
+    runs unless every generic extraction tier above it has already
+    failed.
+    """
+    split_url = urlsplit(
+        page.url
+    )
+
+    hostname = (
+        split_url.hostname or ""
+    ).lower()
+
+    if hostname != MINHKHAI_HOSTNAME:
+        return None
+
+    query_params = parse_qs(
+        split_url.query
+    )
+
+    isbn_values = query_params.get(
+        MINHKHAI_ISBN_QUERY_PARAM
+    )
+
+    if not isbn_values:
+        return None
+
+    isbn_value = (
+        isbn_values[0] or ""
+    ).strip()
+
+    if not MINHKHAI_ISBN_PATTERN.fullmatch(
+        isbn_value
+    ):
+        return None
+
+    return (
+        f"https://{MINHKHAI_HOSTNAME}/hinhlon/{isbn_value}.jpg"
+    )
+
+
 def extract_image_url(
     page: Page,
     product_json_ld: dict[str, Any] | None,
@@ -776,7 +834,7 @@ def extract_image_url(
     if open_graph_image:
         return open_graph_image
 
-    return get_first_attribute(
+    css_fallback_image = get_first_attribute(
         page=page,
         selectors=[
             ".product-image img",
@@ -784,6 +842,13 @@ def extract_image_url(
             '[itemprop="image"]',
         ],
         attribute_name="src",
+    )
+
+    if css_fallback_image:
+        return css_fallback_image
+
+    return extract_minhkhai_image_url(
+        page
     )
 
 

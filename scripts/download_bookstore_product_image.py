@@ -431,7 +431,8 @@ def determine_image_extraction_method(
 
     This mirrors, without re-implementing, the tier order already used by
     reference_metadata.extract_image_url(): JSON-LD product image, then
-    og:image, then a CSS fallback selector.
+    og:image, then a CSS fallback selector, then the minhkhai.com.vn
+    domain-scoped fallback.
     """
     if product_json_ld and product_json_ld.get("image"):
         return "JSON_LD_PRODUCT_IMAGE"
@@ -441,6 +442,20 @@ def determine_image_extraction_method(
         'meta[property="og:image"]',
     ):
         return "OG_IMAGE"
+
+    if reference_metadata.get_first_attribute(
+        page=page,
+        selectors=[
+            ".product-image img",
+            ".product-detail-left img",
+            '[itemprop="image"]',
+        ],
+        attribute_name="src",
+    ):
+        return "CSS_FALLBACK"
+
+    if reference_metadata.extract_minhkhai_image_url(page):
+        return "MINHKHAI_DOMAIN_FALLBACK"
 
     return "CSS_FALLBACK"
 
