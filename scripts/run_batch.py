@@ -44,6 +44,7 @@ from src.cli_bootstrap import configure_utf8_console  # noqa: E402
 from src.domain.decisions import Outcome  # noqa: E402
 from src.repositories.supabase_repository import SupabaseRepository  # noqa: E402
 
+import preflight_pipeline  # noqa: E402
 from pipeline_state import (  # noqa: E402
     ACCEPTED_WARNING_CODES,
     CandidateState,
@@ -271,6 +272,17 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Print the full per-stage trace (derived state, dispatched "
+            "script, subprocess tail) for every candidate. Without this "
+            "flag only the final grouped batch result is printed -- the "
+            "stable default operator experience."
+        ),
+    )
+
     return parser.parse_args(argv)
 
 
@@ -454,7 +466,12 @@ def print_pre_block(
     state: CandidateState,
     next_stage_label: str,
     action_label: str,
+    *,
+    verbose: bool = True,
 ) -> None:
+    if not verbose:
+        return
+
     print()
     print(f"Candidate: {candidate_code}")
     print(f"Derived state: {state.derived_state}")
@@ -469,7 +486,12 @@ def print_post_block(
     blocker: str | None,
     human_gate: bool,
     recovery_state: str | None,
+    *,
+    verbose: bool = True,
 ) -> None:
+    if not verbose:
+        return
+
     print(f"Result: {result_label}")
     print(f"New state: {new_state_label}")
     print(f"Warnings: {', '.join(warnings) if warnings else 'none'}")
@@ -478,8 +500,15 @@ def print_post_block(
     print(f"Recovery state: {recovery_state or 'none'}")
 
 
-def _print_subprocess_tail(completed: subprocess.CompletedProcess) -> None:
+def _print_subprocess_tail(
+    completed: subprocess.CompletedProcess,
+    *,
+    verbose: bool = True,
+) -> None:
     """Print a short tail of a subprocess's output for operator visibility."""
+    if not verbose:
+        return
+
     for stream_name, text in (("stdout", completed.stdout), ("stderr", completed.stderr)):
         if not text:
             continue
@@ -502,6 +531,7 @@ def process_one_candidate(
     expected_batch_id: str | None,
 ) -> CandidateReport:
     """Process one candidate through as many automatable stages as apply."""
+    verbose = getattr(args, "verbose", False)
     report = CandidateReport(candidate_code=candidate_code)
 
     bundle = load_candidate_bundle(repository, candidate_code)
@@ -542,7 +572,9 @@ def process_one_candidate(
             else f"(none -- {kind})"
         )
 
-        print_pre_block(candidate_code, state, next_stage_label, description)
+        print_pre_block(
+            candidate_code, state, next_stage_label, description, verbose=verbose
+        )
 
         if kind == "blocked":
             report.result = "BLOCKED"
@@ -553,6 +585,7 @@ def process_one_candidate(
                 state.blocked_reason,
                 state.human_gate,
                 state.recovery_state,
+                verbose=verbose,
             )
             break
 
@@ -565,6 +598,7 @@ def process_one_candidate(
                 None,
                 state.human_gate,
                 state.recovery_state,
+                verbose=verbose,
             )
             break
 
@@ -577,6 +611,7 @@ def process_one_candidate(
                 None,
                 True,
                 state.recovery_state,
+                verbose=verbose,
             )
             break
 
@@ -592,6 +627,7 @@ def process_one_candidate(
                 None,
                 state.human_gate,
                 state.recovery_state,
+                verbose=verbose,
             )
             break
 
@@ -610,14 +646,17 @@ def process_one_candidate(
                     None,
                     state.human_gate,
                     state.recovery_state,
+                    verbose=verbose,
                 )
                 break
 
         argv = build_argv(dispatch, state)
-        print(f"  Invoking: {' '.join(argv)}")
+
+        if verbose:
+            print(f"  Invoking: {' '.join(argv)}")
 
         completed = subprocess_runner(argv)
-        _print_subprocess_tail(completed)
+        _print_subprocess_tail(completed, verbose=verbose)
 
         if completed.returncode != 0:
             report.result = "STAGE_FAILED"
@@ -628,6 +667,7 @@ def process_one_candidate(
                 None,
                 state.human_gate,
                 state.recovery_state,
+                verbose=verbose,
             )
             break
 
@@ -649,6 +689,7 @@ def process_one_candidate(
                 new_state.blocked_reason,
                 new_state.human_gate,
                 new_state.recovery_state,
+                verbose=verbose,
             )
             break
 
@@ -658,10 +699,12 @@ def process_one_candidate(
             "--candidate-code",
             candidate_code,
         ]
-        print(f"  Checkpoint audit: {' '.join(audit_argv)}")
+
+        if verbose:
+            print(f"  Checkpoint audit: {' '.join(audit_argv)}")
 
         audit_completed = subprocess_runner(audit_argv)
-        _print_subprocess_tail(audit_completed)
+        _print_subprocess_tail(audit_completed, verbose=verbose)
 
         error_count, warning_codes = parse_audit_output(audit_completed.stdout)
         unacceptable_warnings = [
@@ -678,6 +721,7 @@ def process_one_candidate(
                 None,
                 new_state.human_gate,
                 new_state.recovery_state,
+                verbose=verbose,
             )
             report.final_state = state.derived_state
             report.human_gate = state.human_gate
@@ -702,6 +746,7 @@ def process_one_candidate(
             None,
             new_state.human_gate,
             new_state.recovery_state,
+            verbose=verbose,
         )
 
         state = new_state
@@ -722,8 +767,13 @@ def process_one_candidate(
     return report
 
 
-def print_summary(reports: list[CandidateReport], requested: int) -> None:
-    """Print the final per-candidate table and batch-level counts."""
+def print_detailed_summary(reports: list[CandidateReport], requested: int) -> None:
+    """Print the full per-candidate table and batch-level counts.
+
+    Only printed with --verbose -- the stable default operator experience
+    is print_grouped_summary() below (CLAUDE.md section 26 / Phase 6:
+    the operator should not have to read a wide per-stage table to learn
+    which candidates need a decision)."""
     print()
     print("=" * 100)
     print("BATCH SUMMARY")
@@ -777,14 +827,172 @@ def print_summary(reports: list[CandidateReport], requested: int) -> None:
     print(f"Audit failures: {audit_failures}")
 
 
+# The six named result groups from CLAUDE.md's stable operating mode /
+# Phase 6, plus three internal catch-alls: RECONCILED for a candidate that
+# reached full terminal completion (pipeline_state.py's "RECONCILED"
+# derived state), NOT_PROCESSED for candidates the batch never reached
+# after an earlier AUDIT_FAILED stop, and OTHER for any report shape none
+# of the above describe -- kept so a candidate can never silently vanish
+# from the summary.
+GROUP_ORDER = (
+    "READY_FOR_DRAFT",
+    "REVIEW_REQUIRED",
+    "BLOCKED",
+    "AUTO_REJECTED",
+    "DRAFT_CREATED",
+    "RECOVERY_REQUIRED",
+    "RECONCILED",
+    "OTHER",
+    "NOT_PROCESSED",
+)
+
+# result values that mean "a dispatched writer or the audit checkpoint
+# itself failed" -- checked before READY_FOR_DRAFT/DRAFT_CREATED so that a
+# failed create_woocommerce_draft.py / sync_woocommerce_product_status.py
+# attempt is never reported as if it were merely awaiting authorization or
+# already reconciled (final_state does not change on a failed dispatch --
+# only report.result does).
+_FAILURE_RESULTS = (
+    "BLOCKED",
+    "STAGE_FAILED",
+    "AUDIT_FAILED",
+    "NOT_FOUND",
+    "BATCH_MISMATCH",
+)
+
+
+def classify_report_group(report: CandidateReport) -> str:
+    """Map one CandidateReport onto exactly one of GROUP_ORDER's buckets."""
+    if report.result == "NOT_PROCESSED":
+        return "NOT_PROCESSED"
+
+    if report.blocked or report.result in _FAILURE_RESULTS:
+        return "BLOCKED"
+
+    if report.recovery_state is not None:
+        return "RECOVERY_REQUIRED"
+
+    if report.final_state == "READY_FOR_DRAFT" and report.human_gate:
+        return "READY_FOR_DRAFT"
+
+    if report.final_state == "DRAFT_CREATED":
+        return "DRAFT_CREATED"
+
+    if report.final_state == "DUPLICATE_REJECTED":
+        return "AUTO_REJECTED"
+
+    if report.final_state == "RECONCILED":
+        return "RECONCILED"
+
+    if report.human_gate:
+        return "REVIEW_REQUIRED"
+
+    return "OTHER"
+
+
+def print_grouped_summary(reports: list[CandidateReport], requested: int) -> None:
+    """Print the stable default batch result: candidates grouped into
+    READY_FOR_DRAFT / REVIEW_REQUIRED / BLOCKED / AUTO_REJECTED /
+    DRAFT_CREATED / RECOVERY_REQUIRED, with a short candidate / derived
+    state / reason line for each REVIEW_REQUIRED or BLOCKED candidate --
+    no per-stage trace, no wide table (see --verbose for that).
+
+    Candidates already in READY_FOR_DRAFT are never listed as needing
+    review here -- they get their own group plus the bounded Woo
+    authorization request printed by print_woo_approval_request().
+    """
+    groups: dict[str, list[CandidateReport]] = {name: [] for name in GROUP_ORDER}
+
+    for report in reports:
+        groups[classify_report_group(report)].append(report)
+
+    print()
+    print("=" * 78)
+    print("BATCH RESULT")
+    print("=" * 78)
+
+    for name in GROUP_ORDER:
+        members = groups[name]
+
+        if not members:
+            continue
+
+        print()
+        print(f"{name}: {len(members)}")
+
+        for report in members:
+            if name in ("REVIEW_REQUIRED", "BLOCKED"):
+                reason = report.human_gate_reason or report.blocked_reason or report.result
+                print()
+                print(report.candidate_code)
+                print(report.final_state)
+                print(reason)
+            elif name == "RECOVERY_REQUIRED":
+                print(f"{report.candidate_code}  ({report.recovery_state})")
+            else:
+                print(report.candidate_code)
+
+    print()
+    print(f"Candidates requested: {requested}")
+    print(f"Candidates processed: {sum(len(v) for k, v in groups.items() if k != 'NOT_PROCESSED')}")
+
+
+def print_woo_approval_request(
+    reports: list[CandidateReport],
+    allow_woo_draft: bool,
+) -> None:
+    """Print the single bounded Woo draft authorization request required
+    by CLAUDE.md section 6 whenever candidates reached READY_FOR_DRAFT on
+    this run without --allow-woo-draft. Never creates a draft itself --
+    printing only. Asks once for the whole bounded batch, never once per
+    candidate."""
+    if allow_woo_draft:
+        return
+
+    pending = [
+        report for report in reports if classify_report_group(report) == "READY_FOR_DRAFT"
+    ]
+
+    if not pending:
+        return
+
+    print()
+    print("=" * 78)
+    print(f"READY_FOR_DRAFT: {len(pending)}")
+    print()
+    print("Candidates:")
+
+    for report in pending:
+        print(report.candidate_code)
+
+    print()
+    print("Woo draft creation requires one bounded human authorization.")
+    print(
+        "Re-run with --allow-woo-draft and the exact same "
+        "--candidate-code(s)/--candidate-codes to authorize exactly "
+        "these candidates. No other candidate is authorized by this "
+        "request."
+    )
+
+
 def main(
     argv: list[str] | None = None,
     *,
     repository: SupabaseRepository | None = None,
     subprocess_runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
     confirm: Callable[[str], bool] | None = None,
+    preflight_runner: Callable[[], preflight_pipeline.PreflightResult] | None = None,
 ) -> int:
-    """Run the batch orchestrator. Returns a process exit code."""
+    """Run the batch orchestrator. Returns a process exit code.
+
+    `preflight_runner` is injectable (Phase 5's "reusable Python
+    function", not a recursive shell-out): production leaves it unset and
+    gets a real scripts/preflight_pipeline.run_preflight() call reusing
+    this run's own `repository`; tests inject a stub so the orchestrator
+    test suite stays fully offline. Skipped entirely for --dry-run, which
+    remains usable for diagnostics even when live connectivity (e.g. Woo)
+    is unavailable -- --dry-run never invokes a writer regardless.
+    """
     args = parse_arguments(argv)
 
     try:
@@ -810,6 +1018,26 @@ def main(
 
     if confirm is None:
         confirm = default_confirm
+
+    if not args.dry_run:
+        if preflight_runner is None:
+            active_repository = repository
+
+            def preflight_runner() -> preflight_pipeline.PreflightResult:
+                return preflight_pipeline.run_preflight(repository=active_repository)
+
+        preflight_result = preflight_runner()
+        preflight_pipeline.print_report(preflight_result)
+
+        if not preflight_result.ready:
+            print(
+                "Error: preflight reported a blocking failure -- refusing "
+                "to start production writes. Resolve the blocker(s) above "
+                "(or use --dry-run for a read-only diagnostic run) and "
+                "try again.",
+                file=sys.stderr,
+            )
+            return 2
 
     expected_batch_id: str | None = None
 
@@ -854,7 +1082,11 @@ def main(
         if report.result == "AUDIT_FAILED":
             batch_stopped = True
 
-    print_summary(reports, len(allowlist))
+    if args.verbose:
+        print_detailed_summary(reports, len(allowlist))
+
+    print_grouped_summary(reports, len(allowlist))
+    print_woo_approval_request(reports, args.allow_woo_draft)
 
     hard_failure = any(
         report.result

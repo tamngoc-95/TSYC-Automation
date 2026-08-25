@@ -101,13 +101,32 @@ def make_args(
     non_interactive: bool = True,
     allow_woo_draft: bool = False,
     batch_code: str | None = None,
+    verbose: bool = False,
 ) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         dry_run=dry_run,
         non_interactive=non_interactive,
         allow_woo_draft=allow_woo_draft,
         batch_code=batch_code,
+        verbose=verbose,
     )
+
+
+def always_ready_preflight() -> "run_batch.preflight_pipeline.PreflightResult":
+    """A stub preflight_runner that always reports ready -- keeps
+    orchestrator tests fully offline (no live Supabase/WooCommerce) while
+    still exercising the "preflight must pass before writes" gate."""
+    return run_batch.preflight_pipeline.PreflightResult(checks=())
+
+
+def always_blocked_preflight() -> "run_batch.preflight_pipeline.PreflightResult":
+    """A stub preflight_runner that always reports a blocking failure."""
+    blocking_check = run_batch.preflight_pipeline.PreflightCheck(
+        code="SUPABASE_READ",
+        status=run_batch.preflight_pipeline.CheckStatus.FAIL,
+        message="simulated blocking failure",
+    )
+    return run_batch.preflight_pipeline.PreflightResult(checks=(blocking_check,))
 
 
 def recording_runner(
@@ -291,6 +310,7 @@ def test_writer_stages_execute_serially_in_allowlist_order():
         repository=repository,
         subprocess_runner=runner,
         confirm=always_confirm,
+        preflight_runner=always_ready_preflight,
     )
 
     assert exit_code == 0
@@ -397,6 +417,7 @@ def test_audit_error_stops_entire_batch():
         repository=repository,
         subprocess_runner=runner,
         confirm=always_confirm,
+        preflight_runner=always_ready_preflight,
     )
 
     assert exit_code == 1
@@ -751,3 +772,306 @@ def test_default_subprocess_runner_stdout_stderr_capture_unchanged():
     assert result.returncode == 0
     assert result.stdout.strip() == "out-line"
     assert result.stderr.strip() == "err-line"
+
+
+# --------------------------------------------------------------------------
+# 17. Preflight integration (Phase 5): a blocking preflight failure prevents
+# any writer from running; --dry-run skips preflight entirely.
+# --------------------------------------------------------------------------
+
+
+def test_preflight_failure_prevents_writers():
+    repository = make_repository(
+        product_candidates=[make_candidate(identity_status="IDENTITY_VERIFIED")],
+        product_references=[make_reference()],
+    )
+    runner, calls = recording_runner()
+
+    exit_code = run_batch.main(
+        ["--candidate-code", CANDIDATE_CODE, "--max-candidates", "1", "--non-interactive"],
+        repository=repository,
+        subprocess_runner=runner,
+        confirm=always_confirm,
+        preflight_runner=always_blocked_preflight,
+    )
+
+    assert exit_code == 2
+    assert calls == []  # no writer, no audit checkpoint subprocess was ever invoked
+
+
+def test_default_preflight_runner_reuses_the_batchs_own_repository(monkeypatch):
+    """When no preflight_runner is injected, main() must build its own
+    default closure that calls preflight_pipeline.run_preflight() reusing
+    this run's own repository -- not construct a second live connection."""
+    repository = make_repository(
+        product_candidates=[make_candidate(identity_status="IDENTITY_VERIFIED")],
+        product_references=[make_reference()],
+    )
+    runner, calls = recording_runner()
+    seen_repositories = []
+
+    def fake_run_preflight(*, repository):
+        seen_repositories.append(repository)
+        return run_batch.preflight_pipeline.PreflightResult(checks=())
+
+    monkeypatch.setattr(
+        run_batch.preflight_pipeline, "run_preflight", fake_run_preflight
+    )
+
+    exit_code = run_batch.main(
+        ["--candidate-code", CANDIDATE_CODE, "--max-candidates", "1", "--non-interactive"],
+        repository=repository,
+        subprocess_runner=runner,
+        confirm=always_confirm,
+    )
+
+    assert exit_code == 0
+    assert seen_repositories == [repository]
+
+
+def test_dry_run_skips_preflight_entirely():
+    """--dry-run must remain usable for diagnostics even when preflight
+    would otherwise report a blocking failure (CLAUDE.md Phase 5)."""
+    repository = make_repository(
+        product_candidates=[make_candidate(identity_status="IDENTITY_VERIFIED")],
+        product_references=[make_reference()],
+    )
+    runner, calls = recording_runner()
+
+    def exploding_preflight_runner():
+        raise AssertionError("preflight must not run at all in --dry-run mode")
+
+    exit_code = run_batch.main(
+        [
+            "--candidate-code",
+            CANDIDATE_CODE,
+            "--max-candidates",
+            "1",
+            "--dry-run",
+            "--non-interactive",
+        ],
+        repository=repository,
+        subprocess_runner=runner,
+        confirm=always_confirm,
+        preflight_runner=exploding_preflight_runner,
+    )
+
+    assert exit_code == 0
+    assert calls == []
+
+
+# --------------------------------------------------------------------------
+# 18. One REVIEW_REQUIRED (human-gated) candidate does not stop other,
+# independent candidates in the same bounded batch.
+# --------------------------------------------------------------------------
+
+
+def test_one_human_gated_candidate_does_not_stop_independent_candidates():
+    other_code = "FB-2026-001-CAN-0002"
+    other_candidate_id = "88888888-8888-8888-8888-888888888888"
+
+    repository = make_repository(
+        product_candidates=[
+            # First candidate: no identity evidence yet -> human gate.
+            make_candidate(identity_status="IDENTITY_PENDING"),
+            # Second candidate: fully clear to advance automatically.
+            make_candidate(
+                candidate_id=other_candidate_id,
+                candidate_code=other_code,
+                identity_status="IDENTITY_VERIFIED",
+            ),
+        ],
+        product_references=[
+            make_reference(
+                reference_id="reference-2",
+                candidate_id=other_candidate_id,
+            ),
+        ],
+    )
+    runner, calls = recording_runner()
+
+    exit_code = run_batch.main(
+        [
+            "--candidate-code",
+            CANDIDATE_CODE,
+            "--candidate-code",
+            other_code,
+            "--max-candidates",
+            "2",
+            "--non-interactive",
+        ],
+        repository=repository,
+        subprocess_runner=runner,
+        confirm=always_confirm,
+        preflight_runner=always_ready_preflight,
+    )
+
+    assert exit_code == 0
+    # The human-gated candidate never invoked a writer, but the
+    # independent second candidate still advanced.
+    assert len(calls) == 1
+    assert calls[0][-3] == other_code
+
+
+# --------------------------------------------------------------------------
+# 19. Final grouped summary (Phase 6): candidates classify into exactly one
+# of the named result groups, and a human-gated candidate's short reason
+# is printed.
+# --------------------------------------------------------------------------
+
+
+def test_classify_report_group_covers_the_named_groups():
+    ready_report = run_batch.CandidateReport(
+        candidate_code="CAN-READY",
+        final_state="READY_FOR_DRAFT",
+        human_gate=True,
+    )
+    review_report = run_batch.CandidateReport(
+        candidate_code="CAN-REVIEW",
+        final_state="CONTENT_DRAFTED",
+        human_gate=True,
+        human_gate_reason="Content awaits human approval.",
+    )
+    blocked_report = run_batch.CandidateReport(
+        candidate_code="CAN-BLOCKED",
+        result="STAGE_FAILED",
+    )
+    rejected_report = run_batch.CandidateReport(
+        candidate_code="CAN-REJECTED",
+        final_state="DUPLICATE_REJECTED",
+    )
+    draft_created_report = run_batch.CandidateReport(
+        candidate_code="CAN-DRAFTED",
+        final_state="DRAFT_CREATED",
+    )
+    recovery_report = run_batch.CandidateReport(
+        candidate_code="CAN-RECOVERY",
+        recovery_state="CREATE_RESULT_UNCERTAIN",
+    )
+
+    assert run_batch.classify_report_group(ready_report) == "READY_FOR_DRAFT"
+    assert run_batch.classify_report_group(review_report) == "REVIEW_REQUIRED"
+    assert run_batch.classify_report_group(blocked_report) == "BLOCKED"
+    assert run_batch.classify_report_group(rejected_report) == "AUTO_REJECTED"
+    assert run_batch.classify_report_group(draft_created_report) == "DRAFT_CREATED"
+    assert run_batch.classify_report_group(recovery_report) == "RECOVERY_REQUIRED"
+
+
+def test_failed_woo_draft_creation_is_blocked_not_ready_for_draft():
+    """Regression: a candidate still shows final_state="READY_FOR_DRAFT"
+    (state is only reassigned after a *successful* dispatch+audit) even
+    when create_woocommerce_draft.py itself failed -- report.result is
+    "STAGE_FAILED" in that case, and that must win over the READY_FOR_DRAFT
+    final_state so a failed authorized Woo draft attempt is never reported
+    as if it were merely awaiting authorization."""
+    failed_after_authorization = run_batch.CandidateReport(
+        candidate_code="CAN-WOO-FAILED",
+        final_state="READY_FOR_DRAFT",
+        human_gate=True,
+        result="STAGE_FAILED",
+    )
+
+    assert run_batch.classify_report_group(failed_after_authorization) == "BLOCKED"
+
+
+def test_failed_reconciliation_is_blocked_not_draft_created():
+    failed_reconciliation = run_batch.CandidateReport(
+        candidate_code="CAN-SYNC-FAILED",
+        final_state="DRAFT_CREATED",
+        result="STAGE_FAILED",
+    )
+
+    assert run_batch.classify_report_group(failed_reconciliation) == "BLOCKED"
+
+
+def test_reconciled_terminal_state_gets_its_own_group():
+    reconciled_report = run_batch.CandidateReport(
+        candidate_code="CAN-DONE",
+        final_state="RECONCILED",
+        result="TERMINAL",
+    )
+
+    assert run_batch.classify_report_group(reconciled_report) == "RECONCILED"
+
+
+def test_grouped_summary_prints_reason_for_review_required(capsys):
+    review_report = run_batch.CandidateReport(
+        candidate_code="CAN-0021",
+        final_state="CONTENT_DRAFTED",
+        human_gate=True,
+        human_gate_reason="Content draft awaits human approval.",
+    )
+
+    run_batch.print_grouped_summary([review_report], requested=1)
+
+    output = capsys.readouterr().out
+    assert "REVIEW_REQUIRED: 1" in output
+    assert "CAN-0021" in output
+    assert "Content draft awaits human approval." in output
+
+
+def test_grouped_summary_never_lists_ready_for_draft_under_review_required(capsys):
+    ready_report = run_batch.CandidateReport(
+        candidate_code="CAN-READY",
+        final_state="READY_FOR_DRAFT",
+        human_gate=True,
+        human_gate_reason="WooCommerce draft creation is a human gate by default.",
+    )
+
+    run_batch.print_grouped_summary([ready_report], requested=1)
+
+    output = capsys.readouterr().out
+    assert "READY_FOR_DRAFT: 1" in output
+    assert "REVIEW_REQUIRED" not in output
+
+
+# --------------------------------------------------------------------------
+# 20. Bounded Woo authorization request (Phase 7): lists exactly the
+# READY_FOR_DRAFT candidates from this bounded run, nothing else, and is
+# suppressed once --allow-woo-draft was actually supplied.
+# --------------------------------------------------------------------------
+
+
+def test_woo_approval_request_lists_only_ready_for_draft_candidates(capsys):
+    ready_report = run_batch.CandidateReport(
+        candidate_code="CAN-READY",
+        final_state="READY_FOR_DRAFT",
+        human_gate=True,
+    )
+    other_report = run_batch.CandidateReport(
+        candidate_code="CAN-OTHER",
+        final_state="DRAFT_CREATED",
+    )
+
+    run_batch.print_woo_approval_request([ready_report, other_report], allow_woo_draft=False)
+
+    output = capsys.readouterr().out
+    assert "READY_FOR_DRAFT: 1" in output
+    assert "CAN-READY" in output
+    assert "CAN-OTHER" not in output
+    assert "bounded human authorization" in output
+
+
+def test_woo_approval_request_suppressed_when_already_authorized(capsys):
+    ready_report = run_batch.CandidateReport(
+        candidate_code="CAN-READY",
+        final_state="READY_FOR_DRAFT",
+        human_gate=True,
+    )
+
+    run_batch.print_woo_approval_request([ready_report], allow_woo_draft=True)
+
+    output = capsys.readouterr().out
+    assert output == ""
+
+
+def test_woo_approval_request_silent_when_nothing_ready(capsys):
+    other_report = run_batch.CandidateReport(
+        candidate_code="CAN-OTHER",
+        final_state="DRAFT_CREATED",
+    )
+
+    run_batch.print_woo_approval_request([other_report], allow_woo_draft=False)
+
+    output = capsys.readouterr().out
+    assert output == ""
