@@ -25,11 +25,13 @@ Usage (watch for clipboard changes until Ctrl+C):
         --watch --batch-code FB-2026-001 --max-sources 5
 
 Optional auto-continue (ingest, then run the existing exact-source
-collector and cleaner for that one URL -- never creates a candidate,
-since create_candidates_from_cleaned_posts.py requires a human-supplied
---candidate-title that cannot be safely automated):
+collector and cleaner for that one URL, then deterministic automatic
+candidate extraction, then the bounded orchestrator for exactly the
+candidate codes just created -- requires --max-candidates; never passes
+--allow-woo-draft, so this chain never crosses the WooCommerce
+human-approval gate):
     .venv/Scripts/python.exe scripts/watch_facebook_clipboard.py \\
-        --once --batch-code FB-2026-001 --process
+        --once --batch-code FB-2026-001 --process --max-candidates 5
 
 Privacy: raw clipboard content is never printed, logged, or persisted.
 Only the normalized permalink -- and only after it has passed strict
@@ -68,10 +70,17 @@ from run_batch import PYTHON_EXE, default_subprocess_runner  # noqa: E402
 configure_utf8_console()
 
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 
 MIN_POLL_INTERVAL_SECONDS = 0.5
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
+
+# Exit code returned when ingestion itself succeeded but a requested
+# --process auto-continue chain failed for at least one source. Distinct
+# from 2 (an argument/preflight error, before any I/O) -- this means real
+# work was attempted and a downstream stage did not complete cleanly, so
+# the OS-level exit code must not read as full success.
+PROCESS_CHAIN_FAILURE_EXIT_CODE = 1
 
 # Windows clipboard format for plain Unicode text (CF_UNICODETEXT).
 _CF_UNICODETEXT = 13
@@ -162,15 +171,55 @@ def print_outcome(outcome: IngestOutcome) -> None:
         print("Clipboard content ignored (not a supported TSYC permalink).")
 
 
+_CANDIDATE_CODES_PREFIX = "CANDIDATE_CODES:"
+
+
+def parse_candidate_codes(stdout: str) -> list[str]:
+    """Parse create_candidates_from_cleaned_posts.py's stable
+    "CANDIDATE_CODES: ..." output line -- never human prose.
+
+    Deliberately neutral name/label (not "created"): the codes on this
+    line are exactly the candidate codes now available to continue
+    processing downstream, whether they were freshly CREATED this run
+    or already EXISTING from a prior idempotent-repeat run (see that
+    script's create_candidates_from_page() / format_candidate_codes_
+    line()) -- this caller treats both cases identically, so the label
+    must not claim "created" for codes that were not. Keep this in sync
+    with that script's own print of the same prefix."""
+    for line in (stdout or "").splitlines():
+        if line.startswith(_CANDIDATE_CODES_PREFIX):
+            raw = line[len(_CANDIDATE_CODES_PREFIX):].strip()
+            return [code.strip() for code in raw.split(",") if code.strip()]
+
+    return []
+
+
+def _print_tail(completed: subprocess.CompletedProcess, *, max_lines: int = 15) -> None:
+    """Print the last few lines of a subprocess's stdout -- used only for
+    the exception-visibility cases below (extraction failed, extraction
+    produced no candidates, or run_batch.py exited unexpectedly), not for
+    every routine successful stage."""
+    lines = (completed.stdout or "").strip().splitlines()
+
+    for line in lines[-max_lines:]:
+        print(f"    {line}")
+
+
 def run_process_chain(
     source_url_id: str,
     subprocess_runner: Callable[[list[str]], subprocess.CompletedProcess],
+    max_candidates: int,
 ) -> bool:
-    """Optional --process auto-continue: collect, then clean, this one
-    exact source. Never creates a candidate -- create_candidates_from_
-    cleaned_posts.py requires a human-supplied --candidate-title that
-    cannot be safely automated (see docs/TSYC_SOURCE_INGESTION.md).
-    Returns True if both stages succeeded.
+    """Optional --process auto-continue: collect this one exact source,
+    clean it, run deterministic automatic candidate extraction, then run
+    the bounded orchestrator for exactly the candidate codes just
+    created. Never passes --allow-woo-draft to run_batch.py -- this
+    chain never crosses the Woo human-approval gate.
+
+    Returns True once the chain has run to a normal conclusion (which
+    includes "extraction found no candidates" and "run_batch.py reported
+    a candidate exception" -- both are expected reporting outcomes, not
+    crashes). Returns False only for an unexpected stage failure.
     """
     collect_argv = [
         str(PYTHON_EXE),
@@ -202,12 +251,67 @@ def run_process_chain(
         print(f"  Cleaning failed (exit {cleaned.returncode}).")
         return False
 
-    print(
-        "  Collected and cleaned. Candidate extraction still requires a "
-        "human-supplied title: run create_candidates_from_cleaned_posts.py "
-        f"--source-url-id {source_url_id} --candidate-title \"...\" "
-        "--confirm-create --non-interactive"
-    )
+    extract_argv = [
+        str(PYTHON_EXE),
+        str(SCRIPTS_DIR / "create_candidates_from_cleaned_posts.py"),
+        "--source-url-id", source_url_id,
+        "--max-candidates", str(max_candidates),
+        "--non-interactive",
+        "--confirm-create",
+    ]
+
+    print(f"  Invoking: {' '.join(extract_argv)}")
+    extracted = subprocess_runner(extract_argv)
+
+    if extracted.returncode != 0:
+        print(
+            "  Candidate extraction failed "
+            f"(exit {extracted.returncode}) -- this may mean the raw "
+            "page still needs manual cleaning review "
+            "(clean_facebook_raw_pages.py --action SAVE/REVIEW)."
+        )
+        _print_tail(extracted)
+        return False
+
+    candidate_codes = parse_candidate_codes(extracted.stdout)
+
+    if not candidate_codes:
+        print(
+            "  No candidates were created automatically for this post -- "
+            "see the classification result below. Fallback: create_"
+            "candidates_from_cleaned_posts.py --source-url-id "
+            f"{source_url_id} --candidate-title \"...\" --confirm-create "
+            "--non-interactive."
+        )
+        _print_tail(extracted)
+        return True
+
+    print(f"  Candidates created: {', '.join(candidate_codes)}")
+
+    run_batch_argv = [str(PYTHON_EXE), str(SCRIPTS_DIR / "run_batch.py")]
+
+    for code in candidate_codes:
+        run_batch_argv += ["--candidate-code", code]
+
+    run_batch_argv += [
+        "--max-candidates", str(len(candidate_codes)),
+        "--non-interactive",
+    ]
+
+    print(f"  Invoking: {' '.join(run_batch_argv)}")
+    batch_result = subprocess_runner(run_batch_argv)
+    _print_tail(batch_result)
+
+    # run_batch.py's own exit code 1 ("hard_failure") means at least one
+    # of these candidates ended in BLOCKED/STAGE_FAILED/... -- that is
+    # already reported by its own grouped summary above and is expected
+    # exception reporting, not a process-chain crash. Only an
+    # unrecognized exit code (e.g. 2: an argument/preflight error) is
+    # treated as an unexpected failure here.
+    if batch_result.returncode not in (0, 1):
+        print(f"  run_batch.py exited unexpectedly (code {batch_result.returncode}).")
+        return False
+
     return True
 
 
@@ -273,8 +377,21 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "After a new URL is REGISTERED, automatically run the "
             "existing collect_one_facebook_post.py and clean_facebook_"
-            "raw_pages.py for that exact source. Never creates a "
-            "candidate and never creates a WooCommerce draft."
+            "raw_pages.py for that exact source, then deterministic "
+            "automatic candidate extraction, then run_batch.py for "
+            "exactly the candidate codes created. Requires --max-"
+            "candidates. Never creates a WooCommerce draft (no "
+            "--allow-woo-draft is ever passed)."
+        ),
+    )
+
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        help=(
+            "Required with --process: hard upper bound on candidates "
+            "created (and then run through run_batch.py) per ingested "
+            "post. Never unbounded."
         ),
     )
 
@@ -297,6 +414,16 @@ def validate_arguments(args: argparse.Namespace) -> None:
             f"--interval must be at least {MIN_POLL_INTERVAL_SECONDS} "
             "seconds (do not poll more aggressively than necessary)."
         )
+
+    if args.process:
+        if args.max_candidates is None:
+            raise WatcherArgumentError(
+                "--process requires --max-candidates (no unbounded "
+                "candidate creation)."
+            )
+
+        if args.max_candidates < 1:
+            raise WatcherArgumentError("--max-candidates must be at least 1.")
 
 
 def main(
@@ -351,6 +478,13 @@ def main(
 
     last_seen: str | None = None
     ingested_count = 0
+    # Every source_url_id whose --process chain returned False this run.
+    # ingested_count (above) counts sources the clipboard watcher itself
+    # successfully recognized/registered -- it must never be read as a
+    # claim that every one of those sources' downstream --process chain
+    # also completed successfully, so a chain failure is tracked here
+    # instead of folded into that counter.
+    process_chain_failures: list[str] = []
 
     def handle_one_reading() -> None:
         nonlocal last_seen, ingested_count
@@ -373,13 +507,52 @@ def main(
             ingested_count += 1
 
             if args.process and outcome.status == "REGISTERED":
-                run_process_chain(outcome.source_url_id, subprocess_runner)
+                # run_process_chain() itself never raises for an
+                # ordinary stage failure (a non-zero subprocess exit is
+                # reported and returned as False) -- exception isolation
+                # for one source's processing is unchanged by this
+                # failure-tracking; only its already-boolean result is
+                # now recorded instead of discarded.
+                chain_succeeded = run_process_chain(
+                    outcome.source_url_id, subprocess_runner, args.max_candidates
+                )
+
+                if not chain_succeeded:
+                    process_chain_failures.append(outcome.source_url_id)
+                    print(
+                        "  WARNING: --process auto-continue chain failed "
+                        f"for source_url_id {outcome.source_url_id} -- see "
+                        "the stage output above for the exact failing step."
+                    )
+
+    def report_process_chain_failures() -> int:
+        """Print a clear summary of any --process chain failures and
+        return the exit code they imply. Called from every normal exit
+        path below (--once, --watch reaching --max-sources, --watch
+        stopped by Ctrl+C) so a failed processing attempt can never be
+        reported as OS-level success."""
+        if not process_chain_failures:
+            return 0
+
+        print()
+        print(
+            f"--process auto-continue failed for "
+            f"{len(process_chain_failures)} source(s): "
+            + ", ".join(process_chain_failures)
+        )
+        return PROCESS_CHAIN_FAILURE_EXIT_CODE
 
     if args.once:
         handle_one_reading()
-        return 0
+        return report_process_chain_failures()
 
-    # --watch
+    # --watch: each clipboard reading/source is handled independently
+    # (handle_one_reading() catches nothing itself -- an unexpected
+    # exception still propagates and stops the run, unchanged by this
+    # fix); a --process chain failure for one source is recorded and the
+    # loop continues to the next independent source, since run_process_
+    # chain() already isolates that failure to a boolean result rather
+    # than raising.
     try:
         while ingested_count < args.max_sources:
             handle_one_reading()
@@ -388,11 +561,11 @@ def main(
     except KeyboardInterrupt:
         print()
         print("Clipboard watcher stopped by user.")
-        return 0
+        return report_process_chain_failures()
 
     print()
     print(f"Reached --max-sources ({args.max_sources}). Stopping.")
-    return 0
+    return report_process_chain_failures()
 
 
 if __name__ == "__main__":

@@ -355,7 +355,8 @@ def test_cli_unknown_batch_code_fails():
 
 # ---------------------------------------------------------------------
 # 11. --process auto-continue invokes the existing collector/cleaner,
-# never creates a candidate, never touches WooCommerce
+# then deterministic automatic extraction, then run_batch.py -- but
+# never touches WooCommerce (no --allow-woo-draft is ever passed)
 # ---------------------------------------------------------------------
 
 
@@ -365,35 +366,128 @@ def test_process_flag_invokes_collect_and_clean_for_new_registration():
     runner, calls = recording_subprocess_runner()
 
     watcher.main(
-        ["--once", "--batch-code", BATCH_CODE, "--process"],
+        ["--once", "--batch-code", BATCH_CODE, "--process", "--max-candidates", "5"],
         repository=repository,
         clipboard_reader=reader,
         subprocess_runner=runner,
     )
 
-    assert len(calls) == 2
+    # No candidate codes are parsed from the (empty) recorded stdout, so
+    # the chain stops after extraction and never reaches run_batch.py --
+    # exactly 3 calls: collect, clean, extract.
+    assert len(calls) == 3
     assert calls[0][1].endswith("collect_one_facebook_post.py")
     assert calls[1][1].endswith("clean_facebook_raw_pages.py")
+    assert calls[2][1].endswith("create_candidates_from_cleaned_posts.py")
     assert "--source-url-id" in calls[0]
     assert "--confirm-save" in calls[0]
     assert "--non-interactive" in calls[0]
+    assert "--max-candidates" in calls[2]
+    assert "5" in calls[2]
 
 
-def test_process_flag_never_invokes_candidate_creation_or_woo():
+def test_process_flag_invokes_run_batch_for_newly_created_candidate_codes():
+    """The CANDIDATE_CODES: line is deliberately neutral -- this covers
+    the "freshly created this run" case; the idempotent-repeat/existing
+    case is covered by the next test. Both must hand the exact same
+    codes to run_batch.py."""
+    repository = make_repository()
+    reader = clipboard_sequence([authorized_url("1")])
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess:
+        if argv[1].endswith("create_candidates_from_cleaned_posts.py"):
+            stdout = "CANDIDATE_CODES: FB-2026-001-CAN-1"
+            return subprocess.CompletedProcess(argv, 0, stdout, "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    calls: list[list[str]] = []
+
+    def recording_runner(argv: list[str]) -> subprocess.CompletedProcess:
+        calls.append(argv)
+        return runner(argv)
+
+    watcher.main(
+        ["--once", "--batch-code", BATCH_CODE, "--process", "--max-candidates", "5"],
+        repository=repository,
+        clipboard_reader=reader,
+        subprocess_runner=recording_runner,
+    )
+
+    assert len(calls) == 4
+    assert calls[3][1].endswith("run_batch.py")
+    assert "--candidate-code" in calls[3]
+    assert "FB-2026-001-CAN-1" in calls[3]
+    assert "--allow-woo-draft" not in calls[3]
+
+
+def test_process_flag_invokes_run_batch_for_idempotent_existing_candidate_codes():
+    """create_candidates_from_cleaned_posts.py prints the same
+    CANDIDATE_CODES: line whether the codes were freshly created or
+    already existed from a prior idempotent-repeat run -- the watcher
+    must hand run_batch.py the exact same codes either way, without
+    caring which case it was."""
+    repository = make_repository()
+    reader = clipboard_sequence([authorized_url("1")])
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess:
+        if argv[1].endswith("create_candidates_from_cleaned_posts.py"):
+            stdout = (
+                "EXTRACTION ALREADY COMPLETE FOR THIS POST\n"
+                "CANDIDATE_CODES: FB-2026-001-CAN-9\n"
+            )
+            return subprocess.CompletedProcess(argv, 0, stdout, "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    calls: list[list[str]] = []
+
+    def recording_runner(argv: list[str]) -> subprocess.CompletedProcess:
+        calls.append(argv)
+        return runner(argv)
+
+    watcher.main(
+        ["--once", "--batch-code", BATCH_CODE, "--process", "--max-candidates", "5"],
+        repository=repository,
+        clipboard_reader=reader,
+        subprocess_runner=recording_runner,
+    )
+
+    assert len(calls) == 4
+    assert calls[3][1].endswith("run_batch.py")
+    assert "--candidate-code" in calls[3]
+    assert "FB-2026-001-CAN-9" in calls[3]
+    assert "--allow-woo-draft" not in calls[3]
+
+
+def test_parse_candidate_codes_extracts_comma_separated_list():
+    stdout = "some other line\nCANDIDATE_CODES: FB-2026-001-CAN-1,FB-2026-001-CAN-2\n"
+
+    assert watcher.parse_candidate_codes(stdout) == [
+        "FB-2026-001-CAN-1",
+        "FB-2026-001-CAN-2",
+    ]
+
+
+def test_parse_candidate_codes_returns_empty_list_without_the_prefix():
+    assert watcher.parse_candidate_codes("no candidate line here") == []
+    assert watcher.parse_candidate_codes("") == []
+    assert watcher.parse_candidate_codes("CANDIDATE_CODES: ") == []
+
+
+def test_process_flag_never_invokes_woo():
     repository = make_repository()
     reader = clipboard_sequence([authorized_url("1")])
     runner, calls = recording_subprocess_runner()
 
     watcher.main(
-        ["--once", "--batch-code", BATCH_CODE, "--process"],
+        ["--once", "--batch-code", BATCH_CODE, "--process", "--max-candidates", "5"],
         repository=repository,
         clipboard_reader=reader,
         subprocess_runner=runner,
     )
 
     joined = " ".join(" ".join(argv) for argv in calls)
-    assert "create_candidates_from_cleaned_posts.py" not in joined
     assert "create_woocommerce_draft.py" not in joined
+    assert "--allow-woo-draft" not in joined
     assert "woocommerce" not in joined.lower()
 
 
@@ -414,12 +508,28 @@ def test_process_flag_not_invoked_for_already_known_url():
     runner, calls = recording_subprocess_runner()
 
     watcher.main(
+        ["--once", "--batch-code", BATCH_CODE, "--process", "--max-candidates", "5"],
+        repository=repository,
+        clipboard_reader=reader,
+        subprocess_runner=runner,
+    )
+
+    assert calls == []
+
+
+def test_process_flag_requires_max_candidates():
+    repository = make_repository()
+    reader = clipboard_sequence([authorized_url("1")])
+    runner, calls = recording_subprocess_runner()
+
+    exit_code = watcher.main(
         ["--once", "--batch-code", BATCH_CODE, "--process"],
         repository=repository,
         clipboard_reader=reader,
         subprocess_runner=runner,
     )
 
+    assert exit_code == 2
     assert calls == []
 
 
@@ -438,19 +548,129 @@ def test_default_behavior_never_invokes_process_chain():
     assert calls == []
 
 
-def test_process_chain_failure_does_not_crash_watcher():
+def test_process_chain_failure_does_not_crash_watcher_but_exit_code_is_nonzero():
+    """Ingestion itself still succeeded (the URL was registered), but a
+    failed --process chain must not be reported as OS-level success --
+    the process must exit non-zero, and the failure must be visible in
+    stdout, not swallowed."""
     repository = make_repository()
     reader = clipboard_sequence([authorized_url("1")])
     runner, _calls = recording_subprocess_runner(returncode=1)
 
     exit_code = watcher.main(
-        ["--once", "--batch-code", BATCH_CODE, "--process"],
+        ["--once", "--batch-code", BATCH_CODE, "--process", "--max-candidates", "5"],
         repository=repository,
         clipboard_reader=reader,
         subprocess_runner=runner,
     )
 
-    assert exit_code == 0  # ingestion itself still succeeded
+    assert exit_code == watcher.PROCESS_CHAIN_FAILURE_EXIT_CODE
+    assert exit_code != 0
+    # The URL was still registered -- only the downstream chain failed.
+    assert len(repository.client.tables["source_urls"]) == 1
+
+
+def test_process_chain_success_returns_exit_code_zero(capsys):
+    repository = make_repository()
+    reader = clipboard_sequence([authorized_url("1")])
+    runner, _calls = recording_subprocess_runner(returncode=0)
+
+    exit_code = watcher.main(
+        ["--once", "--batch-code", BATCH_CODE, "--process", "--max-candidates", "5"],
+        repository=repository,
+        clipboard_reader=reader,
+        subprocess_runner=runner,
+    )
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "WARNING" not in output
+
+
+def test_watch_mode_records_failure_but_continues_processing_next_source():
+    """A --process chain failure for one source must not stop the
+    --watch loop -- the next independent source is still processed
+    (existing architecture already isolates this: run_process_chain()
+    reports a stage failure as a boolean return, it never raises)."""
+    repository = make_repository()
+    reader = clipboard_sequence([authorized_url("1"), authorized_url("2")])
+
+    # First source: collection fails (returncode 1). Second source: the
+    # whole chain succeeds (returncode 0).
+    call_sequence = {"n": 0}
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess:
+        call_sequence["n"] += 1
+        returncode = 1 if call_sequence["n"] == 1 else 0
+        return subprocess.CompletedProcess(argv, returncode, "", "")
+
+    exit_code = watcher.main(
+        [
+            "--watch", "--batch-code", BATCH_CODE,
+            "--max-sources", "2", "--process", "--max-candidates", "5",
+        ],
+        repository=repository,
+        clipboard_reader=reader,
+        subprocess_runner=runner,
+        sleep=no_sleep,
+    )
+
+    # Both sources were still ingested (2 rows), and the second source's
+    # chain was still attempted (its collect call happened) even though
+    # the first source's chain failed -- the loop was not stopped.
+    assert len(repository.client.tables["source_urls"]) == 2
+    assert call_sequence["n"] >= 2
+    assert exit_code == watcher.PROCESS_CHAIN_FAILURE_EXIT_CODE
+
+
+def test_watch_mode_exit_code_zero_when_no_process_failures():
+    repository = make_repository()
+    reader = clipboard_sequence([authorized_url("1"), authorized_url("2")])
+    runner, _calls = recording_subprocess_runner(returncode=0)
+
+    exit_code = watcher.main(
+        [
+            "--watch", "--batch-code", BATCH_CODE,
+            "--max-sources", "2", "--process", "--max-candidates", "5",
+        ],
+        repository=repository,
+        clipboard_reader=reader,
+        subprocess_runner=runner,
+        sleep=no_sleep,
+    )
+
+    assert exit_code == 0
+
+
+def test_watch_mode_interrupted_still_reports_nonzero_on_prior_failure():
+    """A KeyboardInterrupt-stopped --watch run must still report a
+    non-zero exit code if a --process chain failure was already
+    recorded before the interrupt -- Ctrl+C must not mask it."""
+    repository = make_repository()
+    call_count = {"n": 0}
+
+    def reader() -> str | None:
+        call_count["n"] += 1
+
+        if call_count["n"] == 1:
+            return authorized_url("1")
+
+        raise KeyboardInterrupt
+
+    runner, _calls = recording_subprocess_runner(returncode=1)
+
+    exit_code = watcher.main(
+        [
+            "--watch", "--batch-code", BATCH_CODE,
+            "--max-sources", "5", "--process", "--max-candidates", "5",
+        ],
+        repository=repository,
+        clipboard_reader=reader,
+        subprocess_runner=runner,
+        sleep=no_sleep,
+    )
+
+    assert exit_code == watcher.PROCESS_CHAIN_FAILURE_EXIT_CODE
 
 
 # ---------------------------------------------------------------------

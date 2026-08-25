@@ -13,9 +13,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.decisions import Outcome
+from src.domain.rules import extraction_rules
+from src.domain.rules.extraction_rules import (
+    normalize_isbn,
+    normalize_text,
+    validate_extracted_identity,
+)
 from src.repositories.supabase_repository import SupabaseRepository
-
-from clean_facebook_raw_pages import normalize_unicode_text
 
 configure_utf8_console()
 
@@ -23,11 +28,18 @@ configure_utf8_console()
 BATCH_CODE = "FB-2026-001"
 
 EXTRACTOR_NAME = "facebook_cleaned_post_rule_extractor"
-EXTRACTOR_VERSION = "1.0.0"
+EXTRACTOR_VERSION = "1.1.0"
 
 DEFAULT_CANDIDATE_TYPE = "SINGLE_BOOK"
 DEFAULT_WORKFLOW_STATUS = "EXTRACTED"
 DEFAULT_EXTRACTION_METHOD = "RULE_BASED"
+
+# Default bound for automatic extraction when the caller does not pass
+# --max-candidates. CLAUDE.md's bounded-safety policy applies here the
+# same way it applies to run_batch.py's --max-candidates: automatic
+# extraction must never be allowed to create an unbounded number of
+# candidates from one post.
+DEFAULT_MAX_CANDIDATES = 5
 
 DEFAULT_REVIEW_REASON = (
     "Candidate was extracted from Facebook post text. "
@@ -38,63 +50,26 @@ CANDIDATE_CODE_PATTERN = re.compile(
     rf"^{re.escape(BATCH_CODE)}-CAN-(\d+)$"
 )
 
-LEADING_POST_MARKERS = (
-    "Sách có sẵn ở Đức",
-    "Sách có sẵn",
-)
+# Stable, greppable, machine-readable output-line prefix.
+# scripts/watch_facebook_clipboard.py's --process chain parses this
+# exact prefix (see its parse_candidate_codes()) to learn which
+# candidate codes to hand to run_batch.py next. Deliberately neutral,
+# not "CREATED_CANDIDATE_CODES" -- create_candidates_from_page() can
+# return codes that were freshly created this run *or* codes that
+# already existed from a prior idempotent-repeat run (see its
+# existing_candidates branch); either way these are exactly the
+# candidate codes now available to continue processing downstream, and
+# a downstream consumer treats both cases identically. Keep this prefix
+# in sync with parse_candidate_codes() in watch_facebook_clipboard.py --
+# do not reformat one side without the other.
+CANDIDATE_CODES_PREFIX = "CANDIDATE_CODES:"
 
-TITLE_DESCRIPTION_PATTERNS = (
-    re.compile(
-        r"^(?P<title>.{2,160}?)\s+"
-        r"(?:là|là một)\s+cuốn sách\b",
-        flags=re.IGNORECASE,
-    ),
-    re.compile(
-        r"^(?P<title>.{2,160}?)\s+"
-        r"(?:là|là một)\s+bộ sách\b",
-        flags=re.IGNORECASE,
-    ),
-)
 
-TITLE_AUTHOR_PATTERNS = (
-    re.compile(
-        r"[“\"](?P<title>[^”\"]+)[”\"]\s+"
-        r"(?:của|by)\s+"
-        r"(?P<author>[A-ZÀ-Ỹ][^,\n.–—]+)",
-        flags=re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?P<title>[^\n]{3,160}?)\s+"
-        r"(?:của|by)\s+"
-        r"(?P<author>[A-ZÀ-Ỹ][^,\n.–—]+)",
-        flags=re.IGNORECASE,
-    ),
-)
-
-AUTHOR_REJECTION_MARKERS = (
-    "cuốn sách",
-    "bộ sách",
-    "cơ thể",
-    "tuổi dậy thì",
-    "giúp các em",
-    "giúp trẻ",
-    "nội dung",
-    "ngôn ngữ",
-    "minh họa",
-    "phát triển",
-    "thay đổi",
-    "hướng dẫn",
-    "đây là",
-)
-
-MAX_TITLE_LENGTH = 160
-MAX_AUTHOR_LENGTH = 100
-
-ISBN_PATTERN = re.compile(
-    r"\b(?:ISBN(?:-1[03])?\s*:?\s*)?"
-    r"(?P<isbn>97[89][\d\-\s]{10,20}\d)\b",
-    flags=re.IGNORECASE,
-)
+def format_candidate_codes_line(candidate_codes: list[str]) -> str:
+    """Format the stable CANDIDATE_CODES output line for a run's exact
+    result -- see CANDIDATE_CODES_PREFIX's docstring above for why this
+    label is neutral rather than "CREATED"."""
+    return f"{CANDIDATE_CODES_PREFIX} " + ",".join(candidate_codes)
 
 
 def normalize_confirmation(
@@ -172,6 +147,18 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=DEFAULT_MAX_CANDIDATES,
+        help=(
+            "Hard upper bound on candidates created from this one post "
+            f"(default {DEFAULT_MAX_CANDIDATES}). Applies to both explicit "
+            "--candidate-title values and automatic extraction -- never "
+            "unbounded."
+        ),
+    )
+
+    parser.add_argument(
         "--confirm-create",
         action="store_true",
         help="Confirm candidate creation without prompting.",
@@ -189,341 +176,37 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def normalize_text(
-    value: str | None,
-) -> str:
-    """Normalize whitespace while preserving Vietnamese text."""
-    if not value:
-        return ""
+def extract_book_identity(
+    cleaned_text: str,
+) -> dict[str, Any]:
+    """Extract a conservative book identity from cleaned Facebook text.
 
-    return " ".join(
-        value.split()
-    ).strip()
+    Thin wrapper around src.domain.rules.extraction_rules.
+    extract_single_book_identity() -- that module now holds the one
+    canonical implementation of the title/author/ISBN regex patterns
+    (including the U+034F defensive-normalization fix). This wrapper
+    exists only to preserve this exact function's external contract
+    (name, signature, return-dict shape, matched_pattern labels, raise-
+    on-failure behavior) for its existing callers --
+    scripts/correct_candidate_extraction.py and the regression tests in
+    tests/test_facebook_text_normalization.py that pin down the U+034F
+    fix -- unchanged.
+    """
+    result = extraction_rules.extract_single_book_identity(cleaned_text)
 
-
-def remove_leading_post_markers(
-    value: str,
-) -> str:
-    """Remove known Facebook post labels before identity extraction."""
-    cleaned = normalize_text(value)
-
-    marker_removed = True
-
-    while marker_removed:
-        marker_removed = False
-        lowered = cleaned.casefold()
-
-        for marker in LEADING_POST_MARKERS:
-            marker_text = normalize_text(marker)
-            marker_lower = marker_text.casefold()
-
-            if lowered == marker_lower:
-                return ""
-
-            if lowered.startswith(
-                marker_lower + " "
-            ):
-                cleaned = cleaned[
-                    len(marker_text):
-                ].lstrip(
-                    " \t\r\n:–—-"
-                )
-                marker_removed = True
-                break
-
-    return cleaned
-
-
-def looks_like_description_fragment(
-    value: str | None,
-) -> bool:
-    """Return True when a value resembles prose rather than a person name."""
-    cleaned = normalize_text(value)
-
-    if not cleaned:
-        return False
-
-    lowered = cleaned.casefold()
-
-    if any(
-        marker in lowered
-        for marker in AUTHOR_REJECTION_MARKERS
-    ):
-        return True
-
-    word_count = len(cleaned.split())
-
-    if word_count > 8:
-        return True
-
-    if len(cleaned) > MAX_AUTHOR_LENGTH:
-        return True
-
-    if re.search(
-        r"[.!?;:]",
-        cleaned,
-    ):
-        return True
-
-    return False
-
-
-def validate_extracted_identity(
-    title: str | None,
-    author: str | None,
-) -> tuple[str, str | None, list[str]]:
-    """Validate extracted fields and return normalized values plus warnings."""
-    warnings: list[str] = []
-
-    cleaned_title = clean_extracted_title(
-        title or ""
-    )
-
-    cleaned_author = (
-        clean_extracted_author(author)
-        if author
-        else None
-    )
-
-    if not cleaned_title:
+    if result is None:
         raise RuntimeError(
             "No reliable book title could be extracted "
             "from the cleaned Facebook post."
         )
 
-    if len(cleaned_title) > MAX_TITLE_LENGTH:
-        raise RuntimeError(
-            "The extracted title is too long and appears "
-            "to contain post description text."
-        )
-
-    title_lower = cleaned_title.casefold()
-
-    if title_lower in {
-        "bài viết",
-        "sách có sẵn",
-        "sách có sẵn ở đức",
-        "yêu con",
-        "tiệm sách yêu con ở đức",
-    }:
-        raise RuntimeError(
-            "The extracted title is a Facebook interface label, "
-            "not a reliable book title."
-        )
-
-    if cleaned_author and looks_like_description_fragment(
-        cleaned_author
-    ):
-        warnings.append(
-            "The extracted author resembled description text "
-            "and was removed."
-        )
-        cleaned_author = None
-
-    return (
-        cleaned_title,
-        cleaned_author,
-        warnings,
-    )
-
-
-def clean_extracted_title(
-    value: str,
-) -> str:
-    """Clean punctuation around an extracted book title."""
-    return normalize_text(
-        value
-    ).strip(
-        " \t\r\n“”\"'.,;:–—-"
-    )
-
-
-def clean_extracted_author(
-    value: str,
-) -> str:
-    """Clean punctuation and trailing description from an author name."""
-    cleaned = normalize_text(
-        value
-    ).strip(
-        " \t\r\n“”\"'.,;:–—-"
-    )
-
-    stop_markers = (
-        " là cuốn sách",
-        " là một cuốn sách",
-        " chia sẻ",
-        " giới thiệu",
-        " kể về",
-        " mang đến",
-        " giúp",
-        " được",
-    )
-
-    cleaned_lower = cleaned.lower()
-
-    for marker in stop_markers:
-        marker_position = cleaned_lower.find(
-            marker
-        )
-
-        if marker_position >= 0:
-            cleaned = cleaned[
-                :marker_position
-            ].strip()
-
-            cleaned_lower = cleaned.lower()
-
-    return cleaned
-
-
-def normalize_isbn(
-    value: str | None,
-) -> str | None:
-    """Normalize an ISBN candidate to digits only."""
-    if not value:
-        return None
-
-    digits = re.sub(
-        r"\D",
-        "",
-        value,
-    )
-
-    if len(digits) in {
-        10,
-        13,
-    }:
-        return digits
-
-    return None
-
-
-def extract_book_identity(
-    cleaned_text: str,
-) -> dict[str, Any]:
-    """Extract a conservative book identity from cleaned Facebook text."""
-    # Defensive normalization: strip invisible Unicode formatting/joiner
-    # characters (e.g. Facebook's obfuscation joiner U+034F) before running
-    # the anchored title regexes below. clean_facebook_raw_pages.py already
-    # does this at cleaning time, but title extraction must not silently
-    # trust that every stored cleaned_text row went through the current
-    # cleaner version -- an un-normalized leading noise prefix is exactly
-    # what caused the anchored patterns to miss the real title and fall
-    # through to a garbage mid-text match.
-    normalized_text = remove_leading_post_markers(
-        normalize_unicode_text(
-            cleaned_text
-        )
-    )
-
-    if not normalized_text:
-        raise RuntimeError(
-            "The cleaned Facebook post text is empty."
-        )
-
-    extracted_title: str | None = None
-    extracted_author: str | None = None
-    matched_pattern: str | None = None
-    extraction_warnings: list[str] = []
-
-    for pattern_number, pattern in enumerate(
-        TITLE_DESCRIPTION_PATTERNS,
-        start=1,
-    ):
-        match = pattern.search(
-            normalized_text
-        )
-
-        if not match:
-            continue
-
-        extracted_title = clean_extracted_title(
-            match.group("title")
-        )
-        extracted_author = None
-        matched_pattern = (
-            f"TITLE_DESCRIPTION_PATTERN_{pattern_number}"
-        )
-        break
-
-    if not extracted_title:
-        for pattern_number, pattern in enumerate(
-            TITLE_AUTHOR_PATTERNS,
-            start=1,
-        ):
-            match = pattern.search(
-                normalized_text
-            )
-
-            if not match:
-                continue
-
-            extracted_title = clean_extracted_title(
-                match.group("title")
-            )
-
-            extracted_author = clean_extracted_author(
-                match.group("author")
-            )
-
-            matched_pattern = (
-                f"TITLE_AUTHOR_PATTERN_{pattern_number}"
-            )
-
-            if extracted_title:
-                break
-
-    (
-        extracted_title,
-        extracted_author,
-        validation_warnings,
-    ) = validate_extracted_identity(
-        title=extracted_title,
-        author=extracted_author,
-    )
-
-    extraction_warnings.extend(
-        validation_warnings
-    )
-
-    isbn_match = ISBN_PATTERN.search(
-        normalized_text
-    )
-
-    possible_isbn = (
-        normalize_isbn(
-            isbn_match.group("isbn")
-        )
-        if isbn_match
-        else None
-    )
-
-    extraction_confidence = 0.90
-
-    if matched_pattern and matched_pattern.startswith(
-        "TITLE_DESCRIPTION_PATTERN_"
-    ):
-        extraction_confidence = 0.85
-
-    if not extracted_author:
-        extraction_confidence = min(
-            extraction_confidence,
-            0.80,
-        )
-
-    if possible_isbn:
-        extraction_confidence = min(
-            0.95,
-            extraction_confidence + 0.03,
-        )
-
     return {
-        "extracted_title": extracted_title,
-        "extracted_author": extracted_author,
-        "possible_isbn": possible_isbn,
-        "extraction_confidence": extraction_confidence,
-        "matched_pattern": matched_pattern,
-        "warnings": extraction_warnings,
+        "extracted_title": result.extracted_title,
+        "extracted_author": result.extracted_author,
+        "possible_isbn": result.possible_isbn,
+        "extraction_confidence": result.extraction_confidence,
+        "matched_pattern": result.matched_pattern,
+        "warnings": list(result.warnings),
     }
 
 
@@ -1273,8 +956,15 @@ def create_one_candidate(
     confirm_create: bool,
     non_interactive: bool,
     link_images: bool,
-) -> str:
-    """Create one candidate from one prepared extraction."""
+) -> tuple[str, str | None]:
+    """Create one candidate from one prepared extraction.
+
+    Returns (status, candidate_code) -- candidate_code is populated for
+    CREATED and DUPLICATE_CANDIDATE (the existing one), None for
+    CANCELLED. Callers that need the exact candidate codes created by an
+    automatic-extraction run (scripts/watch_facebook_clipboard.py's
+    --process chain) rely on this.
+    """
     raw_page_id = str(
         raw_page["raw_page_id"]
     )
@@ -1307,7 +997,7 @@ def create_one_candidate(
             "Extracted title: "
             f"{existing_candidate.get('extracted_title')}"
         )
-        return "DUPLICATE_CANDIDATE"
+        return "DUPLICATE_CANDIDATE", existing_candidate.get("candidate_code")
 
     candidate_code = get_next_candidate_code(
         repository=repository,
@@ -1362,7 +1052,7 @@ def create_one_candidate(
         print(
             "Candidate creation cancelled."
         )
-        return "CANCELLED"
+        return "CANCELLED", None
 
     payload = build_candidate_payload(
         batch=batch,
@@ -1515,7 +1205,7 @@ def create_one_candidate(
         f"{len(verified_images)}"
     )
 
-    return "CREATED"
+    return "CREATED", verified_candidate.get("candidate_code")
 
 
 def create_candidates_from_page(
@@ -1526,8 +1216,24 @@ def create_candidates_from_page(
     explicit_extractions: list[dict[str, Any]],
     confirm_create: bool,
     non_interactive: bool,
-) -> dict[str, int]:
-    """Create one or more candidates from one cleaned Facebook post."""
+    max_candidates: int,
+) -> tuple[dict[str, int], list[str]]:
+    """Create one or more candidates from one cleaned Facebook post.
+
+    Explicit --candidate-title values keep exactly their prior behavior.
+    With no explicit titles, this now runs deterministic automatic
+    extraction (src.domain.rules.extraction_rules.run_automatic_
+    extraction): ONE_BOOK/MULTIPLE_BOOKS/COMBO create candidates
+    automatically; GENERAL_POST/AMBIGUOUS create none and are reported
+    with their rule_code and reason -- manual --candidate-title remains
+    the fallback for those, never a guess.
+
+    Returns (results_counts, candidate_codes) -- candidate_codes is every
+    candidate code relevant to this raw_page after this call (newly
+    CREATED ones, or the already-existing ones on the idempotent-repeat
+    path below), for callers (scripts/watch_facebook_clipboard.py's
+    --process chain) that need to hand exact codes to run_batch.py.
+    """
     cleaned_text = str(
         raw_page.get("cleaned_text")
         or ""
@@ -1538,76 +1244,173 @@ def create_candidates_from_page(
             "The selected raw page does not contain cleaned_text."
         )
 
-    if explicit_extractions:
-        extractions = explicit_extractions
-    else:
-        extractions = [
-            extract_book_identity(
-                cleaned_text
-            )
-        ]
-
-    ensure_unique_extractions(
-        extractions
-    )
-
-    multi_candidate_run = len(extractions) > 1
-
-    if (
-        multi_candidate_run
-        and candidate_type in {
-            "BOOK_COMBO",
-            "BOOK_SET",
-        }
-    ):
-        raise RuntimeError(
-            "Use one BOOK_COMBO or BOOK_SET candidate for a bundled product. "
-            "Use repeated --candidate-title values only when the Facebook "
-            "post contains multiple distinct sellable products."
-        )
-
-    existing_candidates = get_existing_candidates_for_raw_page(
-        repository=repository,
-        raw_page_id=str(
-            raw_page["raw_page_id"]
-        ),
-    )
-
-    if (
-        existing_candidates
-        and not explicit_extractions
-    ):
-        raise RuntimeError(
-            "This raw page already has candidate records. "
-            "Automatic single-candidate extraction is blocked to avoid "
-            "creating an unintended duplicate. Use explicit --candidate-title "
-            "values if another distinct product must be added."
-        )
+    raw_page_id = str(raw_page["raw_page_id"])
 
     results = {
         "CREATED": 0,
         "DUPLICATE_CANDIDATE": 0,
         "CANCELLED": 0,
+        "AUTO_REJECTED": 0,
+        "REVIEW_REQUIRED": 0,
+        "BLOCKED": 0,
     }
+    created_candidate_codes: list[str] = []
 
-    combo_group_code = None
+    if explicit_extractions:
+        extractions = explicit_extractions
 
-    if candidate_type in {
-        "BOOK_COMBO",
-        "BOOK_SET",
-    }:
+        if len(extractions) > max_candidates:
+            raise RuntimeError(
+                f"{len(extractions)} --candidate-title value(s) exceed "
+                f"--max-candidates ({max_candidates}). Failing before any write."
+            )
+
+        ensure_unique_extractions(extractions)
+
+        multi_candidate_run = len(extractions) > 1
+
+        if (
+            multi_candidate_run
+            and candidate_type in {"BOOK_COMBO", "BOOK_SET"}
+        ):
+            raise RuntimeError(
+                "Use one BOOK_COMBO or BOOK_SET candidate for a bundled product. "
+                "Use repeated --candidate-title values only when the Facebook "
+                "post contains multiple distinct sellable products."
+            )
+
         combo_group_code = (
-            f"{BATCH_CODE}-GROUP-"
-            f"{str(raw_page['raw_page_id'])[:8]}"
+            f"{BATCH_CODE}-GROUP-{raw_page_id[:8]}"
+            if candidate_type in {"BOOK_COMBO", "BOOK_SET"}
+            else None
         )
 
-    for extraction in extractions:
-        status = create_one_candidate(
+        for extraction in extractions:
+            status, candidate_code = create_one_candidate(
+                repository=repository,
+                batch=batch,
+                raw_page=raw_page,
+                extraction=extraction,
+                candidate_type=candidate_type,
+                combo_group_code=combo_group_code,
+                confirm_create=confirm_create,
+                non_interactive=non_interactive,
+                link_images=not multi_candidate_run,
+            )
+
+            results[status] += 1
+
+            if status == "CREATED" and candidate_code:
+                created_candidate_codes.append(candidate_code)
+
+        return results, created_candidate_codes
+
+    # --- automatic mode (no explicit --candidate-title) ---
+
+    existing_candidates = get_existing_candidates_for_raw_page(
+        repository=repository,
+        raw_page_id=raw_page_id,
+    )
+
+    if existing_candidates:
+        # Idempotent: this raw_page was already processed by a prior
+        # run. Report the existing candidates instead of raising or
+        # creating an unintended duplicate (Phase 8: running extraction
+        # twice must not create duplicate candidates).
+        print()
+        print("=" * 78)
+        print("EXTRACTION ALREADY COMPLETE FOR THIS POST")
+        print("=" * 78)
+        print(f"Rule code: {extraction_rules.EXTRACTION_DUPLICATE}")
+        print(
+            "This raw page already has "
+            f"{len(existing_candidates)} candidate(s) from a previous "
+            "extraction run."
+        )
+
+        existing_codes: list[str] = []
+
+        for existing in existing_candidates:
+            code = existing.get("candidate_code")
+            print(f"  - {code} | {existing.get('extracted_title')}")
+
+            if code:
+                existing_codes.append(code)
+
+        results["DUPLICATE_CANDIDATE"] = len(existing_candidates)
+        return results, existing_codes
+
+    extraction_run = extraction_rules.run_automatic_extraction(cleaned_text)
+    decision = extraction_run.decision
+
+    print()
+    print(
+        f"Post classified as: {extraction_run.post_type} "
+        f"({decision.rule_code})"
+    )
+
+    if decision.outcome == Outcome.AUTO_REJECT:
+        print(f"Reason: {decision.reason}")
+        print("No candidate created (general/non-product post).")
+        results["AUTO_REJECTED"] += 1
+        return results, []
+
+    if decision.outcome == Outcome.REVIEW_REQUIRED:
+        print(f"Reason: {decision.reason}")
+        print(
+            "No candidate created automatically. Fallback: supply "
+            "--candidate-title explicitly (and --candidate-author/"
+            "--possible-isbn if known) to create it manually."
+        )
+        results["REVIEW_REQUIRED"] += 1
+        return results, []
+
+    if decision.outcome == Outcome.BLOCKED:
+        print(f"Reason: {decision.reason}")
+        print("No candidate created.")
+        results["BLOCKED"] += 1
+        return results, []
+
+    # AUTO_PASS
+    if len(extraction_run.candidates) > max_candidates:
+        print(
+            f"{len(extraction_run.candidates)} candidate(s) were "
+            f"identified, exceeding --max-candidates ({max_candidates}). "
+            "Refusing to create any of them in this run rather than "
+            "silently truncating the list."
+        )
+        results["BLOCKED"] += 1
+        return results, []
+
+    extractions = [
+        {
+            "extracted_title": candidate.extracted_title,
+            "extracted_author": candidate.extracted_author,
+            "possible_isbn": candidate.possible_isbn,
+            "extraction_confidence": candidate.extraction_confidence,
+            "matched_pattern": candidate.matched_pattern,
+            "warnings": list(candidate.warnings),
+        }
+        for candidate in extraction_run.candidates
+    ]
+
+    ensure_unique_extractions(extractions)
+
+    multi_candidate_run = len(extractions) > 1
+
+    combo_group_code = (
+        f"{BATCH_CODE}-GROUP-{raw_page_id[:8]}"
+        if extraction_run.post_type == extraction_rules.PostType.COMBO
+        else None
+    )
+
+    for extraction, candidate in zip(extractions, extraction_run.candidates):
+        status, candidate_code = create_one_candidate(
             repository=repository,
             batch=batch,
             raw_page=raw_page,
             extraction=extraction,
-            candidate_type=candidate_type,
+            candidate_type=candidate.candidate_type,
             combo_group_code=combo_group_code,
             confirm_create=confirm_create,
             non_interactive=non_interactive,
@@ -1616,7 +1419,10 @@ def create_candidates_from_page(
 
         results[status] += 1
 
-    return results
+        if status == "CREATED" and candidate_code:
+            created_candidate_codes.append(candidate_code)
+
+    return results, created_candidate_codes
 
 
 
@@ -1678,7 +1484,7 @@ def main() -> None:
         non_interactive=args.non_interactive,
     )
 
-    results = create_candidates_from_page(
+    results, candidate_codes = create_candidates_from_page(
         repository=repository,
         batch=batch,
         raw_page=selected_raw_page,
@@ -1686,6 +1492,7 @@ def main() -> None:
         explicit_extractions=explicit_extractions,
         confirm_create=args.confirm_create,
         non_interactive=args.non_interactive,
+        max_candidates=args.max_candidates,
     )
 
     print()
@@ -1699,6 +1506,9 @@ def main() -> None:
         print(
             f"{status}: {count}"
         )
+
+    print()
+    print(format_candidate_codes_line(candidate_codes))
 
     print()
     print(

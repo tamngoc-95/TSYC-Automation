@@ -68,6 +68,7 @@ class FakeQueryBuilder:
         self._payload: Any = None
         self._eq_filters: list[tuple[str, Any]] = []
         self._not_null_filters: list[str] = []
+        self._null_filters: list[str] = []
         self._orders: list[tuple[str, bool]] = []
         self._limit_n: int | None = None
 
@@ -97,6 +98,18 @@ class FakeQueryBuilder:
         self._eq_filters.append((column, value))
         return self
 
+    def is_(self, column: str, value: str) -> "FakeQueryBuilder":
+        """Mimic the bare `.is_(column, "null")` IS NULL filter (distinct
+        from `.not_.is_(column, "null")`'s IS NOT NULL, above)."""
+        if value != "null":
+            raise NotImplementedError(
+                "FakeQueryBuilder.is_() only supports the 'null' sentinel "
+                f"used by the pipeline scripts, got: {value!r}"
+            )
+
+        self._null_filters.append(column)
+        return self
+
     @property
     def not_(self) -> _NotProxy:
         return _NotProxy(self)
@@ -118,6 +131,10 @@ class FakeQueryBuilder:
 
         for column in self._not_null_filters:
             if row.get(column) is None:
+                return False
+
+        for column in self._null_filters:
+            if row.get(column) is not None:
                 return False
 
         return True
