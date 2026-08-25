@@ -222,6 +222,79 @@ class FakeSupabaseRepository:
     ) -> None:
         self.client = FakeSupabaseClient(tables)
 
+    def get_batch_by_code(
+        self,
+        batch_code: str,
+    ) -> dict[str, Any] | None:
+        """Mirror SupabaseRepository.get_batch_by_code() for offline tests."""
+        rows = (
+            self.client.table("batches")
+            .select("*")
+            .eq("batch_code", batch_code)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+
+        return rows[0] if rows else None
+
+    def save_source_url(
+        self,
+        batch_id: str,
+        source_url: str,
+        selection_reason: str | None = None,
+        active: bool = True,
+        source_type: str = "FACEBOOK_POST",
+    ) -> dict[str, Any]:
+        """Mirror SupabaseRepository.save_source_url() for offline tests.
+
+        The real method upserts on (batch_id, source_type, source_url);
+        FakeQueryBuilder has no .upsert(), so this replicates the same
+        insert-or-update-on-conflict semantics using only its already-
+        supported select/insert/update operations.
+        """
+        payload = {
+            "batch_id": batch_id,
+            "source_type": source_type,
+            "source_url": source_url,
+            "source_name": selection_reason,
+            "is_authorized": active,
+            "crawl_status": "PENDING" if active else "SKIPPED",
+        }
+
+        existing_rows = (
+            self.client.table("source_urls")
+            .select("*")
+            .eq("batch_id", batch_id)
+            .eq("source_type", source_type)
+            .eq("source_url", source_url)
+            .execute()
+            .data
+            or []
+        )
+
+        if existing_rows:
+            response = (
+                self.client.table("source_urls")
+                .update(payload)
+                .eq("batch_id", batch_id)
+                .eq("source_type", source_type)
+                .eq("source_url", source_url)
+                .execute()
+            )
+        else:
+            response = (
+                self.client.table("source_urls")
+                .insert(payload)
+                .execute()
+            )
+
+        if not response.data:
+            raise RuntimeError(f"Source URL upsert returned no data: {source_url}")
+
+        return response.data[0]
+
     def write_process_log(
         self,
         message: str,
