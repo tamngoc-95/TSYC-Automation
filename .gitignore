@@ -30,6 +30,8 @@ data/raw/*
 data/processed/*
 data/output/*
 data/raw/facebook-images/
+facebook_export_filelist.txt*
+facebook-vothitam2810-*
 
 # Keep folder placeholders
 !data/raw/.gitkeep
