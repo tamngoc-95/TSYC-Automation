@@ -660,6 +660,49 @@ def is_reference_evaluable(reference: dict[str, Any]) -> bool:
     return bool((reference.get("reference_title") or "").strip())
 
 
+_REFERENCE_CROSS_CORROBORATION_THRESHOLD = 0.60
+
+
+def _rejecting_references_corroborate_each_other(
+    confirmed_no_matches: Sequence[tuple[dict[str, Any], DecisionResult]],
+) -> bool:
+    """
+    True when 2+ references that each individually AUTO_REJECTed against
+    the candidate nonetheless largely agree with EACH OTHER on title.
+
+    Live incident this guards against: historical candidate CAN-0004,
+    extracted_title "Power vs. Force" (short, from a Facebook post).
+    Both of its registered references were confidently AUTO_REJECTed
+    individually -- title_similarity between "power vs force" and each
+    reference's full official title (e.g. "Power Vs Force - Trường Năng
+    Lượng Và Những Nhân Tố Quyết Định Hành Vi Của Con Người") fell below
+    the 0.60 threshold purely because of the huge length difference, not
+    because the book is actually different. Both references agreed with
+    each other on author, publisher, and page count -- and, decisively,
+    scored similar to EACH OTHER on title (both share the same long
+    official title pattern) even though neither scored similar to the
+    short candidate title. That is exactly the "candidate's own title is
+    abbreviated" signal, not "multiple credible sources confirm this is
+    a different book" -- collapsing straight to AUTO_REJECT there was
+    itself a false-conflict bug of the same shape this module exists to
+    eliminate elsewhere.
+
+    A single confirmed_no_matches entry (nothing to corroborate against)
+    always returns False -- unchanged, confident AUTO_REJECT behavior.
+    """
+    if len(confirmed_no_matches) < 2:
+        return False
+
+    titles = [reference.get("reference_title") for reference, _res in confirmed_no_matches]
+
+    return any(
+        calculate_similarity(titles[i], titles[j])
+        >= _REFERENCE_CROSS_CORROBORATION_THRESHOLD
+        for i in range(len(titles))
+        for j in range(i + 1, len(titles))
+    )
+
+
 def evaluate_candidate_identity(
     candidate: dict[str, Any],
     references: Sequence[dict[str, Any]],
@@ -878,11 +921,23 @@ def evaluate_candidate_identity(
             confidence=consensus.confidence,
         )
 
-    if confirmed_no_matches and len(confirmed_no_matches) == len(per_reference):
+    if (
+        confirmed_no_matches
+        and len(confirmed_no_matches) == len(per_reference)
+        and not _rejecting_references_corroborate_each_other(confirmed_no_matches)
+    ):
         # Every usable reference -- and there is at least one -- is a
-        # real, evaluated disagreement. This is the only path an
-        # AUTO_REJECT survives aggregation: no usable reference
-        # supports the candidate at all.
+        # real, evaluated disagreement, AND (when there are 2+) they
+        # don't even agree with each other. This is the only path an
+        # AUTO_REJECT survives aggregation: no usable reference supports
+        # the candidate, and there is no sign the rejection is an
+        # artifact of the candidate's own extracted title being short/
+        # abbreviated rather than the book actually being different --
+        # see _rejecting_references_corroborate_each_other's docstring
+        # for the live incident (CAN-0004 "Power vs. Force") this guards
+        # against. CLAUDE.md 5.2: do not stop on low string similarity
+        # alone when stronger evidence (here: multiple sources agreeing
+        # with each other) resolves identity.
         _worst_ref, worst_res = max(
             confirmed_no_matches, key=lambda pair: pair[1].confidence or 0.0
         )
@@ -896,6 +951,33 @@ def evaluate_candidate_identity(
                 "has_genuine_conflict": True,
             },
             confidence=worst_res.confidence,
+        )
+
+    if confirmed_no_matches and len(confirmed_no_matches) == len(per_reference):
+        # Every usable reference individually rejected the candidate,
+        # but (per the guard above) they corroborate each other on
+        # title -- this is evidence the candidate's own extracted title
+        # is short/abbreviated relative to each reference's full
+        # official title, not evidence the book itself is different.
+        # REVIEW_REQUIRED with its own accurate reasoning -- never
+        # IDENTITY_CONFIRMED_NO_MATCH's rule_code/reason, which would
+        # misdescribe a REVIEW_REQUIRED outcome as a confirmed reject.
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=IDENTITY_INSUFFICIENT_EVIDENCE,
+            reason=(
+                "Every reference individually scored low title "
+                "similarity against the candidate's extracted title, "
+                "but the references agree closely with each other -- "
+                "the candidate's own extracted title is likely "
+                "abbreviated rather than the book being different."
+            ),
+            evidence={
+                **base_evidence,
+                "has_genuine_conflict": False,
+                "match_decision": MatchDecision.POSSIBLE_MATCH,
+            },
+            confidence=max(res.confidence or 0.0 for _r, res in confirmed_no_matches),
         )
 
     # Insufficient (or conflicting-but-inconclusive) evidence -- review.

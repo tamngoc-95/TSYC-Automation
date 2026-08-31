@@ -460,6 +460,72 @@ def test_strong_pass_plus_genuine_no_match_is_a_real_conflict():
     assert result.evidence["has_genuine_conflict"] is True
 
 
+def test_abbreviated_candidate_title_with_two_corroborating_long_titles_is_not_a_false_reject():
+    """Live incident: historical candidate CAN-0004 ('Power vs. Force',
+    a short Facebook-extracted title). Both of its registered references
+    carry the full, much longer official subtitle and individually
+    AUTO_REJECT (title_similarity < 0.60 against the short candidate
+    title) -- but they closely agree with EACH OTHER. That must not
+    collapse to a confident AUTO_REJECT/CONFLICT; it must become
+    REVIEW_REQUIRED, since the low similarity is an artifact of the
+    candidate's own abbreviated title, not evidence of a different book
+    (CLAUDE.md 5.2)."""
+    candidate = _candidate("Power vs. Force")
+    ref_a = _reference(
+        reference_id="fahasa",
+        reference_title=(
+            "Power Vs Force - Trường Năng Lượng Và Những Nhân Tố Quyết "
+            "Định Hành Vi Của Con Người (Tái Bản)"
+        ),
+        reference_author="David R Hawkins",
+        reference_publisher="NXB Thế Giới",
+        reference_page_count=398,
+    )
+    ref_b = _reference(
+        reference_id="neta",
+        reference_title=(
+            "Power Vs Force - Trường Năng Lượng Và Những Nhân Tố Quyết "
+            "Định Tinh Thần, Sức Khỏe Con Người (Bìa Cứng)"
+        ),
+        reference_author="David R. Hawkins",
+        reference_publisher="Thế Giới",
+        reference_page_count=398,
+    )
+
+    result = rules.evaluate_candidate_identity(candidate, [ref_a, ref_b])
+
+    assert result.outcome == Outcome.REVIEW_REQUIRED
+    assert result.outcome != Outcome.AUTO_REJECT
+    assert result.rule_code == rules.IDENTITY_INSUFFICIENT_EVIDENCE
+    assert result.evidence["has_genuine_conflict"] is False
+
+
+def test_two_genuinely_unrelated_rejecting_references_still_confirm_no_match():
+    """The guard above must not swallow a real rejection: two references
+    that reject the candidate AND disagree with each other is still a
+    confident, genuine AUTO_REJECT."""
+    candidate = _candidate("Some Book")
+    ref_a = _reference(reference_id="a", reference_title="Completely Different Novel About Ships")
+    ref_b = _reference(reference_id="b", reference_title="A Cookbook For Weekend Brunch")
+
+    result = rules.evaluate_candidate_identity(candidate, [ref_a, ref_b])
+
+    assert result.outcome == Outcome.AUTO_REJECT
+    assert result.evidence["has_genuine_conflict"] is True
+
+
+def test_single_rejecting_reference_is_still_a_confident_reject():
+    """A lone rejecting reference has nothing to corroborate against --
+    the guard only applies with 2+ rejecting references."""
+    candidate = _candidate("Doraemon Tap 1")
+    lone_reject = _reference(reference_id="r1", reference_title="Totally Unrelated Cooking Manual")
+
+    result = rules.evaluate_candidate_identity(candidate, [lone_reject])
+
+    assert result.outcome == Outcome.AUTO_REJECT
+    assert result.evidence["has_genuine_conflict"] is True
+
+
 def test_G_unvalidated_isbn_never_becomes_the_consensus_isbn():
     """Two sources agreeing on title/author but one carrying a
     barcode-shaped, non-ISBN value must still AUTO_PASS (consensus
