@@ -390,6 +390,47 @@ def test_I_publisher_conflict_blocks_verification_no_silent_winner():
 # --------------------------------------------------------------------------
 
 
+def test_stale_match_decision_on_an_unusable_reference_is_cleared_not_left():
+    """A reference row that was wrongly evaluated to NO_MATCH before
+    hardening (empty title, evaluated anyway) must have that stale
+    match_decision cleared back to NULL -- even once the candidate-level
+    decision itself is unchanged and would otherwise be a pure NO_OP --
+    never left standing as if it were still a real, current decision."""
+    candidate = make_candidate(title="Nỗi Buồn Chiến Tranh")
+    good = make_reference(
+        "netabooks", title="Nỗi Buồn Chiến Tranh", author="Bảo Ninh", source_priority=3,
+    )
+    stale_unusable = make_reference(
+        "fahasa-empty",
+        source_type="FAHASA",
+        source_priority=4,
+        match_decision="NO_MATCH",  # stale, from a pre-hardening run
+        match_confidence=1.0,
+    )
+    repository = make_repository([candidate], [good, stale_unusable])
+
+    first = mci.evaluate_and_apply_decision(
+        repository=repository, candidate=candidate,
+        references=[good, stale_unusable], confirm_save=True,
+    )
+    assert first["action"].startswith("WROTE:")
+
+    stale_row_after_first = next(
+        r for r in fetch_references(repository, "cand-1") if r["reference_id"] == "fahasa-empty"
+    )
+    assert stale_row_after_first["match_decision"] is None
+    assert stale_row_after_first["match_confidence"] is None
+
+    # Rerunning now must be a true no-op (nothing left to clear, nothing
+    # about the decision changed).
+    updated_candidate = fetch_candidate(repository, "cand-1")
+    second = mci.evaluate_and_apply_decision(
+        repository=repository, candidate=updated_candidate,
+        references=fetch_references(repository, "cand-1"), confirm_save=True,
+    )
+    assert second["action"] == "NO_OP"
+
+
 def test_J_recompute_twice_with_same_evidence_second_run_is_no_op():
     candidate = make_candidate(title="Cây cam ngọt của tôi")
     fahasa = make_reference(

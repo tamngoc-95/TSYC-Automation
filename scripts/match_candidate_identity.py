@@ -2044,9 +2044,14 @@ def apply_reference_match_decisions(
     match_confidence (evaluate_single_reference_identity, thresholds
     unchanged) -- but only when it actually differs from what is
     already stored, so an unchanged rerun never rewrites an identical
-    reference row. Unusable references are never written here -- their
-    match_decision stays NULL, which already means "not yet evaluated"
-    in the existing schema; no new enum value is needed for "unusable".
+    reference row. An UNUSABLE reference is never evaluated here -- but
+    if it already carries a stale match_decision from before this
+    hardening (a pre-hardening run's per-reference NO_MATCH against
+    missing metadata -- exactly the CAN-0015/CAN-0039 incident shape),
+    that stale value is cleared back to NULL, which already means "not
+    yet evaluated" in the existing schema. This never fabricates a
+    decision for an unusable reference -- it only ever removes a wrong
+    one that should never have been written.
 
     Returns the number of reference rows actually updated.
     """
@@ -2054,6 +2059,26 @@ def apply_reference_match_decisions(
 
     for reference in references:
         if not identity_rules.is_reference_evaluable(reference):
+            if reference.get("match_decision") is not None:
+                response = (
+                    repository.client
+                    .table("product_references")
+                    .update(
+                        {
+                            "match_decision": None,
+                            "match_confidence": None,
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    .eq("reference_id", reference["reference_id"])
+                    .execute()
+                )
+                if not response.data:
+                    raise RuntimeError(
+                        "Product reference stale-decision clear returned no "
+                        f"data for reference_id={reference.get('reference_id')}."
+                    )
+                updated_count += 1
             continue
 
         result = identity_rules.evaluate_single_reference_identity(
@@ -2163,13 +2188,42 @@ def evaluate_and_apply_decision(
         "has_genuine_conflict": decision.evidence.get("has_genuine_conflict"),
     }
 
-    if stored_fingerprint == fingerprint:
+    stale_unusable_reference_ids = [
+        reference.get("reference_id")
+        for reference in references
+        if not identity_rules.is_reference_evaluable(reference)
+        and reference.get("match_decision") is not None
+    ]
+
+    if stored_fingerprint == fingerprint and not stale_unusable_reference_ids:
         print()
         print(
             "NO_OP: decision unchanged since the last evaluation "
             "(fingerprint match). No write performed."
         )
         return {**base_result, "action": "NO_OP"}
+
+    if stored_fingerprint == fingerprint and stale_unusable_reference_ids:
+        # The candidate-level decision itself is unchanged, but one or
+        # more unusable references still carry a stale match_decision
+        # from before this hardening (the exact CAN-0015/CAN-0039
+        # incident shape) -- clear it. Not a NO_OP: this is a real,
+        # one-time correction, not a decision change.
+        print()
+        print(
+            "Decision unchanged, but "
+            f"{len(stale_unusable_reference_ids)} unusable reference(s) "
+            "still carry a stale match_decision from before hardening -- "
+            "clearing."
+        )
+        if not confirm_save:
+            return {**base_result, "action": "WOULD_CLEAR_STALE_UNUSABLE_DECISIONS"}
+        cleared_count = apply_reference_match_decisions(repository, candidate, references)
+        return {
+            **base_result,
+            "action": "CLEARED_STALE_UNUSABLE_DECISIONS",
+            "reference_rows_updated": cleared_count,
+        }
 
     current_status = candidate.get("identity_status")
 
