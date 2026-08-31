@@ -660,6 +660,45 @@ def is_reference_evaluable(reference: dict[str, Any]) -> bool:
     return bool((reference.get("reference_title") or "").strip())
 
 
+_TITLE_CONTAINMENT_MIN_COVERAGE = 0.8
+
+
+def _is_short_title_contained_in_long(
+    short_title: str | None,
+    long_title: str | None,
+    min_coverage: float = _TITLE_CONTAINMENT_MIN_COVERAGE,
+) -> bool:
+    """
+    True when the shorter title's significant words are substantially
+    present in the longer title's words -- i.e. the shorter title reads
+    as an abbreviation of the longer one, not a different book.
+    Word-set containment, so it is order- and punctuation-insensitive:
+    exactly what a title shortened for a Facebook post (or a reference
+    site's much longer official listing, subtitle, series name, or
+    edition tag) looks like next to a full title. Requires at least one
+    significant word on each side -- two empty/near-empty titles never
+    "contain" each other.
+
+    This is the general form of the CAN-0004 ("Power vs. Force")
+    incident from _rejecting_references_corroborate_each_other, but
+    applies per-reference rather than only when 2+ references reject in
+    agreement -- it is what's needed to correctly handle a single-
+    reference candidate whose extracted title is fully contained in a
+    much longer official reference title (confirmed live on
+    "Học Montessori - 100 Hoạt Động Montessori", contained inside "Học
+    Montessori Để Dạy Trẻ Theo Phương Pháp Montessori - 100 Hoạt Động
+    Montessori: Con Không Cần Ipad Để Lớn Khôn").
+    """
+    short_tokens = set(normalize_text(short_title).split())
+    long_tokens = set(normalize_text(long_title).split())
+
+    if not short_tokens or not long_tokens:
+        return False
+
+    covered = len(short_tokens & long_tokens) / len(short_tokens)
+    return covered >= min_coverage
+
+
 _REFERENCE_CROSS_CORROBORATION_THRESHOLD = 0.60
 
 
@@ -819,8 +858,40 @@ def evaluate_candidate_identity(
         for reference in usable
     ]
 
+    candidate_title = candidate.get("extracted_title")
+
+    def _is_confirmed_reject(reference: dict[str, Any], result: DecisionResult) -> bool:
+        """
+        A result only counts as a *confirmed* reject -- real negative
+        evidence -- if it isn't explained away by the candidate's own
+        title being a short/abbreviated version of the reference's
+        title, or vice versa (see _is_short_title_contained_in_long's
+        docstring for the live incident this fixes: a single-reference
+        candidate whose extracted title is fully contained in a much
+        longer official title, e.g. "Học Montessori - 100 Hoạt Động
+        Montessori" inside "Học Montessori Để Dạy Trẻ Theo Phương Pháp
+        Montessori - 100 Hoạt Động Montessori: Con Không Cần Ipad Để
+        Lớn Khôn", was landing as a confident AUTO_REJECT with only one
+        reference to compare against -- title length mismatch alone,
+        not evidence of a different book). An ISBN-conflict reject is
+        never downgraded this way -- that is independent, decisive
+        negative evidence unrelated to title wording.
+        """
+        if not result.is_auto_reject:
+            return False
+        if result.evidence.get("isbn_conflict"):
+            return True
+        reference_title = reference.get("reference_title")
+        if _is_short_title_contained_in_long(
+            candidate_title, reference_title
+        ) or _is_short_title_contained_in_long(reference_title, candidate_title):
+            return False
+        return True
+
     strong_passes = [(r, res) for r, res in per_reference if res.is_auto_pass]
-    confirmed_no_matches = [(r, res) for r, res in per_reference if res.is_auto_reject]
+    confirmed_no_matches = [
+        (r, res) for r, res in per_reference if _is_confirmed_reject(r, res)
+    ]
 
     if strong_passes and confirmed_no_matches:
         best_pass_ref, _best_pass_res = max(
@@ -1010,16 +1081,34 @@ def evaluate_candidate_identity(
     # so a confirmed-reject's confidence never masquerades as "the best
     # available review reasoning" for an outcome that isn't a rejection.
     review_candidates = [
-        (r, res) for r, res in per_reference if not res.is_auto_reject
+        (r, res) for r, res in per_reference if not _is_confirmed_reject(r, res)
     ] or per_reference
     best_ref, best_res = max(
         review_candidates, key=lambda pair: pair[1].confidence or 0.0
     )
 
+    # best_res may be a reclassified (title-containment) reject -- its
+    # own rule_code/reason still literally say "too different", which
+    # would misdescribe a REVIEW_REQUIRED outcome as a confirmed
+    # rejection. Use accurate, generic reasoning for that case instead.
+    if has_conflict_signal:
+        fallback_rule_code = consensus.rule_code
+        fallback_reason = consensus.reason
+    elif best_res.is_auto_reject:
+        fallback_rule_code = IDENTITY_INSUFFICIENT_EVIDENCE
+        fallback_reason = (
+            "The candidate's extracted title is short relative to the "
+            "reference's full title, so title similarity alone is "
+            "inconclusive; the available metadata is not conclusive."
+        )
+    else:
+        fallback_rule_code = best_res.rule_code
+        fallback_reason = best_res.reason
+
     return DecisionResult(
         outcome=Outcome.REVIEW_REQUIRED,
-        rule_code=consensus.rule_code if has_conflict_signal else best_res.rule_code,
-        reason=consensus.reason if has_conflict_signal else best_res.reason,
+        rule_code=fallback_rule_code,
+        reason=fallback_reason,
         evidence={
             **base_evidence,
             **(consensus.evidence if has_conflict_signal else best_res.evidence),

@@ -574,6 +574,68 @@ def test_two_rejecting_references_with_different_specific_authors_still_confirm_
     assert result.evidence["has_genuine_conflict"] is True
 
 
+# --------------------------------------------------------------------------
+# Single-reference title containment: the general form of the CAN-0004
+# incident, but with only ONE reference to compare against (so the 2+-
+# reference corroboration checks above can't apply). Live incident:
+# historical candidate CAN-0025 ("Học Montessori - 100 Hoạt Động
+# Montessori"), whose single registered reference carried the full
+# official title including series name, method description, and
+# subtitle -- fully containing the candidate's title as a word set, but
+# scoring low SequenceMatcher similarity purely from length.
+# --------------------------------------------------------------------------
+
+
+def test_single_reference_with_candidate_title_contained_in_a_long_official_title_is_not_a_false_reject():
+    candidate = _candidate("Học Montessori - 100 Hoạt Động Montessori")
+    long_official_title = _reference(
+        reference_id="fahasa",
+        reference_title=(
+            "Học Montessori Để Dạy Trẻ Theo Phương Pháp Montessori - 100 "
+            "Hoạt Động Montessori: Con Không Cần Ipad Để Lớn Khôn"
+        ),
+        reference_author="Ève Herrmann",
+    )
+
+    result = rules.evaluate_candidate_identity(candidate, [long_official_title])
+
+    assert result.outcome == Outcome.REVIEW_REQUIRED
+    assert result.outcome != Outcome.AUTO_REJECT
+    assert result.evidence["has_genuine_conflict"] is False
+
+
+def test_single_reference_genuinely_unrelated_title_still_confirms_no_match():
+    """The containment guard must not swallow a real single-reference
+    rejection: a short candidate title whose words simply aren't present
+    in an unrelated reference title is still a confident AUTO_REJECT."""
+    candidate = _candidate("Giận")
+    unrelated = _reference(
+        reference_id="r1", reference_title="Totally Unrelated Cooking Manual",
+    )
+
+    result = rules.evaluate_candidate_identity(candidate, [unrelated])
+
+    assert result.outcome == Outcome.AUTO_REJECT
+    assert result.evidence["has_genuine_conflict"] is True
+
+
+def test_isbn_conflict_reject_is_never_downgraded_by_title_containment():
+    """An ISBN-conflict reject must never be reclassified by the title-
+    containment check, even if the titles would otherwise "contain" each
+    other -- conflicting valid ISBNs are decisive, independent evidence."""
+    candidate = _candidate("Some Book", isbn="9786041234567")
+    same_title_different_isbn = _reference(
+        reference_id="r1",
+        reference_title="Some Book - Special Extended Edition",
+        reference_isbn="9786049999999",
+    )
+
+    result = rules.evaluate_candidate_identity(candidate, [same_title_different_isbn])
+
+    assert result.outcome == Outcome.AUTO_REJECT
+    assert result.evidence["has_genuine_conflict"] is True
+
+
 def test_G_unvalidated_isbn_never_becomes_the_consensus_isbn():
     """Two sources agreeing on title/author but one carrying a
     barcode-shaped, non-ISBN value must still AUTO_PASS (consensus
