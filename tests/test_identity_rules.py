@@ -314,3 +314,260 @@ def test_combo_no_members_requires_review():
     result = rules.evaluate_combo_identity([])
 
     assert result.outcome == Outcome.REVIEW_REQUIRED
+
+
+# --- normalize_publisher / publishers_conflict --------------------------
+
+
+def test_normalize_publisher_strips_leading_nxb():
+    assert rules.normalize_publisher("NXB Hội Nhà Văn") == rules.normalize_text(
+        "Hội Nhà Văn"
+    )
+
+
+def test_normalize_publisher_does_not_corrupt_a_real_name_containing_similar_tokens():
+    """'Nhã Nam' must never be mangled by stripping a bare 'nha' token --
+    only whole leading legal-form phrases are stripped."""
+    assert rules.normalize_publisher("Nhã Nam") == rules.normalize_text("Nhã Nam")
+
+
+def test_publishers_conflict_false_for_single_distinct_value_repeated():
+    assert rules.publishers_conflict(["Trẻ", "Trẻ", None, ""]) is False
+
+
+def test_publishers_conflict_false_after_legal_prefix_normalization():
+    assert rules.publishers_conflict(["NXB Hội Nhà Văn", "Hội Nhà Văn"]) is False
+
+
+def test_publishers_conflict_true_for_materially_different_values():
+    assert (
+        rules.publishers_conflict(["Hội Nhà Văn", "NXB Văn Hoá Sài Gòn"]) is True
+    )
+
+
+def test_publishers_conflict_false_for_all_empty():
+    assert rules.publishers_conflict([None, "", None]) is False
+
+
+# --- is_reference_evaluable --------------------------------------------
+
+
+def test_reference_with_title_is_evaluable():
+    assert rules.is_reference_evaluable({"reference_title": "Some Book"}) is True
+
+
+def test_reference_without_title_is_not_evaluable():
+    assert rules.is_reference_evaluable({"reference_title": None}) is False
+    assert rules.is_reference_evaluable({"reference_title": ""}) is False
+    assert rules.is_reference_evaluable({"reference_title": "   "}) is False
+    assert rules.is_reference_evaluable({}) is False
+
+
+# --- evaluate_candidate_identity: cumulative aggregate -------------------
+#
+# These protect the exact live-incident shapes found on the TSYC
+# historical identity pilot (CAN-0015, CAN-0039) plus the newly hardened
+# ISBN-validation and publisher-conflict gates (Phase 10 A/B/E/G/H/I).
+
+
+def _candidate(title, author=None, isbn=None):
+    return {
+        "extracted_title": title,
+        "extracted_author": author,
+        "possible_isbn": isbn,
+    }
+
+
+def _reference(**overrides):
+    reference = {
+        "reference_id": "ref-1",
+        "reference_title": None,
+        "reference_author": None,
+        "reference_isbn": None,
+        "reference_publisher": None,
+        "reference_page_count": None,
+    }
+    reference.update(overrides)
+    return reference
+
+
+def test_A_good_possible_match_then_empty_reference_does_not_regress():
+    """CAN-0039's exact failure shape: a real reference that produced a
+    valid POSSIBLE_MATCH, plus a second reference whose crawl came back
+    completely empty. The empty reference must never flip this to
+    NO_MATCH/CONFLICT -- regardless of which order they are supplied in."""
+    candidate = _candidate("Nỗi Buồn Chiến Tranh")
+    good = _reference(
+        reference_id="netabooks",
+        reference_title="Nỗi Buồn Chiến Tranh",
+        reference_author="Bảo Ninh",
+        reference_publisher="Trẻ",
+        reference_page_count=348,
+    )
+    empty = _reference(reference_id="fahasa-empty")
+
+    for references in ([good, empty], [empty, good]):
+        result = rules.evaluate_candidate_identity(candidate, references)
+
+        assert result.outcome == Outcome.REVIEW_REQUIRED
+        assert result.evidence["match_decision"] == MatchDecision.POSSIBLE_MATCH
+        assert result.evidence["has_genuine_conflict"] is False
+        assert result.evidence["usable_reference_count"] == 1
+        assert result.evidence["unusable_reference_count"] == 1
+
+
+def test_B_empty_reference_alone_is_not_evaluable_never_confident_no_match():
+    candidate = _candidate("Any Title At All")
+    result = rules.evaluate_candidate_identity(candidate, [_reference()])
+
+    assert result.outcome == Outcome.REVIEW_REQUIRED
+    assert result.rule_code == rules.IDENTITY_NO_USABLE_EVIDENCE
+    assert result.evidence["has_genuine_conflict"] is False
+    assert result.evidence["usable_reference_count"] == 0
+    assert result.evidence["unusable_reference_count"] == 1
+
+
+def test_E_strong_pass_with_only_unusable_extra_reference_preserves_match():
+    candidate = _candidate("Doraemon Tap 1", author="Fujiko F. Fujio")
+    strong = _reference(
+        reference_id="r1", reference_title="Doraemon Tap 1", reference_author="Fujiko F. Fujio"
+    )
+    unusable = _reference(reference_id="r2")
+
+    result = rules.evaluate_candidate_identity(candidate, [strong, unusable])
+
+    assert result.outcome == Outcome.AUTO_PASS
+    assert result.evidence["has_genuine_conflict"] is False
+    assert result.evidence["matching_reference_id"] == "r1"
+
+
+def test_strong_pass_plus_genuine_no_match_is_a_real_conflict():
+    """A different, well-populated reference confidently disagreeing
+    with an otherwise-strong match is exactly the case that must stop
+    for review -- unlike an empty/unusable reference (test_B/E)."""
+    candidate = _candidate("Doraemon Tap 1", author="Fujiko F. Fujio")
+    strong = _reference(
+        reference_id="r1", reference_title="Doraemon Tap 1", reference_author="Fujiko F. Fujio"
+    )
+    disagreeing = _reference(
+        reference_id="r2", reference_title="Totally Unrelated Cooking Manual"
+    )
+
+    result = rules.evaluate_candidate_identity(candidate, [strong, disagreeing])
+
+    assert result.outcome == Outcome.REVIEW_REQUIRED
+    assert result.rule_code == rules.IDENTITY_CONFLICTING_CREDIBLE_SOURCES
+    assert result.evidence["has_genuine_conflict"] is True
+
+
+def test_G_unvalidated_isbn_never_becomes_the_consensus_isbn():
+    """Two sources agreeing on title/author but one carrying a
+    barcode-shaped, non-ISBN value must still AUTO_PASS (consensus
+    doesn't need ISBN), and that value must never appear in
+    valid_isbn_values -- the write layer must not promote it."""
+    candidate = _candidate("Quân khu Nam Đồng")
+    with_bad_isbn = _reference(
+        reference_id="neta",
+        reference_title="Quân Khu Nam Đồng",
+        reference_author="Bình Ca",
+        reference_isbn="2396043028889",  # does not start with 978/979
+        reference_publisher="Trẻ",
+        reference_page_count=440,
+    )
+    clean = _reference(
+        reference_id="fahasa",
+        reference_title="Quân Khu Nam Đồng",
+        reference_author="Bình Ca",
+        reference_publisher="Trẻ",
+        reference_page_count=440,
+    )
+
+    result = rules.evaluate_candidate_identity(candidate, [with_bad_isbn, clean])
+
+    assert result.outcome == Outcome.AUTO_PASS
+    assert result.evidence["valid_isbn_values"] == []
+    assert result.evidence.get("isbn_conflict") is False
+
+
+def test_H_two_conflicting_valid_isbns_requires_review():
+    candidate = _candidate("Some Book")
+    ref_a = _reference(
+        reference_id="a", reference_title="Some Book", reference_isbn="9786041234567"
+    )
+    ref_b = _reference(
+        reference_id="b", reference_title="Some Book", reference_isbn="9786049999999"
+    )
+
+    result = rules.evaluate_candidate_identity(candidate, [ref_a, ref_b])
+
+    assert result.outcome == Outcome.REVIEW_REQUIRED
+    assert result.rule_code == rules.IDENTITY_CONFLICTING_CREDIBLE_SOURCES
+    assert result.evidence["isbn_conflict"] is True
+    assert result.evidence["has_genuine_conflict"] is True
+
+
+def test_I_publisher_conflict_blocks_auto_pass_no_silent_winner():
+    candidate = _candidate("Phía Sau Nghi Can X")
+    ref_a = _reference(
+        reference_id="neta",
+        reference_title="Phía Sau Nghi Can X",
+        reference_author="Higashino Keigo",
+        reference_publisher="Hội Nhà Văn",
+    )
+    ref_b = _reference(
+        reference_id="fahasa",
+        reference_title="Phía Sau Nghi Can X",
+        reference_author="Higashino Keigo",
+        reference_publisher="NXB Văn Hoá Sài Gòn",
+    )
+
+    result = rules.evaluate_candidate_identity(candidate, [ref_a, ref_b])
+
+    assert result.outcome == Outcome.REVIEW_REQUIRED
+    assert result.rule_code == rules.IDENTITY_CONFLICTING_CREDIBLE_SOURCES
+    assert result.evidence["publisher_conflict"] is True
+    assert result.evidence["has_genuine_conflict"] is True
+
+
+def test_consensus_two_agreeing_sources_still_auto_passes_with_hardening():
+    """The hardening must not weaken the existing, working consensus
+    path: two independent, fully agreeing sources still AUTO_PASS."""
+    candidate = _candidate("Đời ngắn đừng ngủ dài")
+    ref_a = _reference(
+        reference_id="a",
+        reference_title="Đời Ngắn Đừng Ngủ Dài",
+        reference_author="Robin Sharma",
+        reference_publisher="Trẻ",
+        reference_page_count=228,
+    )
+    ref_b = _reference(
+        reference_id="b",
+        reference_title="Đời Ngắn Đừng Ngủ Dài",
+        reference_author="Robin Sharma",
+        reference_publisher="Trẻ",
+        reference_page_count=228,
+    )
+
+    result = rules.evaluate_candidate_identity(candidate, [ref_a, ref_b])
+
+    assert result.outcome == Outcome.AUTO_PASS
+    assert result.rule_code == rules.IDENTITY_EXACT_TITLE_AUTHOR
+
+
+def test_evaluate_candidate_identity_is_order_independent():
+    """Same reference set, different order, must yield the identical
+    decision -- true idempotency depends on this."""
+    candidate = _candidate("Nỗi Buồn Chiến Tranh")
+    good = _reference(
+        reference_id="netabooks",
+        reference_title="Nỗi Buồn Chiến Tranh",
+        reference_author="Bảo Ninh",
+    )
+    empty = _reference(reference_id="fahasa-empty")
+
+    result_1 = rules.evaluate_candidate_identity(candidate, [good, empty])
+    result_2 = rules.evaluate_candidate_identity(candidate, [empty, good])
+
+    assert result_1.outcome == result_2.outcome
+    assert result_1.rule_code == result_2.rule_code
+    assert result_1.confidence == result_2.confidence
