@@ -498,6 +498,7 @@ def save_content(
     approve: bool,
     generation_method: str | None = None,
     review_notes: str | None = None,
+    status_override: str | None = None,
 ) -> dict[str, Any]:
     """
     Insert or update one Vietnamese content record atomically as possible.
@@ -506,13 +507,23 @@ def save_content(
     --action REVISE to record that a write came from human review rather
     than the rule-based generator. Callers that omit them (the original
     SAVE/APPROVE flow) get the original inferred values, unchanged.
+
+    status_override lets a caller write ContentStatus.REVIEW_REQUIRED
+    explicitly -- used only by the automatic-approval-declined path in
+    main() below, when a non-interactive --action APPROVE attempt fails
+    deterministic validation. It always wins over `approve` when set.
     """
     now = utc_now()
     # Written to both product_contents.content_status and
-    # internal_products.content_status below -- APPROVED/DRAFTED are valid
-    # members of both (src.domain.content_status) enums, so one shared
-    # string is correct for both writes.
-    status = ContentStatus.APPROVED if approve else ContentStatus.DRAFTED
+    # internal_products.content_status below -- APPROVED/DRAFTED/
+    # REVIEW_REQUIRED are valid members of both (src.domain.content_status)
+    # enums, so one shared string is correct for both writes.
+    if status_override is not None:
+        status = status_override
+    else:
+        status = ContentStatus.APPROVED if approve else ContentStatus.DRAFTED
+
+    is_approved = status == ContentStatus.APPROVED
 
     payload = {
         **content,
@@ -529,20 +540,20 @@ def save_content(
         ),
         "generator_name": GENERATOR_NAME,
         "generator_version": GENERATOR_VERSION,
-        "review_required": not approve,
+        "review_required": not is_approved,
         "review_notes": (
             review_notes
             if review_notes is not None
             else (
                 "Content reviewed and approved for WooCommerce draft."
-                if approve
+                if is_approved
                 else (
                     "Draft saved. Review the wording, product facts, and "
                     "topic before WooCommerce draft creation."
                 )
             )
         ),
-        "approved_at": now if approve else None,
+        "approved_at": now if is_approved else None,
         "updated_at": now,
     }
 
@@ -633,6 +644,62 @@ def save_content(
 
     return written_row
 
+
+def attempt_content_approval(
+    repository: SupabaseRepository,
+    product: dict[str, Any],
+    existing: dict[str, Any] | None,
+    content: dict[str, Any],
+    generated: dict[str, Any],
+    non_interactive: bool,
+) -> tuple[dict[str, Any], str | None]:
+    """
+    Run --action APPROVE's deterministic validation and save accordingly.
+
+    Returns (written_row, declined_reason). declined_reason is None on a
+    genuine approval (content_status=APPROVED). When validation fails:
+
+    - non_interactive=True (the orchestrator's automated path, CLAUDE.md
+      15.3 "stop for human review" -- not "crash the batch"): the content
+      row is written with content_status=REVIEW_REQUIRED instead of
+      raising, and declined_reason carries why. This is never a silent
+      downgrade of previously APPROVED content -- validate_approval_content
+      already refuses a first-generation or still-untouched draft, and
+      REVISE separately refuses to touch an APPROVED row; APPROVE only
+      ever reaches here from DRAFTED.
+    - non_interactive=False (a human explicitly typed/passed APPROVE):
+      the RuntimeError is re-raised unchanged so the human sees the
+      failure immediately, exactly as before this function existed.
+    """
+    try:
+        validate_approval_content(
+            existing=existing,
+            content=content,
+            generated=generated,
+        )
+    except RuntimeError as error:
+        if not non_interactive:
+            raise
+
+        result = save_content(
+            repository=repository,
+            product=product,
+            existing=existing,
+            content=content,
+            approve=False,
+            status_override=ContentStatus.REVIEW_REQUIRED,
+            review_notes=f"Automatic approval declined: {error}",
+        )
+        return result, f"{type(error).__name__}: {error}"
+
+    result = save_content(
+        repository=repository,
+        product=product,
+        existing=existing,
+        content=content,
+        approve=True,
+    )
+    return result, None
 
 
 def load_reviewer_content_file(path: Path) -> dict[str, Any]:
@@ -1076,19 +1143,37 @@ def main() -> None:
         return
 
     if action == "APPROVE":
-        validate_approval_content(
+        result, declined_reason = attempt_content_approval(
+            repository=repository,
+            product=product,
             existing=existing,
             content=content,
             generated=generated,
+            non_interactive=args.non_interactive,
         )
 
-    result = save_content(
-        repository=repository,
-        product=product,
-        existing=existing,
-        content=content,
-        approve=(action == "APPROVE"),
-    )
+        if declined_reason is not None:
+            print()
+            print("=" * 78)
+            print("PRODUCT CONTENT RESULT")
+            print("=" * 78)
+            print(f"Content ID: {result.get('product_content_id')}")
+            print(f"Content status: {result.get('content_status')}")
+            print(f"Review required: {result.get('review_required')}")
+            print(
+                "Automatic content approval was declined "
+                f"({declined_reason}); routed to REVIEW_REQUIRED for "
+                "human review."
+            )
+            return
+    else:
+        result = save_content(
+            repository=repository,
+            product=product,
+            existing=existing,
+            content=content,
+            approve=False,
+        )
 
     print()
     print("=" * 78)

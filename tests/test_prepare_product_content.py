@@ -349,6 +349,142 @@ def test_save_content_draft_updates_in_place_when_existing_row_present():
 
 
 # --------------------------------------------------------------------------
+# 6. Automatic content approval (CLAUDE.md 15.3): passes through cleanly
+# when validation passes, downgrades to REVIEW_REQUIRED instead of
+# crashing when it does not -- but only for the automated (orchestrator)
+# path. An interactive human APPROVE still fails loudly and immediately.
+# --------------------------------------------------------------------------
+
+
+def test_save_content_review_required_status_override():
+    product = make_product()
+    existing = make_approved_content(
+        content_status="DRAFTED",
+        review_required=True,
+        approved_at=None,
+    )
+
+    repository = FakeSupabaseRepository(
+        tables={
+            "internal_products": [product],
+            "product_contents": [existing],
+        }
+    )
+
+    result = ppc.save_content(
+        repository=repository,
+        product=product,
+        existing=existing,
+        content={"product_name": existing["product_name"]},
+        approve=False,
+        status_override=ppc.ContentStatus.REVIEW_REQUIRED,
+        review_notes="Automatic approval declined: still a generic draft.",
+    )
+
+    assert result["content_status"] == "REVIEW_REQUIRED"
+    assert result["review_required"] is True
+    assert result["approved_at"] is None
+    assert "Automatic approval declined" in result["review_notes"]
+
+    stored_product = repository.client.tables["internal_products"][0]
+    assert stored_product["content_status"] == "REVIEW_REQUIRED"
+
+
+def test_attempt_content_approval_approves_enriched_content():
+    product = make_product()
+    generated = ppc.build_safe_draft(product)
+    enriched = dict(generated)
+    enriched["long_description"] = (
+        "Nội dung sách kể về một hành trình khám phá thế giới xung quanh, "
+        "được biên tập lại từ bài đăng Facebook đã được phép sử dụng."
+    )
+    existing = {"product_content_id": "content-1", "content_status": "DRAFTED", **enriched}
+
+    repository = FakeSupabaseRepository(
+        tables={
+            "internal_products": [product],
+            "product_contents": [dict(existing)],
+        }
+    )
+
+    result, declined_reason = ppc.attempt_content_approval(
+        repository=repository,
+        product=product,
+        existing=existing,
+        content=enriched,
+        generated=generated,
+        non_interactive=True,
+    )
+
+    assert declined_reason is None
+    assert result["content_status"] == "APPROVED"
+    assert result["review_required"] is False
+
+
+def test_attempt_content_approval_downgrades_generic_draft_when_automated():
+    """A generic, unenriched draft cannot pass automatic approval -- the
+    automated (orchestrator) caller gets a REVIEW_REQUIRED row and a
+    reason string, never an exception."""
+    product = make_product()
+    generated = ppc.build_safe_draft(product)
+    existing = {"product_content_id": "content-1", "content_status": "DRAFTED", **generated}
+
+    repository = FakeSupabaseRepository(
+        tables={
+            "internal_products": [product],
+            "product_contents": [dict(existing)],
+        }
+    )
+
+    result, declined_reason = ppc.attempt_content_approval(
+        repository=repository,
+        product=product,
+        existing=existing,
+        content=generated,
+        generated=generated,
+        non_interactive=True,
+    )
+
+    assert declined_reason is not None
+    assert "generic metadata-only safe draft" in declined_reason
+    assert result["content_status"] == "REVIEW_REQUIRED"
+    assert result["review_required"] is True
+
+    stored_product = repository.client.tables["internal_products"][0]
+    assert stored_product["content_status"] == "REVIEW_REQUIRED"
+
+
+def test_attempt_content_approval_raises_when_interactive():
+    """A human explicitly running --action APPROVE (not --non-interactive)
+    still gets the immediate RuntimeError -- no silent downgrade behind
+    an interactive user's back."""
+    product = make_product()
+    generated = ppc.build_safe_draft(product)
+    existing = {"content_status": "DRAFTED", **generated}
+
+    repository = FakeSupabaseRepository(
+        tables={
+            "internal_products": [product],
+            "product_contents": [{"product_content_id": "content-1", **existing}],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="generic metadata-only safe draft"):
+        ppc.attempt_content_approval(
+            repository=repository,
+            product=product,
+            existing=existing,
+            content=generated,
+            generated=generated,
+            non_interactive=False,
+        )
+
+    # Nothing was written on the raised path.
+    stored_product = repository.client.tables["internal_products"][0]
+    assert stored_product["content_status"] == "PENDING"
+
+
+# --------------------------------------------------------------------------
 # 6. missing ISBN does not block content preparation
 # --------------------------------------------------------------------------
 

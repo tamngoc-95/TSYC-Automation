@@ -136,6 +136,25 @@ AUTOMATABLE_DISPATCH: dict[str, DispatchEntry] = {
             "(never approves content)."
         ),
     ),
+    "CONTENT_DRAFTED": DispatchEntry(
+        script="prepare_product_content.py",
+        build_args=lambda state: [
+            "--product-code",
+            state.product_code,
+            "--action",
+            "APPROVE",
+            "--non-interactive",
+        ],
+        description=(
+            "Attempt automatic content approval (CLAUDE.md 15.3): "
+            "re-runs the deterministic content_rules checks and approves "
+            "only when they all pass. When they do not, the script itself "
+            "downgrades content_status to REVIEW_REQUIRED and exits 0 -- "
+            "this candidate then stops at the resulting CONTENT_REVIEW_"
+            "REQUIRED human gate on the next state read, without ever "
+            "failing the stage or stopping any other candidate."
+        ),
+    ),
     "IMAGE_VALIDATED": DispatchEntry(
         script="check_draft_readiness.py",
         build_args=lambda state: [

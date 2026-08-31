@@ -271,6 +271,21 @@ def _warnings_for_internal_product(
     return warnings
 
 
+def _vietnamese_content_review_notes(
+    contents: list[dict[str, Any]],
+) -> str | None:
+    """The Vietnamese product_contents row's own review_notes, if any --
+    surfaces prepare_product_content.py's exact declined-approval reason
+    (CLAUDE.md 15.3) in the batch summary instead of a generic "manual
+    review required" placeholder. Read-only; this function decides
+    nothing, it only re-states what the writer already recorded."""
+    for content in contents:
+        if content.get("content_language") == "vi":
+            notes = content.get("review_notes")
+            return str(notes) if notes else None
+    return None
+
+
 def _derive_recovery_state(
     bundle: dict[str, Any],
 ) -> tuple[str, str] | None:
@@ -398,18 +413,23 @@ def _derive_image_content_state(
         )
 
     if content_status == InternalProductContentStatus.DRAFTED:
+        # Not a human gate: CLAUDE.md section 15.3 explicitly allows
+        # automatic content approval once deterministic validation
+        # confirms verified-facts-only, no internal workflow language,
+        # and a non-generic draft. run_batch.py's AUTOMATABLE_DISPATCH
+        # dispatches prepare_product_content.py --action APPROVE for
+        # this state; that script re-runs the same deterministic checks
+        # (src.domain.rules.content_rules) and, when they do not all
+        # pass, downgrades content_status to REVIEW_REQUIRED itself
+        # instead of approving -- which re-derives as CONTENT_REVIEW_
+        # REQUIRED below (a real human gate) on the next state read.
+        # This function never approves anything itself; it only decides
+        # DRAFTED is not, by itself, a reason to stop.
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,
             product_code=product_code,
             derived_state="CONTENT_DRAFTED",
-            human_gate=True,
-            human_gate_reason=(
-                "A content draft exists but is not APPROVED. Content "
-                "approval requires human review/enrichment "
-                "(prepare_product_content.py --action APPROVE) -- it is "
-                "never approved automatically."
-            ),
             warnings=warnings,
         )
 
@@ -418,6 +438,8 @@ def _derive_image_content_state(
     # DRAFTED, REVIEW_REQUIRED, APPROVED) -- kept as a defensive literal
     # rather than invented as a domain constant that would not exist.
     if content_status in (InternalProductContentStatus.REVIEW_REQUIRED, "REJECTED"):
+        review_notes = _vietnamese_content_review_notes(bundle["contents"])
+
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,
@@ -425,8 +447,12 @@ def _derive_image_content_state(
             derived_state="CONTENT_REVIEW_REQUIRED",
             human_gate=True,
             human_gate_reason=(
-                f"Content status is {content_status}; manual review is "
-                "required before content can advance."
+                f"Content status is {content_status}. "
+                + (
+                    review_notes
+                    if review_notes
+                    else "Manual review is required before content can advance."
+                )
             ),
             warnings=warnings,
         )

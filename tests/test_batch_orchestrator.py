@@ -443,9 +443,39 @@ def test_accepted_warnings_continue_past_audit_checkpoint():
         script = argv[1]
 
         if script.endswith("prepare_product_content.py"):
+            if "APPROVE" in argv:
+                # Simulate the real script's automatic-approval write:
+                # content moves DRAFTED -> APPROVED (deterministic
+                # validation passed).
+                repository.client.tables["internal_products"][0][
+                    "content_status"
+                ] = "APPROVED"
+                for row in repository.client.tables.get("product_contents", []):
+                    if row["internal_product_id"] == INTERNAL_PRODUCT_ID:
+                        row["content_status"] = "APPROVED"
+            else:
+                # Simulate the real script's SAVE write: PENDING -> DRAFTED.
+                repository.client.tables["internal_products"][0][
+                    "content_status"
+                ] = "DRAFTED"
+                repository.client.tables.setdefault(
+                    "product_contents", []
+                ).append(
+                    {
+                        "product_content_id": "content-1",
+                        "internal_product_id": INTERNAL_PRODUCT_ID,
+                        "content_language": "vi",
+                        "content_status": "DRAFTED",
+                    }
+                )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        if script.endswith("check_draft_readiness.py"):
+            # Simulate the real script's write once content+image are both
+            # approved: NOT_CREATED -> READY_FOR_DRAFT (the Woo human gate).
             repository.client.tables["internal_products"][0][
-                "content_status"
-            ] = "DRAFTED"
+                "woocommerce_status"
+            ] = "READY_FOR_DRAFT"
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         if script.endswith("audit_pipeline_state.py"):
@@ -465,10 +495,16 @@ def test_accepted_warnings_continue_past_audit_checkpoint():
     )
 
     assert report.result != "AUDIT_FAILED"
-    assert report.actions_executed == ["prepare_product_content.py"]
-    # Content is now DRAFTED -- a human gate for approval, reached only
-    # because the batch was allowed to continue past accepted warnings.
-    assert report.final_state == "CONTENT_DRAFTED"
+    # Content approval is now automatic (CLAUDE.md 15.3): SAVE, then
+    # APPROVE, then straight through to the Woo draft human gate -- the
+    # batch was allowed to continue past every accepted warning without
+    # ever stopping for a human decision on the content itself.
+    assert report.actions_executed == [
+        "prepare_product_content.py",
+        "prepare_product_content.py",
+        "check_draft_readiness.py",
+    ]
+    assert report.final_state == "READY_FOR_DRAFT"
     assert report.human_gate is True
 
 
@@ -508,6 +544,161 @@ def test_unaccepted_warning_stops_the_batch():
     )
 
     assert report.result == "AUDIT_FAILED"
+
+
+# --------------------------------------------------------------------------
+# 9b. Automatic content approval (CLAUDE.md 15.3): CONTENT_DRAFTED is
+# dispatched (never a human gate by itself), and a declined automatic
+# approval routes only that one candidate to REVIEW_REQUIRED without
+# stopping any other candidate in the same bounded batch.
+# --------------------------------------------------------------------------
+
+
+def test_content_drafted_dispatches_automatic_approve():
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+        ],
+        product_references=[make_reference()],
+        internal_products=[
+            make_internal_product(content_status="DRAFTED"),
+        ],
+    )
+    bundle = load_candidate_bundle(repository, CANDIDATE_CODE)
+    state = derive_candidate_state(bundle)
+
+    assert state.derived_state == "CONTENT_DRAFTED"
+    assert state.human_gate is False
+
+    kind, dispatch, _description = run_batch.decide_action(state, False)
+
+    assert kind == "invoke"
+    assert dispatch is run_batch.AUTOMATABLE_DISPATCH["CONTENT_DRAFTED"]
+    assert dispatch.script == "prepare_product_content.py"
+    assert dispatch.build_args(state) == [
+        "--product-code",
+        state.product_code,
+        "--action",
+        "APPROVE",
+        "--non-interactive",
+    ]
+
+
+def test_content_review_required_surfaces_the_writer_declined_reason():
+    """pipeline_state.derive_candidate_state must surface
+    prepare_product_content.py's own declined-approval reason
+    (product_contents.review_notes) rather than a generic placeholder,
+    so a REVIEW_REQUIRED batch summary line is actually actionable."""
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+        ],
+        product_references=[make_reference()],
+        internal_products=[
+            make_internal_product(content_status="REVIEW_REQUIRED"),
+        ],
+        product_contents=[
+            {
+                "product_content_id": "content-1",
+                "internal_product_id": INTERNAL_PRODUCT_ID,
+                "content_language": "vi",
+                "content_status": "REVIEW_REQUIRED",
+                "review_notes": (
+                    "Automatic approval declined: RuntimeError: Content is "
+                    "still the generic metadata-only safe draft."
+                ),
+            }
+        ],
+    )
+
+    bundle = load_candidate_bundle(repository, CANDIDATE_CODE)
+    state = derive_candidate_state(bundle)
+
+    assert state.derived_state == "CONTENT_REVIEW_REQUIRED"
+    assert state.human_gate is True
+    assert "still the generic metadata-only safe draft" in state.human_gate_reason
+
+
+def test_declined_automatic_approval_does_not_stop_other_candidates():
+    other_code = "FB-2026-001-CAN-0002"
+    other_candidate_id = "99999999-9999-9999-9999-999999999999"
+    other_reference_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    other_internal_product_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+            make_candidate(
+                candidate_id=other_candidate_id,
+                candidate_code=other_code,
+                identity_status="IDENTITY_VERIFIED",
+            ),
+        ],
+        product_references=[
+            make_reference(),
+            make_reference(
+                reference_id=other_reference_id,
+                candidate_id=other_candidate_id,
+            ),
+        ],
+        internal_products=[
+            # First candidate: content is still the generic safe draft --
+            # automatic approval must decline it.
+            make_internal_product(content_status="DRAFTED"),
+            make_internal_product(
+                internal_product_id=other_internal_product_id,
+                candidate_id=other_candidate_id,
+                product_code=f"TSYC-{other_code}",
+                # Second candidate: fully clear to advance automatically
+                # (READY_FOR_DRAFT is itself a human gate, which is the
+                # convenient stopping point for this test).
+                content_status="APPROVED",
+                image_status="APPROVED",
+                woocommerce_status="READY_FOR_DRAFT",
+            ),
+        ],
+    )
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess:
+        script = argv[1]
+
+        if script.endswith("prepare_product_content.py"):
+            # Simulate the real script's automatic-approval-declined
+            # write: DRAFTED -> REVIEW_REQUIRED, exit 0 (never a stage
+            # failure).
+            product_code = argv[argv.index("--product-code") + 1]
+
+            for product in repository.client.tables["internal_products"]:
+                if product["product_code"] == product_code:
+                    product["content_status"] = "REVIEW_REQUIRED"
+
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        if script.endswith("audit_pipeline_state.py"):
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    exit_code = run_batch.main(
+        [
+            "--candidate-code",
+            CANDIDATE_CODE,
+            "--candidate-code",
+            other_code,
+            "--max-candidates",
+            "2",
+            "--non-interactive",
+        ],
+        repository=repository,
+        subprocess_runner=runner,
+        confirm=always_confirm,
+        preflight_runner=always_ready_preflight,
+    )
+
+    # No STAGE_FAILED/AUDIT_FAILED/BLOCKED anywhere -- a declined
+    # automatic approval is a clean, expected REVIEW_REQUIRED outcome,
+    # never a batch-stopping failure.
+    assert exit_code == 0
 
 
 # --------------------------------------------------------------------------
@@ -928,9 +1119,9 @@ def test_classify_report_group_covers_the_named_groups():
     )
     review_report = run_batch.CandidateReport(
         candidate_code="CAN-REVIEW",
-        final_state="CONTENT_DRAFTED",
+        final_state="CONTENT_REVIEW_REQUIRED",
         human_gate=True,
-        human_gate_reason="Content awaits human approval.",
+        human_gate_reason="Automatic content approval was declined.",
     )
     blocked_report = run_batch.CandidateReport(
         candidate_code="CAN-BLOCKED",
@@ -997,9 +1188,9 @@ def test_reconciled_terminal_state_gets_its_own_group():
 def test_grouped_summary_prints_reason_for_review_required(capsys):
     review_report = run_batch.CandidateReport(
         candidate_code="CAN-0021",
-        final_state="CONTENT_DRAFTED",
+        final_state="CONTENT_REVIEW_REQUIRED",
         human_gate=True,
-        human_gate_reason="Content draft awaits human approval.",
+        human_gate_reason="Automatic content approval was declined.",
     )
 
     run_batch.print_grouped_summary([review_report], requested=1)
@@ -1007,7 +1198,7 @@ def test_grouped_summary_prints_reason_for_review_required(capsys):
     output = capsys.readouterr().out
     assert "REVIEW_REQUIRED: 1" in output
     assert "CAN-0021" in output
-    assert "Content draft awaits human approval." in output
+    assert "Automatic content approval was declined." in output
 
 
 def test_grouped_summary_never_lists_ready_for_draft_under_review_required(capsys):
