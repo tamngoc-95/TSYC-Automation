@@ -67,6 +67,7 @@ class FakeQueryBuilder:
         self._op: str | None = None
         self._payload: Any = None
         self._eq_filters: list[tuple[str, Any]] = []
+        self._neq_filters: list[tuple[str, Any]] = []
         self._not_null_filters: list[str] = []
         self._null_filters: list[str] = []
         self._orders: list[tuple[str, bool]] = []
@@ -98,6 +99,10 @@ class FakeQueryBuilder:
         self._eq_filters.append((column, value))
         return self
 
+    def neq(self, column: str, value: Any) -> "FakeQueryBuilder":
+        self._neq_filters.append((column, value))
+        return self
+
     def is_(self, column: str, value: str) -> "FakeQueryBuilder":
         """Mimic the bare `.is_(column, "null")` IS NULL filter (distinct
         from `.not_.is_(column, "null")`'s IS NOT NULL, above)."""
@@ -127,6 +132,10 @@ class FakeQueryBuilder:
     def _passes_filters(self, row: dict[str, Any]) -> bool:
         for column, value in self._eq_filters:
             if row.get(column) != value:
+                return False
+
+        for column, value in self._neq_filters:
+            if row.get(column) == value:
                 return False
 
         for column in self._not_null_filters:

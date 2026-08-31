@@ -27,7 +27,7 @@ from src.repositories.supabase_repository import SupabaseRepository
 configure_utf8_console()
 
 
-BATCH_CODE = "FB-2026-001"
+DEFAULT_BATCH_CODE = "FB-2026-001"
 
 REGISTRAR_NAME = "candidate_reference_source_registrar"
 REGISTRAR_VERSION = "1.0.0"
@@ -77,6 +77,22 @@ def parse_arguments() -> argparse.Namespace:
     selector_group.add_argument(
         "--candidate-id",
         help="Exact candidate UUID.",
+    )
+
+    parser.add_argument(
+        "--batch-code",
+        default=DEFAULT_BATCH_CODE,
+        help=(
+            "Batch code to resolve the candidate against. Defaults to the "
+            f"live Facebook collection batch ({DEFAULT_BATCH_CODE}) so "
+            "existing production behavior is unchanged when this flag is "
+            "omitted. Pass an explicit historical batch code (for example "
+            "FB-HIST-2026-001) to register a reference source for a "
+            "candidate in that batch -- the same validation, idempotency, "
+            "and provenance logic applies regardless of which batch is "
+            "targeted; this never falls back to the default batch when "
+            "the requested one is missing or the candidate isn't in it."
+        ),
     )
 
     parser.add_argument(
@@ -290,8 +306,13 @@ def normalize_url(
 
 def get_batch(
     repository: SupabaseRepository,
+    batch_code: str,
 ) -> dict[str, Any]:
-    """Return the configured batch."""
+    """Return the batch matching the exact requested batch code.
+
+    Never falls back to DEFAULT_BATCH_CODE when the requested batch_code
+    is not found -- an unresolved batch is always a hard failure.
+    """
     response = (
         repository.client
         .table("batches")
@@ -300,7 +321,7 @@ def get_batch(
         )
         .eq(
             "batch_code",
-            BATCH_CODE,
+            batch_code,
         )
         .limit(1)
         .execute()
@@ -310,7 +331,7 @@ def get_batch(
 
     if not records:
         raise RuntimeError(
-            f"Batch was not found: {BATCH_CODE}"
+            f"Batch was not found: {batch_code}"
         )
 
     return records[0]
@@ -1317,13 +1338,14 @@ def main() -> None:
         f"Version: {REGISTRAR_VERSION}"
     )
     print(
-        f"Batch: {BATCH_CODE}"
+        f"Batch: {args.batch_code}"
     )
 
     repository = SupabaseRepository()
 
     batch = get_batch(
-        repository
+        repository,
+        args.batch_code,
     )
 
     candidates = get_candidates(
