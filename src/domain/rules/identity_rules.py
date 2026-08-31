@@ -689,18 +689,43 @@ def _rejecting_references_corroborate_each_other(
 
     A single confirmed_no_matches entry (nothing to corroborate against)
     always returns False -- unchanged, confident AUTO_REJECT behavior.
+
+    Title similarity is not the only corroboration signal checked. Live
+    incident: historical candidate CAN-0007, extracted_title "Giận" (a
+    real, very short one-word Vietnamese title). Its two references were
+    "Giận (Tái Bản 2023)" and "Giận - Thích Nhất Hạnh" -- each
+    individually AUTO_REJECTed against the short candidate title (same
+    length-mismatch shape as CAN-0004), but this time the two references
+    ALSO score low similarity against EACH OTHER, because one appends a
+    reprint year and the other appends an author-name suffix -- entirely
+    different kinds of extra text, so the title-similarity check above
+    alone does not catch it. Both references nonetheless explicitly
+    agree on the same specific (non-generic) reference_author, "Thích
+    Nhất Hạnh" -- independent corroboration they describe the same book
+    even though their title strings don't resemble each other. When
+    every rejecting reference names the same one specific author, that
+    counts as corroboration too.
     """
     if len(confirmed_no_matches) < 2:
         return False
 
     titles = [reference.get("reference_title") for reference, _res in confirmed_no_matches]
 
-    return any(
+    if any(
         calculate_similarity(titles[i], titles[j])
         >= _REFERENCE_CROSS_CORROBORATION_THRESHOLD
         for i in range(len(titles))
         for j in range(i + 1, len(titles))
-    )
+    ):
+        return True
+
+    authors = [reference.get("reference_author") for reference, _res in confirmed_no_matches]
+    if all(is_specific_author(author) for author in authors):
+        normalized_authors = {normalize_text(author) for author in authors}
+        if len(normalized_authors) == 1:
+            return True
+
+    return False
 
 
 def evaluate_candidate_identity(

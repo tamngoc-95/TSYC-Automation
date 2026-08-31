@@ -526,6 +526,54 @@ def test_single_rejecting_reference_is_still_a_confident_reject():
     assert result.evidence["has_genuine_conflict"] is True
 
 
+def test_abbreviated_short_title_with_same_author_on_differently_worded_refs_is_not_a_false_reject():
+    """Live incident: historical candidate CAN-0007 ('Giận', a real
+    one-word Vietnamese title). Its two references, 'Giận (Tái Bản
+    2023)' and 'Giận - Thích Nhất Hạnh', each individually AUTO_REJECT
+    against the short candidate title -- and this time they ALSO score
+    low similarity against EACH OTHER (one appends a reprint year, the
+    other an author-name suffix -- different kinds of extra text). Title
+    cross-similarity alone would miss this; both references explicitly
+    agree on the same specific author, which must be enough
+    corroboration on its own."""
+    candidate = _candidate("Giận")
+    ref_a = _reference(
+        reference_id="fahasa", reference_title="Giận (Tái Bản 2023)",
+        reference_author="Thích Nhất Hạnh",
+    )
+    ref_b = _reference(
+        reference_id="neta", reference_title="Giận - Thích Nhất Hạnh",
+        reference_author="Thích Nhất Hạnh",
+    )
+
+    result = rules.evaluate_candidate_identity(candidate, [ref_a, ref_b])
+
+    assert result.outcome == Outcome.REVIEW_REQUIRED
+    assert result.outcome != Outcome.AUTO_REJECT
+    assert result.evidence["has_genuine_conflict"] is False
+
+
+def test_two_rejecting_references_with_different_specific_authors_still_confirm_no_match():
+    """Author-based corroboration must require the SAME author on every
+    rejecting reference -- different specific authors, on titles that
+    also don't resemble each other, is exactly the opposite signal (real
+    evidence of different books), never corroboration."""
+    candidate = _candidate("Giận")
+    ref_a = _reference(
+        reference_id="a", reference_title="Completely Different Novel About Ships",
+        reference_author="Author One",
+    )
+    ref_b = _reference(
+        reference_id="b", reference_title="A Cookbook For Weekend Brunch",
+        reference_author="Author Two",
+    )
+
+    result = rules.evaluate_candidate_identity(candidate, [ref_a, ref_b])
+
+    assert result.outcome == Outcome.AUTO_REJECT
+    assert result.evidence["has_genuine_conflict"] is True
+
+
 def test_G_unvalidated_isbn_never_becomes_the_consensus_isbn():
     """Two sources agreeing on title/author but one carrying a
     barcode-shaped, non-ISBN value must still AUTO_PASS (consensus
