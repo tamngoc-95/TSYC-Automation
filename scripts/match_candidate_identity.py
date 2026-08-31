@@ -1847,12 +1847,19 @@ def compute_decision_fingerprint(
 def build_verified_conflict_evidence(
     candidate: dict[str, Any],
     decision: Any,
+    fingerprint: str,
 ) -> dict[str, Any]:
     """Append-only: records that hardened re-evaluation found evidence
     conflicting with an already-VERIFIED identity, WITHOUT touching
     identity_status, workflow_status, or any verified_* field --
     CLAUDE.md 2.7: verified identity is never silently overwritten, even
-    by evidence that would otherwise change the decision."""
+    by evidence that would otherwise change the decision.
+
+    Still stamps decision_fingerprint (exactly like the normal write
+    path) so an unchanged rerun against the same conflicting evidence is
+    a true NO_OP next time -- without this, every rerun would re-detect
+    "fingerprint differs from the never-updated stored one" and append a
+    duplicate post_verification_conflicts entry forever."""
     existing_evidence = candidate.get("source_evidence")
     source_evidence = (
         dict(existing_evidence) if isinstance(existing_evidence, dict) else {}
@@ -1890,6 +1897,7 @@ def build_verified_conflict_evidence(
     )
 
     source_evidence["post_verification_conflicts"] = history
+    source_evidence["decision_fingerprint"] = fingerprint
     return source_evidence
 
 
@@ -2189,7 +2197,9 @@ def evaluate_and_apply_decision(
 
         payload = {
             "review_required": True,
-            "source_evidence": build_verified_conflict_evidence(candidate, decision),
+            "source_evidence": build_verified_conflict_evidence(
+                candidate, decision, fingerprint
+            ),
             "updated_at": utc_now(),
         }
         response = (

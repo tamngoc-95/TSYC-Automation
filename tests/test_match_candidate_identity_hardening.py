@@ -321,6 +321,17 @@ def test_F_verified_candidate_with_genuine_conflict_is_flagged_not_overwritten()
     assert "post_verification_conflicts" in updated["source_evidence"]
     assert len(updated["source_evidence"]["post_verification_conflicts"]) == 1
 
+    # Rerunning against the same, unchanged conflicting evidence must be
+    # a true no-op -- not a re-flag that appends a second, duplicate
+    # post_verification_conflicts entry every time.
+    second = mci.evaluate_and_apply_decision(
+        repository=repository, candidate=updated,
+        references=[ref_a, ref_b], confirm_save=True,
+    )
+    assert second["action"] == "NO_OP"
+    final = fetch_candidate(repository, "cand-4")
+    assert len(final["source_evidence"]["post_verification_conflicts"]) == 1
+
 
 # --------------------------------------------------------------------------
 # G / H / I -- ISBN/publisher safety survive the full script-level write
