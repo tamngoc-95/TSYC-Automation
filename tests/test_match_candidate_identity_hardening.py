@@ -258,6 +258,57 @@ def test_E_verified_candidate_with_consistent_evidence_is_untouched():
         verified_author="Bình Ca",
         source_evidence={"decision_fingerprint": "stale-fingerprint-forces-recompute"},
     )
+    # Already fully synced -- both contributing references already carry
+    # match_decision=MATCH, exactly what a healthy IDENTITY_VERIFIED
+    # candidate looks like. This is what makes it a true NO_OP case; see
+    # test_E2 below for the "was never synced" (FB-HIST-2026) shape.
+    ref_a = make_reference(
+        "neta", candidate_id="cand-3", title="Quân Khu Nam Đồng", author="Bình Ca",
+        publisher="Trẻ", page_count=440, source_priority=3,
+        match_decision="MATCH", match_confidence=0.90,
+    )
+    ref_b = make_reference(
+        "fahasa", candidate_id="cand-3", title="Quân Khu Nam Đồng", author="Bình Ca",
+        publisher="Trẻ", page_count=440, source_type="FAHASA", source_priority=4,
+        match_decision="MATCH", match_confidence=0.90,
+    )
+    repository = make_repository([candidate], [ref_a, ref_b])
+
+    result = mci.evaluate_and_apply_decision(
+        repository=repository, candidate=candidate,
+        references=[ref_a, ref_b], confirm_save=True,
+    )
+
+    assert result["action"] == "NO_OP_VERIFIED_CONSISTENT"
+    unchanged = fetch_candidate(repository, "cand-3")
+    assert unchanged["identity_status"] == "IDENTITY_VERIFIED"
+    assert unchanged["verified_title"] == "Quân Khu Nam Đồng"
+    assert unchanged["verified_author"] == "Bình Ca"
+    assert unchanged["review_required"] is False
+    # Nothing about the already-synced reference rows was rewritten.
+    assert fetch_references(repository, "cand-3") == [ref_a, ref_b]
+
+
+def test_E2_verified_candidate_with_unsynced_references_is_recovered_via_rerun():
+    """
+    The exact confirmed FB-HIST-2026 incident shape (2026-08-31, 5
+    candidates): identity_status is already IDENTITY_VERIFIED via a
+    legitimate multi-source consensus AUTO_PASS, but the contributing
+    references were never promoted to match_decision=MATCH (a prior
+    matcher version's bug). A plain rerun -- exactly --mode RECOMPUTE,
+    no raw SQL, no candidate-row rewrite -- must repair the reference
+    rows and leave the (already-correct) verified identity untouched.
+    """
+    candidate = make_candidate(
+        candidate_id="cand-3",
+        candidate_code="TEST-CAN-0003",
+        title="Quân khu Nam Đồng",
+        identity_status="IDENTITY_VERIFIED",
+        review_required=False,
+        verified_title="Quân Khu Nam Đồng",
+        verified_author="Bình Ca",
+        source_evidence={"decision_fingerprint": "stale-fingerprint-forces-recompute"},
+    )
     ref_a = make_reference(
         "neta", candidate_id="cand-3", title="Quân Khu Nam Đồng", author="Bình Ca",
         publisher="Trẻ", page_count=440, source_priority=3,
@@ -273,12 +324,24 @@ def test_E_verified_candidate_with_consistent_evidence_is_untouched():
         references=[ref_a, ref_b], confirm_save=True,
     )
 
-    assert result["action"] == "NO_OP_VERIFIED_CONSISTENT"
+    assert result["action"] == "VERIFIED_CONSISTENT_REFERENCES_SYNCED"
+    assert result["reference_rows_updated"] == 2
+
     unchanged = fetch_candidate(repository, "cand-3")
     assert unchanged["identity_status"] == "IDENTITY_VERIFIED"
     assert unchanged["verified_title"] == "Quân Khu Nam Đồng"
     assert unchanged["verified_author"] == "Bình Ca"
     assert unchanged["review_required"] is False
+
+    recovered_refs = fetch_references(repository, "cand-3")
+    assert all(ref["match_decision"] == "MATCH" for ref in recovered_refs)
+
+    # Rerunning again now must be a true no-op -- nothing left to sync.
+    again = mci.evaluate_and_apply_decision(
+        repository=repository, candidate=fetch_candidate(repository, "cand-3"),
+        references=recovered_refs, confirm_save=True,
+    )
+    assert again["action"] == "NO_OP_VERIFIED_CONSISTENT"
 
 
 def test_F_verified_candidate_with_genuine_conflict_is_flagged_not_overwritten():
@@ -352,7 +415,7 @@ def test_G_unvalidated_isbn_is_never_written_as_verified_isbn():
     )
     repository = make_repository([candidate], [ref_a, ref_b])
 
-    mci.evaluate_and_apply_decision(
+    result = mci.evaluate_and_apply_decision(
         repository=repository, candidate=candidate,
         references=[ref_a, ref_b], confirm_save=True,
     )
@@ -360,6 +423,19 @@ def test_G_unvalidated_isbn_is_never_written_as_verified_isbn():
     updated = fetch_candidate(repository, "cand-1")
     assert updated["identity_status"] == "IDENTITY_VERIFIED"
     assert updated["verified_isbn"] is None
+
+    # This is the exact FB-HIST-2026 repro shape: candidate_author is
+    # missing, so neither reference individually reaches MATCH (each is
+    # only POSSIBLE_MATCH on its own -- title strong, author unverifiable
+    # against the candidate). Multi-source consensus is what verifies the
+    # candidate, so BOTH contributing references must themselves end up
+    # persisted as match_decision=MATCH -- never left at POSSIBLE_MATCH
+    # while the candidate claims VERIFIED (audit's
+    # VERIFIED_IDENTITY_WITHOUT_MATCH_REFERENCE).
+    assert result["reference_rows_updated"] == 2
+    updated_refs = {r["reference_id"]: r for r in fetch_references(repository, "cand-1")}
+    assert updated_refs["neta"]["match_decision"] == "MATCH"
+    assert updated_refs["fahasa"]["match_decision"] == "MATCH"
 
 
 def test_I_publisher_conflict_blocks_verification_no_silent_winner():
@@ -383,6 +459,133 @@ def test_I_publisher_conflict_blocks_verification_no_silent_winner():
     updated = fetch_candidate(repository, "cand-1")
     assert updated["identity_status"] != "IDENTITY_VERIFIED"
     assert updated["verified_publisher"] is None
+    # No reference is force-promoted to MATCH for a non-AUTO_PASS result.
+    for reference in fetch_references(repository, "cand-1"):
+        assert reference["match_decision"] != "MATCH"
+
+
+# --------------------------------------------------------------------------
+# L -- fail-closed identity-verification invariant (Phase C): an AUTO_PASS
+# decision that names no contributing reference must never be persisted as
+# IDENTITY_VERIFIED, and a candidate with zero MATCH references and no
+# verified consensus can never end up VERIFIED at all.
+# --------------------------------------------------------------------------
+
+
+def test_L1_assert_verifiable_rejects_auto_pass_with_no_contributing_reference():
+    from src.domain.decisions import DecisionResult, Outcome
+    from src.domain.rules import identity_rules
+
+    ungrounded_auto_pass = DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code="IDENTITY_EXACT_CANONICAL_TITLE",
+        reason="fabricated for this test -- names no reference",
+        evidence={},  # no contributing_reference_ids
+        confidence=0.99,
+    )
+
+    try:
+        identity_rules.assert_verifiable(ungrounded_auto_pass)
+        assert False, "expected IdentityVerificationInvariantError"
+    except identity_rules.IdentityVerificationInvariantError:
+        pass
+
+    # A REVIEW_REQUIRED/AUTO_REJECT decision never claims VERIFIED and is
+    # never subject to this check.
+    identity_rules.assert_verifiable(
+        DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code="IDENTITY_INSUFFICIENT_EVIDENCE",
+            reason="not enough evidence",
+            evidence={},
+        )
+    )
+
+
+def test_L2_hardened_write_path_refuses_to_persist_ungrounded_auto_pass():
+    """
+    Defense in depth at the actual write boundary (not just the pure rule
+    function): build_hardened_candidate_payload must refuse to build an
+    IDENTITY_VERIFIED payload for a (deliberately fabricated,
+    invalid-fixture) AUTO_PASS decision that names no contributing
+    reference -- exactly the shape a future rule regression would take.
+    """
+    from src.domain.decisions import DecisionResult, Outcome
+
+    candidate = make_candidate(title="Some Title")
+    ungrounded_auto_pass = DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code="IDENTITY_EXACT_CANONICAL_TITLE",
+        reason="fabricated for this test",
+        evidence={},
+        confidence=0.99,
+    )
+
+    try:
+        mci.build_hardened_candidate_payload(
+            candidate, ungrounded_auto_pass, references_by_id={}, fingerprint="fp"
+        )
+        assert False, "expected IdentityVerificationInvariantError"
+    except Exception as error:  # noqa: BLE001 -- asserting the exact type below
+        from src.domain.rules.identity_rules import IdentityVerificationInvariantError
+        assert isinstance(error, IdentityVerificationInvariantError)
+
+
+def test_L3_zero_match_references_and_no_consensus_never_verifies():
+    """A single weak/insufficient reference (no other source to form a
+    consensus with) must never result in IDENTITY_VERIFIED, and must
+    never leave a reference row at match_decision=MATCH either."""
+    candidate = make_candidate(title="Nỗi Buồn Chiến Tranh")
+    weak = make_reference(
+        "netabooks-weak", title="Nỗi Buồn Chiến Tranh (Tái Bản)",
+        source_priority=3,
+    )
+    repository = make_repository([candidate], [weak])
+
+    result = mci.evaluate_and_apply_decision(
+        repository=repository, candidate=candidate,
+        references=[weak], confirm_save=True,
+    )
+
+    assert result["outcome"] != "AUTO_PASS"
+    updated = fetch_candidate(repository, "cand-1")
+    assert updated["identity_status"] != "IDENTITY_VERIFIED"
+    assert fetch_references(repository, "cand-1")[0]["match_decision"] != "MATCH"
+
+
+def test_L4_generic_repository_writer_cannot_bypass_identity_rules():
+    """
+    There is exactly one write path in this module that can ever set
+    identity_status=IDENTITY_VERIFIED: build_hardened_candidate_payload,
+    always fed by identity_rules.evaluate_candidate_identity()'s
+    DecisionResult and gated by assert_verifiable(). Guard against a
+    regression that reintroduces a second, ungated writer: the module's
+    only unconditional dict literal assignment of IdentityStatus.
+    IDENTITY_VERIFIED must be the one inside build_hardened_candidate_
+    payload's Outcome.AUTO_PASS branch.
+    """
+    import inspect
+
+    # An *assignment* of IDENTITY_VERIFIED -- as a dict value destined for
+    # a product_candidates payload -- not a mere read/comparison (several
+    # functions legitimately compare candidate.get("identity_status") ==
+    # IdentityStatus.IDENTITY_VERIFIED to guard against overwriting one).
+    assignment_pattern = ": IdentityStatus.IDENTITY_VERIFIED"
+
+    payload_fn_source = inspect.getsource(mci.build_hardened_candidate_payload)
+    assert assignment_pattern in payload_fn_source
+
+    # No other function in the module assigns IDENTITY_VERIFIED directly.
+    for name, obj in vars(mci).items():
+        if not inspect.isfunction(obj) or obj.__module__ != mci.__name__:
+            continue
+        if name == "build_hardened_candidate_payload":
+            continue
+        fn_source = inspect.getsource(obj)
+        assert assignment_pattern not in fn_source, (
+            f"{name} assigns IDENTITY_VERIFIED outside the one canonical, "
+            "assert_verifiable()-gated write path"
+        )
 
 
 # --------------------------------------------------------------------------

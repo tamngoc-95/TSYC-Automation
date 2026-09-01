@@ -439,6 +439,9 @@ def test_E_strong_pass_with_only_unusable_extra_reference_preserves_match():
     assert result.outcome == Outcome.AUTO_PASS
     assert result.evidence["has_genuine_conflict"] is False
     assert result.evidence["matching_reference_id"] == "r1"
+    # The caller must be able to persist match_decision=MATCH on exactly
+    # the reference this AUTO_PASS relied on -- see assert_verifiable().
+    assert result.evidence["contributing_reference_ids"] == ["r1"]
 
 
 def test_strong_pass_plus_genuine_no_match_is_a_real_conflict():
@@ -728,6 +731,54 @@ def test_consensus_two_agreeing_sources_still_auto_passes_with_hardening():
 
     assert result.outcome == Outcome.AUTO_PASS
     assert result.rule_code == rules.IDENTITY_EXACT_TITLE_AUTHOR
+    # FB-HIST-2026 regression (2026-08-31): a multi-source consensus
+    # AUTO_PASS must name BOTH contributing references -- not just the
+    # single "best" one -- so the caller can persist match_decision=
+    # MATCH on each. A candidate must never end up IDENTITY_VERIFIED
+    # while any reference it was verified from stays at POSSIBLE_MATCH.
+    assert set(result.evidence["contributing_reference_ids"]) == {"a", "b"}
+    rules.assert_verifiable(result)  # must not raise
+
+
+def test_consensus_auto_pass_with_no_specific_author_still_names_contributors():
+    """The FB-HIST-2026 candidates' exact shape: neither individual
+    reference has an author the candidate can be compared against
+    (IDENTITY_EXACT_CANONICAL_TITLE, not _TITLE_AUTHOR), but the
+    consensus AUTO_PASS still must name every contributing reference."""
+    candidate = _candidate("Không Tự Khinh Bỉ Không Tự Phí Hoài")
+    ref_a = _reference(
+        reference_id="fahasa-ref",
+        reference_title="Không Tự Khinh Bỉ Không Tự Phí Hoài",
+    )
+    ref_b = _reference(
+        reference_id="bookstore-ref",
+        reference_title="Không Tự Khinh Bỉ Không Tự Phí Hoài",
+    )
+
+    result = rules.evaluate_candidate_identity(candidate, [ref_a, ref_b])
+
+    assert result.outcome == Outcome.AUTO_PASS
+    assert result.rule_code == rules.IDENTITY_EXACT_CANONICAL_TITLE
+    assert set(result.evidence["contributing_reference_ids"]) == {
+        "fahasa-ref",
+        "bookstore-ref",
+    }
+    rules.assert_verifiable(result)  # must not raise
+
+
+def test_assert_verifiable_noop_for_review_required_and_auto_reject():
+    review = rules.evaluate_candidate_identity(
+        _candidate("Some Title"), [_reference(reference_id="r1")]
+    )
+    assert review.outcome == Outcome.REVIEW_REQUIRED
+    rules.assert_verifiable(review)  # never raises for non-AUTO_PASS
+
+    reject = rules.evaluate_candidate_identity(
+        _candidate("Something Completely Different"),
+        [_reference(reference_id="r1", reference_title="Unrelated Book Title Here")],
+    )
+    assert reject.outcome == Outcome.AUTO_REJECT
+    rules.assert_verifiable(reject)  # never raises for non-AUTO_PASS
 
 
 def test_evaluate_candidate_identity_is_order_independent():

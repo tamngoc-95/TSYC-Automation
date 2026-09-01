@@ -225,6 +225,59 @@ def publishers_conflict(values: Sequence[str | None]) -> bool:
     return len(normalized_values) > 1
 
 
+# --- production identity-verification invariant ---------------------------
+
+
+class IdentityVerificationInvariantError(RuntimeError):
+    """
+    Raised when code attempts to persist identity_status=IDENTITY_VERIFIED
+    from an AUTO_PASS decision that names no contributing reference.
+
+    This is the fail-closed guard for the confirmed FB-HIST-2026 incident
+    (2026-08-31): 5 historical candidates were written as IDENTITY_VERIFIED
+    by a legitimate multi-source consensus AUTO_PASS, but the reference-
+    sync step that ran afterward evaluated each reference independently
+    (single-reference thresholds only) and never learned which references
+    the consensus decision actually relied on -- so every reference row
+    was left at POSSIBLE_MATCH while the candidate claimed VERIFIED. See
+    assert_verifiable() and match_candidate_identity.py's
+    apply_reference_match_decisions().
+    """
+
+
+def assert_verifiable(decision: DecisionResult) -> None:
+    """
+    Fail-closed production invariant (CLAUDE.md sections 9, 10, 13; the
+    same rule scripts/audit_pipeline_state.py enforces after the fact as
+    VERIFIED_IDENTITY_WITHOUT_MATCH_REFERENCE): a candidate may enter
+    IDENTITY_VERIFIED only when the decision that produced it can name at
+    least one reference whose own match_decision the caller can -- and
+    must -- persist as MATCH.
+
+    Every AUTO_PASS branch of evaluate_candidate_identity() populates
+    evidence["contributing_reference_ids"] with exactly that evidence.
+    Call this immediately before writing identity_status=IDENTITY_VERIFIED
+    (scripts/match_candidate_identity.py's build_hardened_candidate_payload
+    is the one canonical write path that does) so a future rule change
+    that ever produces an AUTO_PASS without naming a contributing
+    reference fails loudly -- IDENTITY_VERIFICATION_INVARIANT_FAILED --
+    instead of silently persisting an ungrounded verified identity.
+
+    A no-op for any non-AUTO_PASS decision: REVIEW_REQUIRED/AUTO_REJECT
+    never claim IDENTITY_VERIFIED and are unaffected.
+    """
+    if decision.outcome != Outcome.AUTO_PASS:
+        return
+
+    if not decision.evidence.get("contributing_reference_ids"):
+        raise IdentityVerificationInvariantError(
+            "IDENTITY_VERIFICATION_INVARIANT_FAILED: an AUTO_PASS identity "
+            f"decision (rule_code={decision.rule_code!r}) names no "
+            "contributing reference -- refusing to persist "
+            "IDENTITY_VERIFIED without MATCH-reference evidence."
+        )
+
+
 # --- single-reference identity match --------------------------------------
 
 
@@ -932,6 +985,13 @@ def evaluate_candidate_identity(
                 **best_res.evidence,
                 "has_genuine_conflict": False,
                 "matching_reference_id": best_ref.get("reference_id"),
+                # The one reference whose own individual evaluation
+                # AUTO_PASSed -- the caller must persist match_decision=
+                # MATCH on exactly this reference. See
+                # assert_verifiable()/contributing_reference_ids on the
+                # consensus branch below for why this must never be
+                # empty on an AUTO_PASS.
+                "contributing_reference_ids": [best_ref.get("reference_id")],
             },
             confidence=best_res.confidence,
         )
@@ -1013,6 +1073,22 @@ def evaluate_candidate_identity(
                 "has_genuine_conflict": False,
                 "matching_reference_id": best_ref.get("reference_id"),
                 "valid_isbn_values": sorted(valid_isbn_values),
+                # EVERY reference that contributed to this multi-source
+                # consensus AUTO_PASS -- not just the "best" one chosen
+                # for canonical metadata above. The caller must persist
+                # match_decision=MATCH on each of these. Without this,
+                # a candidate can become IDENTITY_VERIFIED purely from
+                # combined multi-source evidence while every individual
+                # reference row is left at whatever
+                # evaluate_single_reference_identity() alone would say
+                # for it (often POSSIBLE_MATCH, since consensus exists
+                # precisely to combine signals no single reference
+                # reaches alone) -- the confirmed FB-HIST-2026 root
+                # cause of 5 candidates verified with zero MATCH
+                # references. See assert_verifiable().
+                "contributing_reference_ids": [
+                    r.get("reference_id") for r, _res in title_matches
+                ],
             },
             confidence=consensus.confidence,
         )

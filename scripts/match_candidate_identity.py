@@ -32,7 +32,30 @@ MATCHER_NAME = "candidate_identity_matcher"
 # identity_rules.evaluate_candidate_identity) replaces per-mode ad hoc
 # writes. See the "HARDENED, CUMULATIVE IDENTITY DECISION PATH" section
 # below for the two confirmed production incidents this fixes.
-MATCHER_VERSION = "2.0.0"
+# 2.1.0: fixes the FB-HIST-2026 IDENTITY_VERIFIED-without-MATCH-reference
+# incident (5 candidates, 2026-08-31). apply_reference_match_decisions()
+# now promotes every reference identity_rules.evaluate_candidate_identity()
+# names in a consensus AUTO_PASS's evidence["contributing_reference_ids"]
+# to match_decision=MATCH, instead of only ever re-deriving each
+# reference's decision independently (which a multi-source consensus
+# AUTO_PASS can legitimately outrun -- that's the whole point of
+# consensus). build_hardened_candidate_payload() also now calls
+# identity_rules.assert_verifiable() and fails closed
+# (IdentityVerificationInvariantError) if an AUTO_PASS ever again names
+# no contributing reference, and evaluate_and_apply_decision() writes
+# reference rows before the candidate row so a mid-write failure can
+# never leave a candidate claiming IDENTITY_VERIFIED with no MATCH
+# reference behind it. Also removes the legacy, pre-hardening
+# consensus write path (calculate_consensus_match /
+# update_candidate_from_consensus / update_references_from_consensus /
+# update_candidate_status and their now-orphaned helpers), which was
+# unreachable from main() (confirmed: no caller anywhere in the repo)
+# but had two of its own confirmed defects -- no idempotency/fingerprint
+# guard (the source of the duplicate identity_consensus_history entries
+# found on 4 candidates during the 2026-08-31 reconciliation) and its
+# own independent, undocumented reference-promotion rule that had
+# silently diverged from the current one.
+MATCHER_VERSION = "2.1.0"
 
 VALID_CONFIRMATIONS = {
     "SAVE",
@@ -264,629 +287,6 @@ def get_unmatched_reference(
 
     return None
 
-def calculate_match(
-    candidate: dict[str, Any],
-    reference: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Compare candidate identity data with reference metadata.
-
-    Delegates to the shared src.domain.rules.identity_rules engine
-    (evaluate_single_reference_identity) rather than reimplementing the
-    comparison independently -- see that function's docstring for the
-    exact thresholds and the ISBN-vs-barcode validity fix. This function
-    keeps its original return shape so every existing caller below is
-    unaffected by the extraction.
-    """
-    decision_result = identity_rules.evaluate_single_reference_identity(
-        candidate=candidate,
-        reference=reference,
-    )
-    evidence = decision_result.evidence
-
-    return {
-        "match_decision": evidence["match_decision"],
-        "match_confidence": decision_result.confidence,
-        "match_reason": decision_result.reason,
-        "title_similarity": evidence["title_similarity"],
-        "author_similarity": evidence["author_similarity"],
-        "isbn_match": evidence["isbn_match"],
-        "isbn_conflict": evidence["isbn_conflict"],
-        "candidate_isbn": evidence["candidate_isbn"],
-        "reference_isbn": evidence["reference_isbn"],
-        "rule_code": decision_result.rule_code,
-    }
-
-
-def print_match_result(
-    candidate: dict[str, Any],
-    reference: dict[str, Any],
-    discovery: dict[str, Any],
-    result: dict[str, Any],
-) -> None:
-    """Print identity matching details."""
-    print()
-    print("=" * 72)
-    print("IDENTITY MATCH RESULT")
-    print("=" * 72)
-
-    print(
-        "Candidate code: "
-        f"{candidate.get('candidate_code')}"
-    )
-
-    print(
-        "Reference ID: "
-        f"{reference.get('reference_id')}"
-    )
-
-    print(
-        "Source URL ID: "
-        f"{reference.get('source_url_id')}"
-    )
-
-    print(
-        "Source type: "
-        f"{reference.get('source_type')}"
-    )
-
-    print(
-        "Source name: "
-        f"{reference.get('source_name')}"
-    )
-
-    print(
-        "Discovery status: "
-        f"{discovery.get('discovery_status')}"
-    )
-
-    print()
-    print(
-        "Candidate title: "
-        f"{candidate.get('extracted_title')}"
-    )
-
-    print(
-        "Reference title: "
-        f"{reference.get('reference_title')}"
-    )
-
-    print(
-        "Title similarity: "
-        f"{result['title_similarity']}"
-    )
-
-    print()
-    print(
-        "Candidate author: "
-        f"{candidate.get('extracted_author') or '[not found]'}"
-    )
-
-    print(
-        "Reference author: "
-        f"{reference.get('reference_author') or '[not found]'}"
-    )
-
-    print(
-        "Author similarity: "
-        f"{result['author_similarity']}"
-    )
-
-    print()
-    print(
-        "Candidate ISBN: "
-        f"{result['candidate_isbn'] or '[not found]'}"
-    )
-
-    print(
-        "Reference ISBN: "
-        f"{result['reference_isbn'] or '[not found]'}"
-    )
-
-    print()
-    print(
-        "Decision: "
-        f"{result['match_decision']}"
-    )
-
-    print(
-        "Confidence: "
-        f"{result['match_confidence']}"
-    )
-
-    print(
-        "Reason: "
-        f"{result['match_reason']}"
-    )
-
-
-def build_source_evidence(
-    candidate: dict[str, Any],
-    reference: dict[str, Any],
-    result: dict[str, Any],
-) -> dict[str, Any]:
-    """Build candidate source evidence without deleting existing data."""
-    existing_evidence = candidate.get(
-        "source_evidence"
-    )
-
-    if isinstance(
-        existing_evidence,
-        dict,
-    ):
-        source_evidence = dict(
-            existing_evidence
-        )
-
-    else:
-        source_evidence = {}
-
-    identity_history = source_evidence.get(
-        "identity_verification_history"
-    )
-
-    if not isinstance(
-        identity_history,
-        list,
-    ):
-        identity_history = []
-
-    identity_event = {
-        "reference_id": reference.get(
-            "reference_id"
-        ),
-        "source_url_id": reference.get(
-            "source_url_id"
-        ),
-        "source_type": reference.get(
-            "source_type"
-        ),
-        "source_name": reference.get(
-            "source_name"
-        ),
-        "source_url": reference.get(
-            "source_url"
-        ),
-        "match_decision": result[
-            "match_decision"
-        ],
-        "match_confidence": result[
-            "match_confidence"
-        ],
-        "match_reason": result[
-            "match_reason"
-        ],
-        "title_similarity": result[
-            "title_similarity"
-        ],
-        "author_similarity": result[
-            "author_similarity"
-        ],
-        "isbn_match": result[
-            "isbn_match"
-        ],
-        "isbn_conflict": result[
-            "isbn_conflict"
-        ],
-        "matcher_name": MATCHER_NAME,
-        "matcher_version": MATCHER_VERSION,
-        "verified_at": utc_now(),
-    }
-
-    identity_history.append(
-        identity_event
-    )
-
-    source_evidence[
-        "identity_verification_history"
-    ] = identity_history
-
-    source_evidence[
-        "latest_identity_verification"
-    ] = identity_event
-
-    return source_evidence
-
-
-def build_conflict_fields(
-    result: dict[str, Any],
-) -> list[str]:
-    """Return fields that conflict between candidate and reference."""
-    conflict_fields: list[str] = []
-
-    if result.get(
-        "isbn_conflict"
-    ):
-        conflict_fields.append(
-            "isbn"
-        )
-
-    if result.get(
-        "title_similarity",
-        0,
-    ) < 0.60:
-        conflict_fields.append(
-            "title"
-        )
-
-    return conflict_fields
-
-
-def update_candidate_status(
-    repository: SupabaseRepository,
-    candidate: dict[str, Any],
-    reference: dict[str, Any],
-    result: dict[str, Any],
-) -> None:
-    """Update candidate identity status and verified metadata."""
-    candidate_id = candidate.get(
-        "candidate_id"
-    )
-
-    if not candidate_id:
-        raise ValueError(
-            "candidate_id is required."
-        )
-
-    decision = result[
-        "match_decision"
-    ]
-
-    if decision == MatchDecision.MATCH:
-        identity_status = IdentityStatus.IDENTITY_VERIFIED
-        workflow_status = IdentityStatus.IDENTITY_VERIFIED
-        review_required = False
-        review_reason = None
-        decision_reason = result[
-            "match_reason"
-        ]
-
-    elif decision in {
-        MatchDecision.POSSIBLE_MATCH,
-        MatchDecision.MANUAL_REVIEW,
-        MatchDecision.DIFFERENT_EDITION,
-    }:
-        identity_status = IdentityStatus.IDENTITY_PENDING
-        workflow_status = IdentityStatus.IDENTITY_PENDING
-        review_required = True
-        review_reason = result[
-            "match_reason"
-        ]
-        decision_reason = None
-
-    elif decision == MatchDecision.NO_MATCH:
-        identity_status = IdentityStatus.IDENTITY_CONFLICT
-        workflow_status = IdentityStatus.IDENTITY_CONFLICT
-        review_required = True
-        review_reason = result[
-            "match_reason"
-        ]
-        decision_reason = None
-
-    else:
-        raise ValueError(
-            "Unsupported match decision: "
-            f"{decision}"
-        )
-
-    source_evidence = build_source_evidence(
-        candidate=candidate,
-        reference=reference,
-        result=result,
-    )
-
-    payload: dict[str, Any] = {
-        "identity_status": identity_status,
-        "workflow_status": workflow_status,
-        "identity_confidence": result[
-            "match_confidence"
-        ],
-        "source_evidence": source_evidence,
-        "review_required": review_required,
-        "review_reason": review_reason,
-        "decision_reason": decision_reason,
-        "updated_at": utc_now(),
-    }
-
-    if decision == MatchDecision.MATCH:
-        payload.update(
-            {
-                "verified_title": (
-                    reference.get(
-                        "reference_title"
-                    )
-                    or candidate.get(
-                        "extracted_title"
-                    )
-                ),
-                "verified_isbn": (
-                    reference.get(
-                        "reference_isbn"
-                    )
-                    or candidate.get(
-                        "possible_isbn"
-                    )
-                ),
-                "verified_author": (
-                    reference.get(
-                        "reference_author"
-                    )
-                    or candidate.get(
-                        "extracted_author"
-                    )
-                ),
-                "verified_publisher": (
-                    reference.get(
-                        "reference_publisher"
-                    )
-                ),
-                "verified_page_count": (
-                    reference.get(
-                        "reference_page_count"
-                    )
-                ),
-                "verified_weight_grams": (
-                    reference.get(
-                        "reference_weight_grams"
-                    )
-                ),
-                "verified_length_cm": (
-                    reference.get(
-                        "reference_length_cm"
-                    )
-                ),
-                "verified_width_cm": (
-                    reference.get(
-                        "reference_width_cm"
-                    )
-                ),
-                "verified_height_cm": (
-                    reference.get(
-                        "reference_height_cm"
-                    )
-                ),
-                "conflict_fields": [],
-            }
-        )
-
-    elif decision == MatchDecision.NO_MATCH:
-        payload[
-            "conflict_fields"
-        ] = build_conflict_fields(
-            result
-        )
-
-    response = (
-        repository.client
-        .table("product_candidates")
-        .update(payload)
-        .eq(
-            "candidate_id",
-            candidate_id,
-        )
-        .execute()
-    )
-
-    if not response.data:
-        raise RuntimeError(
-            "Candidate identity update returned no data."
-        )
-
-
-def update_product_reference(
-    repository: SupabaseRepository,
-    reference: dict[str, Any],
-    result: dict[str, Any],
-) -> None:
-    """Save identity matching result to the product reference."""
-    reference_id = reference.get(
-        "reference_id"
-    )
-
-    if not reference_id:
-        raise ValueError(
-            "reference_id is required."
-        )
-
-    existing_metadata = reference.get(
-        "raw_metadata"
-    )
-
-    if isinstance(
-        existing_metadata,
-        dict,
-    ):
-        raw_metadata = dict(
-            existing_metadata
-        )
-
-    else:
-        raw_metadata = {}
-
-    raw_metadata[
-        "identity_match"
-    ] = {
-        "matcher_name": MATCHER_NAME,
-        "matcher_version": MATCHER_VERSION,
-        "matched_at": utc_now(),
-        "reason": result[
-            "match_reason"
-        ],
-        "title_similarity": result[
-            "title_similarity"
-        ],
-        "author_similarity": result[
-            "author_similarity"
-        ],
-        "isbn_match": result[
-            "isbn_match"
-        ],
-        "isbn_conflict": result[
-            "isbn_conflict"
-        ],
-    }
-
-    response = (
-        repository.client
-        .table("product_references")
-        .update(
-            {
-                "match_decision": result[
-                    "match_decision"
-                ],
-                "match_confidence": result[
-                    "match_confidence"
-                ],
-                "raw_metadata": raw_metadata,
-                "updated_at": utc_now(),
-            }
-        )
-        .eq(
-            "reference_id",
-            reference_id,
-        )
-        .execute()
-    )
-
-    if not response.data:
-        raise RuntimeError(
-            "Product reference match update returned no data."
-        )
-
-
-def update_discovery_status(
-    repository: SupabaseRepository,
-    discovery: dict[str, Any],
-    decision: str,
-) -> None:
-    """Update one exact candidate reference discovery record."""
-    discovery_id = discovery.get(
-        "discovery_id"
-    )
-
-    candidate_id = discovery.get(
-        "candidate_id"
-    )
-
-    source_url_id = discovery.get(
-        "source_url_id"
-    )
-
-    if not discovery_id:
-        raise ValueError(
-            "discovery_id is required."
-        )
-
-    if not candidate_id:
-        raise ValueError(
-            "candidate_id is required."
-        )
-
-    if not source_url_id:
-        raise ValueError(
-            "source_url_id is required."
-        )
-
-    if decision == MatchDecision.MATCH:
-        discovery_status = "MATCHED"
-
-    elif decision == MatchDecision.NO_MATCH:
-        discovery_status = "REJECTED"
-
-    else:
-        discovery_status = "CRAWLED"
-
-    response = (
-        repository.client
-        .table(
-            "candidate_reference_sources"
-        )
-        .update(
-            {
-                "discovery_status": discovery_status,
-                "reviewed_at": utc_now(),
-                "updated_at": utc_now(),
-            }
-        )
-        .eq(
-            "discovery_id",
-            discovery_id,
-        )
-        .eq(
-            "candidate_id",
-            candidate_id,
-        )
-        .eq(
-            "source_url_id",
-            source_url_id,
-        )
-        .execute()
-    )
-
-    if not response.data:
-        raise RuntimeError(
-            "No candidate reference discovery record was updated."
-        )
-
-
-def validate_queue_item(
-    candidate: dict[str, Any],
-    reference: dict[str, Any],
-    discovery: dict[str, Any],
-) -> None:
-    """Validate linked IDs before any database updates."""
-    candidate_id = candidate.get(
-        "candidate_id"
-    )
-
-    reference_candidate_id = reference.get(
-        "candidate_id"
-    )
-
-    discovery_candidate_id = discovery.get(
-        "candidate_id"
-    )
-
-    reference_source_url_id = reference.get(
-        "source_url_id"
-    )
-
-    discovery_source_url_id = discovery.get(
-        "source_url_id"
-    )
-
-    if not candidate_id:
-        raise RuntimeError(
-            "The selected candidate has no candidate_id."
-        )
-
-    if not reference_source_url_id:
-        raise RuntimeError(
-            "The selected product reference has no source_url_id."
-        )
-
-    if not discovery_source_url_id:
-        raise RuntimeError(
-            "The selected discovery has no source_url_id."
-        )
-
-    if candidate_id != reference_candidate_id:
-        raise RuntimeError(
-            "Candidate ID and reference candidate ID do not match."
-        )
-
-    if candidate_id != discovery_candidate_id:
-        raise RuntimeError(
-            "Candidate ID and discovery candidate ID do not match."
-        )
-
-    if reference_source_url_id != discovery_source_url_id:
-        raise RuntimeError(
-            "Reference source URL ID and discovery source URL ID "
-            "do not match."
-        )
-
-
 
 def get_pending_consensus_candidate(
     repository: SupabaseRepository,
@@ -1001,631 +401,6 @@ def get_pending_consensus_candidate(
             }
 
     return None
-
-def choose_best_reference(
-    references: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Choose the richest trusted reference for verified metadata."""
-    def score(reference: dict[str, Any]) -> tuple[int, int]:
-        metadata_score = sum(
-            1
-            for field_name in (
-                "reference_title",
-                "reference_isbn",
-                "reference_author",
-                "reference_publisher",
-                "reference_page_count",
-                "reference_weight_grams",
-                "reference_length_cm",
-                "reference_width_cm",
-                "reference_height_cm",
-            )
-            if reference.get(field_name)
-        )
-
-        if is_specific_author(
-            reference.get("reference_author")
-        ):
-            metadata_score += 3
-
-        priority = int(
-            reference.get("source_priority")
-            or 99
-        )
-
-        return (
-            metadata_score,
-            -priority,
-        )
-
-    return max(
-        references,
-        key=score,
-    )
-
-
-def calculate_consensus_match(
-    candidate: dict[str, Any],
-    references: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Calculate a multi-source identity decision for one candidate."""
-    candidate_title = candidate.get("extracted_title")
-    candidate_isbn = normalize_isbn(
-        candidate.get("possible_isbn")
-    )
-
-    reference_results: list[dict[str, Any]] = []
-    title_matches: list[dict[str, Any]] = []
-    isbn_values: set[str] = set()
-
-    for reference in references:
-        result = calculate_match(
-            candidate=candidate,
-            reference=reference,
-        )
-
-        reference_result = {
-            "reference": reference,
-            "result": result,
-        }
-
-        reference_results.append(
-            reference_result
-        )
-
-        if (
-            result["title_similarity"] >= 0.90
-            and not result["isbn_conflict"]
-        ):
-            title_matches.append(
-                reference_result
-            )
-
-        reference_isbn = normalize_isbn(
-            reference.get("reference_isbn")
-        )
-
-        if reference_isbn:
-            isbn_values.add(reference_isbn)
-
-    isbn_conflict = (
-        len(isbn_values) > 1
-        or bool(
-            candidate_isbn
-            and isbn_values
-            and candidate_isbn not in isbn_values
-        )
-    )
-
-    specific_authors = [
-        item["reference"].get("reference_author")
-        for item in title_matches
-        if is_specific_author(
-            item["reference"].get(
-                "reference_author"
-            )
-        )
-    ]
-
-    normalized_specific_authors = {
-        normalize_text(author)
-        for author in specific_authors
-        if author
-    }
-
-    author_conflict = (
-        len(normalized_specific_authors) > 1
-    )
-
-    matching_page_counts = {
-        item["reference"].get(
-            "reference_page_count"
-        )
-        for item in title_matches
-        if item["reference"].get(
-            "reference_page_count"
-        ) is not None
-    }
-
-    page_count_conflict = (
-        len(matching_page_counts) > 1
-    )
-
-    best_reference = choose_best_reference(
-        [
-            item["reference"]
-            for item in title_matches
-        ]
-        or references
-    )
-
-    max_individual_confidence = max(
-        (item["result"]["match_confidence"] for item in reference_results),
-        default=0.0,
-    )
-
-    decision_result = identity_rules.evaluate_consensus_identity(
-        isbn_conflict=isbn_conflict,
-        author_conflict=author_conflict,
-        page_count_conflict=page_count_conflict,
-        matching_reference_count=len(title_matches),
-        has_specific_author=bool(specific_authors),
-        max_individual_confidence=max_individual_confidence,
-    )
-
-    return {
-        "match_decision": decision_result.evidence["match_decision"],
-        "match_confidence": decision_result.confidence,
-        "match_reason": decision_result.reason,
-        "isbn_conflict": isbn_conflict,
-        "author_conflict": author_conflict,
-        "page_count_conflict": page_count_conflict,
-        "matching_reference_count": len(
-            title_matches
-        ),
-        "reference_results": reference_results,
-        "best_reference": best_reference,
-        "specific_author": (
-            specific_authors[0]
-            if specific_authors
-            else None
-        ),
-        "rule_code": decision_result.rule_code,
-    }
-
-
-def print_consensus_result(
-    candidate: dict[str, Any],
-    consensus: dict[str, Any],
-) -> None:
-    """Print a multi-source identity result."""
-    print()
-    print("=" * 72)
-    print("MULTI-SOURCE IDENTITY CONSENSUS")
-    print("=" * 72)
-    print(
-        "Candidate code: "
-        f"{candidate.get('candidate_code')}"
-    )
-    print(
-        "Candidate title: "
-        f"{candidate.get('extracted_title')}"
-    )
-    print(
-        "Matching references: "
-        f"{consensus['matching_reference_count']}"
-    )
-
-    for index, item in enumerate(
-        consensus["reference_results"],
-        start=1,
-    ):
-        reference = item["reference"]
-        result = item["result"]
-
-        print()
-        print(
-            f"[{index}] "
-            f"{reference.get('source_type')} | "
-            f"{reference.get('source_name')}"
-        )
-        print(
-            "    Title: "
-            f"{reference.get('reference_title')}"
-        )
-        print(
-            "    Author: "
-            f"{reference.get('reference_author') or '[not found]'}"
-        )
-        print(
-            "    Publisher: "
-            f"{reference.get('reference_publisher') or '[not found]'}"
-        )
-        print(
-            "    Page count: "
-            f"{reference.get('reference_page_count') or '[not found]'}"
-        )
-        print(
-            "    Title similarity: "
-            f"{result['title_similarity']}"
-        )
-
-    print()
-    print(
-        "Selected verified author: "
-        f"{consensus.get('specific_author') or '[not found]'}"
-    )
-    print(
-        "Decision: "
-        f"{consensus['match_decision']}"
-    )
-    print(
-        "Confidence: "
-        f"{consensus['match_confidence']}"
-    )
-    print(
-        "Reason: "
-        f"{consensus['match_reason']}"
-    )
-
-
-def build_consensus_source_evidence(
-    candidate: dict[str, Any],
-    consensus: dict[str, Any],
-) -> dict[str, Any]:
-    """Append a multi-source consensus event to candidate evidence."""
-    existing_evidence = candidate.get(
-        "source_evidence"
-    )
-
-    source_evidence = (
-        dict(existing_evidence)
-        if isinstance(existing_evidence, dict)
-        else {}
-    )
-
-    history = source_evidence.get(
-        "identity_consensus_history"
-    )
-
-    if not isinstance(history, list):
-        history = []
-
-    event = {
-        "match_decision": consensus[
-            "match_decision"
-        ],
-        "match_confidence": consensus[
-            "match_confidence"
-        ],
-        "match_reason": consensus[
-            "match_reason"
-        ],
-        "matching_reference_count": consensus[
-            "matching_reference_count"
-        ],
-        "selected_reference_id": consensus[
-            "best_reference"
-        ].get("reference_id"),
-        "selected_author": consensus.get(
-            "specific_author"
-        ),
-        "metadata_warnings": [
-            field_name
-            for field_name, value in (
-                (
-                    "isbn",
-                    consensus["best_reference"].get(
-                        "reference_isbn"
-                    )
-                    or candidate.get(
-                        "possible_isbn"
-                    ),
-                ),
-                (
-                    "weight_grams",
-                    consensus["best_reference"].get(
-                        "reference_weight_grams"
-                    ),
-                ),
-            )
-            if not value
-        ],
-        "reference_ids": [
-            item["reference"].get(
-                "reference_id"
-            )
-            for item in consensus[
-                "reference_results"
-            ]
-        ],
-        "matcher_name": MATCHER_NAME,
-        "matcher_version": MATCHER_VERSION,
-        "verified_at": utc_now(),
-    }
-
-    history.append(event)
-
-    source_evidence[
-        "identity_consensus_history"
-    ] = history
-    source_evidence[
-        "latest_identity_consensus"
-    ] = event
-
-    return source_evidence
-
-
-def update_candidate_from_consensus(
-    repository: SupabaseRepository,
-    candidate: dict[str, Any],
-    consensus: dict[str, Any],
-) -> None:
-    """Update candidate using the multi-source consensus decision."""
-    candidate_id = candidate.get(
-        "candidate_id"
-    )
-
-    if not candidate_id:
-        raise ValueError(
-            "candidate_id is required."
-        )
-
-    decision = consensus[
-        "match_decision"
-    ]
-    best_reference = consensus[
-        "best_reference"
-    ]
-
-    if decision == MatchDecision.MATCH:
-        verified_isbn = (
-            best_reference.get(
-                "reference_isbn"
-            )
-            or candidate.get(
-                "possible_isbn"
-            )
-        )
-
-        verified_weight = best_reference.get(
-            "reference_weight_grams"
-        )
-
-        # Missing ISBN and weight are metadata warnings only.
-        # They do not block a successfully verified book identity.
-        review_required = False
-        review_reason = None
-
-        payload: dict[str, Any] = {
-            "identity_status": IdentityStatus.IDENTITY_VERIFIED,
-            "workflow_status": IdentityStatus.IDENTITY_VERIFIED,
-            "identity_confidence": consensus[
-                "match_confidence"
-            ],
-            "verified_title": (
-                best_reference.get(
-                    "reference_title"
-                )
-                or candidate.get(
-                    "extracted_title"
-                )
-            ),
-            "verified_isbn": verified_isbn,
-            "verified_author": (
-                consensus.get(
-                    "specific_author"
-                )
-                or best_reference.get(
-                    "reference_author"
-                )
-                or candidate.get(
-                    "extracted_author"
-                )
-            ),
-            "verified_publisher": best_reference.get(
-                "reference_publisher"
-            ),
-            "verified_page_count": best_reference.get(
-                "reference_page_count"
-            ),
-            "verified_weight_grams": verified_weight,
-            "verified_length_cm": best_reference.get(
-                "reference_length_cm"
-            ),
-            "verified_width_cm": best_reference.get(
-                "reference_width_cm"
-            ),
-            "verified_height_cm": best_reference.get(
-                "reference_height_cm"
-            ),
-            "review_required": review_required,
-            "review_reason": review_reason,
-            "decision_reason": consensus[
-                "match_reason"
-            ],
-            "conflict_fields": [],
-            "source_evidence": (
-                build_consensus_source_evidence(
-                    candidate=candidate,
-                    consensus=consensus,
-                )
-            ),
-            "updated_at": utc_now(),
-        }
-
-    elif decision == MatchDecision.NO_MATCH:
-        payload = {
-            "identity_status": IdentityStatus.IDENTITY_CONFLICT,
-            "workflow_status": IdentityStatus.IDENTITY_CONFLICT,
-            "identity_confidence": consensus[
-                "match_confidence"
-            ],
-            "review_required": True,
-            "review_reason": consensus[
-                "match_reason"
-            ],
-            "decision_reason": None,
-            "conflict_fields": [
-                field_name
-                for field_name, has_conflict in (
-                    (
-                        "isbn",
-                        consensus.get(
-                            "isbn_conflict"
-                        ),
-                    ),
-                    (
-                        "author",
-                        consensus.get(
-                            "author_conflict"
-                        ),
-                    ),
-                    (
-                        "page_count",
-                        consensus.get(
-                            "page_count_conflict"
-                        ),
-                    ),
-                )
-                if has_conflict
-            ],
-            "source_evidence": (
-                build_consensus_source_evidence(
-                    candidate=candidate,
-                    consensus=consensus,
-                )
-            ),
-            "updated_at": utc_now(),
-        }
-
-    else:
-        payload = {
-            "identity_status": IdentityStatus.IDENTITY_PENDING,
-            "workflow_status": IdentityStatus.IDENTITY_PENDING,
-            "identity_confidence": consensus[
-                "match_confidence"
-            ],
-            "review_required": True,
-            "review_reason": consensus[
-                "match_reason"
-            ],
-            "decision_reason": None,
-            "source_evidence": (
-                build_consensus_source_evidence(
-                    candidate=candidate,
-                    consensus=consensus,
-                )
-            ),
-            "updated_at": utc_now(),
-        }
-
-    response = (
-        repository.client
-        .table("product_candidates")
-        .update(payload)
-        .eq(
-            "candidate_id",
-            candidate_id,
-        )
-        .execute()
-    )
-
-    if not response.data:
-        raise RuntimeError(
-            "Candidate consensus update returned no data."
-        )
-
-
-def update_references_from_consensus(
-    repository: SupabaseRepository,
-    consensus: dict[str, Any],
-) -> None:
-    """Update all reference and discovery records from consensus."""
-    final_decision = consensus[
-        "match_decision"
-    ]
-
-    for item in consensus[
-        "reference_results"
-    ]:
-        reference = item[
-            "reference"
-        ]
-        individual_result = item[
-            "result"
-        ]
-
-        if (
-            final_decision == MatchDecision.MATCH
-            and individual_result[
-                "title_similarity"
-            ] >= 0.90
-            and not individual_result[
-                "isbn_conflict"
-            ]
-        ):
-            reference_decision = MatchDecision.MATCH
-            reference_confidence = max(
-                individual_result[
-                    "match_confidence"
-                ],
-                0.90,
-            )
-        else:
-            reference_decision = individual_result[
-                "match_decision"
-            ]
-            reference_confidence = individual_result[
-                "match_confidence"
-            ]
-
-        updated_result = dict(
-            individual_result
-        )
-        updated_result[
-            "match_decision"
-        ] = reference_decision
-        updated_result[
-            "match_confidence"
-        ] = reference_confidence
-        updated_result[
-            "match_reason"
-        ] = (
-            consensus[
-                "match_reason"
-            ]
-            if reference_decision == MatchDecision.MATCH
-            else individual_result[
-                "match_reason"
-            ]
-        )
-
-        update_product_reference(
-            repository=repository,
-            reference=reference,
-            result=updated_result,
-        )
-
-        discovery_response = (
-            repository.client
-            .table(
-                "candidate_reference_sources"
-            )
-            .select(
-                "discovery_id,"
-                "candidate_id,"
-                "source_url_id,"
-                "discovery_status,"
-                "is_selected_for_crawl"
-            )
-            .eq(
-                "candidate_id",
-                reference.get(
-                    "candidate_id"
-                ),
-            )
-            .eq(
-                "source_url_id",
-                reference.get(
-                    "source_url_id"
-                ),
-            )
-            .limit(1)
-            .execute()
-        )
-
-        discoveries = (
-            discovery_response.data
-            or []
-        )
-
-        if discoveries:
-            update_discovery_status(
-                repository=repository,
-                discovery=discoveries[0],
-                decision=reference_decision,
-            )
 
 def resolve_save_confirmation(
     args: argparse.Namespace,
@@ -1954,6 +729,13 @@ def build_hardened_candidate_payload(
     evidence = decision.evidence
 
     if decision.outcome == Outcome.AUTO_PASS:
+        # Fail closed (CLAUDE.md 9/10/13): refuse to persist
+        # IDENTITY_VERIFIED unless the decision names at least one
+        # reference whose match_decision can be, and must be, written as
+        # MATCH -- see IdentityVerificationInvariantError's docstring for
+        # the confirmed incident this guards against.
+        identity_rules.assert_verifiable(decision)
+
         matching_reference_id = evidence.get("matching_reference_id")
         matching_reference = references_by_id.get(matching_reference_id) or {}
 
@@ -2038,6 +820,7 @@ def apply_reference_match_decisions(
     repository: SupabaseRepository,
     candidate: dict[str, Any],
     references: list[dict[str, Any]],
+    decision: Any | None = None,
 ) -> int:
     """
     Write each USABLE reference's own individual match_decision/
@@ -2053,9 +836,37 @@ def apply_reference_match_decisions(
     decision for an unusable reference -- it only ever removes a wrong
     one that should never have been written.
 
+    `decision` is the same candidate-level DecisionResult that
+    evaluate_and_apply_decision() is about to (or just did) turn into a
+    write. When its outcome is AUTO_PASS, every reference named in
+    decision.evidence["contributing_reference_ids"] is force-written to
+    match_decision=MATCH (confidence floored at 0.90) regardless of what
+    evaluate_single_reference_identity() alone would say for it. Those
+    are exactly the references whose *combined* multi-source evidence
+    the AUTO_PASS was verified from -- consensus exists precisely to
+    reach MATCH-strength conclusions no single reference reaches alone
+    (e.g. two independent sources agreeing on title with no conflicts,
+    each individually missing only the author). Without this, a
+    candidate can become IDENTITY_VERIFIED while every one of its
+    reference rows is left at whatever its own single-reference
+    evaluation says (often POSSIBLE_MATCH) -- the confirmed root cause
+    of the FB-HIST-2026 false-VERIFIED incident (5 candidates,
+    2026-08-31): IDENTITY_VERIFIED with zero MATCH references. A caller
+    that omits `decision` (or passes a non-AUTO_PASS one) gets exactly
+    the prior per-reference-only behavior.
+
     Returns the number of reference rows actually updated.
     """
     updated_count = 0
+
+    contributing_ids: set[str] = set()
+    if decision is not None and decision.outcome == Outcome.AUTO_PASS:
+        contributing_ids = {
+            str(reference_id)
+            for reference_id in (
+                decision.evidence.get("contributing_reference_ids") or []
+            )
+        }
 
     for reference in references:
         if not identity_rules.is_reference_evaluable(reference):
@@ -2086,6 +897,13 @@ def apply_reference_match_decisions(
         )
         new_decision = result.evidence["match_decision"]
         new_confidence = result.confidence
+        new_reason = result.reason
+
+        is_contributing = str(reference.get("reference_id")) in contributing_ids
+        if is_contributing:
+            new_decision = MatchDecision.MATCH
+            new_confidence = max(new_confidence, 0.90)
+            new_reason = decision.reason
 
         if (
             reference.get("match_decision") == new_decision
@@ -2101,11 +919,12 @@ def apply_reference_match_decisions(
             "matcher_name": MATCHER_NAME,
             "matcher_version": MATCHER_VERSION,
             "matched_at": utc_now(),
-            "reason": result.reason,
+            "reason": new_reason,
             "title_similarity": result.evidence.get("title_similarity"),
             "author_similarity": result.evidence.get("author_similarity"),
             "isbn_match": result.evidence.get("isbn_match"),
             "isbn_conflict": result.evidence.get("isbn_conflict"),
+            "promoted_by_consensus": is_contributing,
         }
 
         response = (
@@ -2195,7 +1014,37 @@ def evaluate_and_apply_decision(
         and reference.get("match_decision") is not None
     ]
 
-    if stored_fingerprint == fingerprint and not stale_unusable_reference_ids:
+    # References named as contributing evidence to an AUTO_PASS that do
+    # NOT yet carry match_decision=MATCH. The decision_fingerprint alone
+    # (compute_decision_fingerprint does not hash contributing_reference_
+    # ids -- it hashes the evidence the decision was computed FROM, not
+    # this derived promotion list) cannot detect this by itself: an
+    # already-VERIFIED candidate whose references were left unsynced by
+    # a prior, buggy run (the confirmed FB-HIST-2026 shape) has an
+    # unchanged fingerprint on rerun even though its reference rows still
+    # need fixing. Checking this explicitly is what makes a plain rerun
+    # -- --mode RECOMPUTE, no raw SQL -- actually able to repair it.
+    unsynced_contributing_reference_ids: list[str] = []
+    if decision.outcome == Outcome.AUTO_PASS:
+        references_by_id_for_sync = {
+            str(r.get("reference_id")): r for r in references
+        }
+        unsynced_contributing_reference_ids = [
+            reference_id
+            for reference_id in (
+                decision.evidence.get("contributing_reference_ids") or []
+            )
+            if (references_by_id_for_sync.get(str(reference_id)) or {}).get(
+                "match_decision"
+            )
+            != MatchDecision.MATCH
+        ]
+
+    if (
+        stored_fingerprint == fingerprint
+        and not stale_unusable_reference_ids
+        and not unsynced_contributing_reference_ids
+    ):
         print()
         print(
             "NO_OP: decision unchanged since the last evaluation "
@@ -2203,32 +1052,76 @@ def evaluate_and_apply_decision(
         )
         return {**base_result, "action": "NO_OP"}
 
-    if stored_fingerprint == fingerprint and stale_unusable_reference_ids:
+    if stored_fingerprint == fingerprint and (
+        stale_unusable_reference_ids or unsynced_contributing_reference_ids
+    ):
         # The candidate-level decision itself is unchanged, but one or
-        # more unusable references still carry a stale match_decision
-        # from before this hardening (the exact CAN-0015/CAN-0039
-        # incident shape) -- clear it. Not a NO_OP: this is a real,
-        # one-time correction, not a decision change.
+        # more reference rows still need a one-time correction: either a
+        # stale match_decision on an unusable reference from before
+        # hardening (the CAN-0015/CAN-0039 incident shape), or -- the
+        # confirmed FB-HIST-2026 shape -- a reference this AUTO_PASS
+        # relies on that was never promoted to match_decision=MATCH
+        # (e.g. because an earlier matcher version wrote the candidate
+        # as IDENTITY_VERIFIED without doing so). Not a NO_OP: this is a
+        # real, one-time correction, not a decision change. This is what
+        # lets a plain rerun/--mode RECOMPUTE actually repair an
+        # already-VERIFIED candidate whose references were left
+        # unsynced -- the candidate row itself is never touched here.
         print()
-        print(
-            "Decision unchanged, but "
-            f"{len(stale_unusable_reference_ids)} unusable reference(s) "
-            "still carry a stale match_decision from before hardening -- "
-            "clearing."
-        )
+        if stale_unusable_reference_ids:
+            print(
+                f"Decision unchanged, but {len(stale_unusable_reference_ids)} "
+                "unusable reference(s) still carry a stale match_decision "
+                "from before hardening -- clearing."
+            )
+        if unsynced_contributing_reference_ids:
+            print(
+                "Decision unchanged, but "
+                f"{len(unsynced_contributing_reference_ids)} reference(s) "
+                "contributing to this AUTO_PASS are not yet "
+                "match_decision=MATCH -- syncing."
+            )
         if not confirm_save:
-            return {**base_result, "action": "WOULD_CLEAR_STALE_UNUSABLE_DECISIONS"}
-        cleared_count = apply_reference_match_decisions(repository, candidate, references)
+            return {**base_result, "action": "WOULD_SYNC_REFERENCE_DECISIONS"}
+        synced_count = apply_reference_match_decisions(
+            repository, candidate, references, decision
+        )
         return {
             **base_result,
-            "action": "CLEARED_STALE_UNUSABLE_DECISIONS",
-            "reference_rows_updated": cleared_count,
+            "action": "SYNCED_REFERENCE_DECISIONS",
+            "reference_rows_updated": synced_count,
         }
 
     current_status = candidate.get("identity_status")
 
     if current_status == IdentityStatus.IDENTITY_VERIFIED:
         if decision.outcome == Outcome.AUTO_PASS:
+            # Candidate-level identity is already correct and is not
+            # being rewritten (CLAUDE.md 2.7). Defense in depth: still
+            # make sure every reference this (newer) AUTO_PASS decision
+            # counts as contributing evidence is persisted as MATCH --
+            # the same repair the fingerprint-matched branch above
+            # performs, kept here too in case new evidence changed the
+            # fingerprint while the AUTO_PASS conclusion stayed the same.
+            if not confirm_save:
+                return {**base_result, "action": "NO_OP_VERIFIED_CONSISTENT"}
+
+            synced_count = apply_reference_match_decisions(
+                repository, candidate, references, decision
+            )
+            if synced_count:
+                print()
+                print(
+                    f"VERIFIED_CONSISTENT: {candidate_code} stays "
+                    f"IDENTITY_VERIFIED; synced {synced_count} reference "
+                    "row(s) to match_decision=MATCH."
+                )
+                return {
+                    **base_result,
+                    "action": "VERIFIED_CONSISTENT_REFERENCES_SYNCED",
+                    "reference_rows_updated": synced_count,
+                }
+
             print()
             print(
                 f"NO_OP: {candidate_code} is already IDENTITY_VERIFIED and "
@@ -2269,6 +1162,9 @@ def evaluate_and_apply_decision(
         return {**base_result, "action": "VERIFIED_PROTECTED_CONFLICT_FLAGGED"}
 
     references_by_id = {str(r.get("reference_id")): r for r in references}
+    # assert_verifiable() inside build_hardened_candidate_payload's
+    # AUTO_PASS branch runs before any write is attempted -- an
+    # ungrounded AUTO_PASS raises here, before either table is touched.
     payload = build_hardened_candidate_payload(
         candidate, decision, references_by_id, fingerprint
     )
@@ -2277,6 +1173,19 @@ def evaluate_and_apply_decision(
         print()
         print(f"WOULD WRITE: identity_status -> {payload['identity_status']}")
         return {**base_result, "action": f"WOULD_WRITE:{payload['identity_status']}"}
+
+    # Reference rows are synced BEFORE the candidate row is flipped to
+    # IDENTITY_VERIFIED -- not after. If this raises (a Supabase error,
+    # or a future invariant violation), the candidate is never left
+    # claiming a verified identity that its references don't yet back
+    # up. This ordering, plus assert_verifiable() above, is the fix for
+    # the confirmed FB-HIST-2026 incident: a candidate was previously
+    # written IDENTITY_VERIFIED first, then reference promotion ran
+    # separately and (due to the now-fixed bug) never actually promoted
+    # anything for a multi-source consensus AUTO_PASS.
+    updated_reference_count = apply_reference_match_decisions(
+        repository, candidate, references, decision
+    )
 
     response = (
         repository.client
@@ -2287,10 +1196,6 @@ def evaluate_and_apply_decision(
     )
     if not response.data:
         raise RuntimeError("Candidate hardened-decision update returned no data.")
-
-    updated_reference_count = apply_reference_match_decisions(
-        repository, candidate, references
-    )
 
     print()
     print(
