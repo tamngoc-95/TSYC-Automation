@@ -1912,6 +1912,74 @@ def update_internal_product(
         )
 
 
+def reconcile_local_state_with_existing_remote_product(
+    repository: SupabaseRepository,
+    product: dict[str, Any],
+    product_name: str,
+    existing_sync: dict[str, Any] | None,
+    product_response: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Converge local state with an already-existing remote WooCommerce
+    product, found by exact SKU search after an uncertain prior create
+    result (e.g. a client-side timeout hid a successful create's
+    response, or an earlier run's own process died mid-flight).
+
+    Never creates or modifies a remote product -- this function only
+    writes local rows to reflect a remote object find_product_by_sku()
+    has already confirmed exists. Reuses mark_sync_succeeded() and
+    update_internal_product() completely unchanged -- the exact same
+    functions the normal successful-create branch calls -- so local
+    state converges identically no matter which branch discovered the
+    successful remote product. No reconciliation logic is duplicated
+    here beyond wiring those two calls together with the right inputs.
+
+    Refuses (RuntimeError, no write) when the remote product is not a
+    draft: CLAUDE.md's draft-only boundary means an unexpected remote
+    status (published, trashed, ...) is a genuine local/remote state
+    conflict -- section 5.2 "Recovery ambiguity: local state conflicts
+    with remote state" -- and must stop for human review rather than
+    have this function silently record DRAFT_CREATED over it.
+    """
+    remote_status = product_response.get("status")
+
+    if remote_status != "draft":
+        raise RuntimeError(
+            "Cannot reconcile: the existing remote WooCommerce product "
+            f"(id={product_response.get('id')}) has status "
+            f"{remote_status!r}, not 'draft'. This is a local/remote "
+            "state conflict -- resolve manually before proceeding."
+        )
+
+    if existing_sync is None:
+        existing_sync = create_sync_record(
+            repository=repository,
+            product=product,
+            product_name=product_name,
+        )
+
+    uploaded_media = extract_uploaded_media(existing_sync)
+
+    mark_sync_succeeded(
+        repository=repository,
+        sync_id=existing_sync["sync_id"],
+        product_response=product_response,
+        uploaded_media=uploaded_media,
+    )
+
+    update_internal_product(
+        repository=repository,
+        product=product,
+        product_response=product_response,
+        uploaded_media=uploaded_media,
+    )
+
+    return {
+        "sync_id": existing_sync["sync_id"],
+        "uploaded_media": uploaded_media,
+    }
+
+
 def print_preview(
     product: dict[str, Any],
     content: dict[str, Any],
@@ -2145,7 +2213,9 @@ def main() -> None:
         print()
         print(
             "Draft creation stopped because WooCommerce already "
-            "contains this SKU."
+            "contains this SKU. No new product will be created -- "
+            "reconciling local state with the confirmed remote "
+            "product instead."
         )
 
         print(
@@ -2156,6 +2226,20 @@ def main() -> None:
         print(
             "WooCommerce product status: "
             f"{existing_product.get('status')}"
+        )
+
+        reconcile_local_state_with_existing_remote_product(
+            repository=repository,
+            product=product,
+            product_name=content["product_name"],
+            existing_sync=existing_sync,
+            product_response=existing_product,
+        )
+
+        print()
+        print(
+            "Local sync state reconciled with the existing remote "
+            "product. No new WooCommerce product was created."
         )
 
         return
