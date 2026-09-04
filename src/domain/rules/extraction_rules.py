@@ -156,6 +156,68 @@ _UI_LABEL_TITLES = frozenset(
     }
 )
 
+# A price/currency amount (đ, vnđ, k, €, eur, usd, $ -- the same currency
+# vocabulary is_unusable_title_line()'s _PRICE_ONLY_RE already uses below,
+# reused here rather than inventing a second one). A real book title
+# practically never contains one of these, so its presence is a
+# structural, generalizable signal of commercial/preorder text -- not a
+# hardcoded phrase list, and it never fires on a legitimate title that
+# happens to include the word "combo" or a volume count.
+#
+# \b only guards the alphabetic currency tokens (đ/vnđ/k/eur/usd), which
+# need it to avoid matching mid-word. The symbol tokens (€/$) never get
+# a \b: a word boundary requires a transition between a \w and a \W
+# character, and a currency symbol is itself already \W, so \b never
+# matches immediately after one when followed by whitespace or
+# punctuation (e.g. "70€/") -- omitting it there is correct, not a
+# relaxation.
+_PRICE_TOKEN_PATTERN = r"\d[\d.,]*\s*(?:đ\b|vnđ\b|k\b|eur\b|usd\b|€|\$)"
+_PRICE_TOKEN_RE = re.compile(_PRICE_TOKEN_PATTERN, re.IGNORECASE)
+
+# A leading "condition/price / product" preamble -- a common Vietnamese
+# Facebook seller-post convention (e.g. "Em nhận preorder sách mới 70€/
+# Combo 4 cuốn truyện của Thomas Harris"): a commercial-intent clause
+# containing a price token, terminated by a "/" separator, before the
+# actual product description begins. Only strips when the leading clause
+# itself contains a price token -- a title that legitimately starts with
+# a slash-containing phrase for some other reason (no price present) is
+# never touched.
+_LEADING_COMMERCIAL_ANNOUNCEMENT_RE = re.compile(
+    r"^(?P<preamble>[^/\n]*?" + _PRICE_TOKEN_PATTERN + r"[^/\n]*)/\s*",
+    flags=re.IGNORECASE,
+)
+
+
+def strip_leading_commercial_announcement(text: str) -> str:
+    """Strip a leading price-bearing "condition/price / product" preamble
+    from the start of `text`, if present -- see
+    _LEADING_COMMERCIAL_ANNOUNCEMENT_RE's docstring above. Returns `text`
+    unchanged when no such preamble is found, or when stripping it would
+    leave nothing behind (defensive: never discard the only content)."""
+    match = _LEADING_COMMERCIAL_ANNOUNCEMENT_RE.match(text)
+
+    if not match:
+        return text
+
+    remainder = text[match.end():].strip()
+
+    return remainder or text
+
+
+def looks_like_commercial_announcement(value: str | None) -> bool:
+    """True when a candidate title still contains a price/currency token
+    -- strong, generalizable evidence the captured span is a commerce or
+    preorder announcement clause rather than an actual book/product
+    title (CLAUDE.md: never fabricate or accept a guessed title). This
+    check looks only at the captured title text itself, never the
+    surrounding post -- a legitimate title followed later in the same
+    post by an unrelated price mention is never affected, because that
+    price is outside the captured group entirely."""
+    if not value:
+        return False
+
+    return bool(_PRICE_TOKEN_RE.search(value))
+
 
 def normalize_text(value: str | None) -> str:
     """Normalize whitespace while preserving Vietnamese text."""
@@ -295,6 +357,13 @@ def validate_extracted_identity(
             "reliable book title."
         )
 
+    if looks_like_commercial_announcement(cleaned_title):
+        raise RuntimeError(
+            "The extracted title still contains a price/currency token "
+            "and looks like a commercial/preorder announcement, not a "
+            "reliable book title."
+        )
+
     if cleaned_author and looks_like_description_fragment(cleaned_author):
         warnings.append(
             "The extracted author resembled description text and was removed."
@@ -326,6 +395,7 @@ def extract_single_book_identity(cleaned_text: str) -> SingleExtraction | None:
     to preserve its existing external behavior.
     """
     normalized_text = remove_leading_post_markers(normalize_unicode_text(cleaned_text or ""))
+    normalized_text = strip_leading_commercial_announcement(normalized_text)
 
     if not normalized_text:
         return None

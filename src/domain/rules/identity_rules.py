@@ -19,6 +19,8 @@ Rule codes implemented here:
     IDENTITY_CONFLICTING_CREDIBLE_SOURCES   REVIEW_REQUIRED
     IDENTITY_INSUFFICIENT_EVIDENCE          REVIEW_REQUIRED
     IDENTITY_NO_USABLE_EVIDENCE             REVIEW_REQUIRED
+    IDENTITY_CONFLICT_TITLE_ONLY_RECOVERABLE AUTO_PASS
+    IDENTITY_CONFLICT_NOT_RECOVERABLE        BLOCKED
 
 See docs/TSYC_DECISION_MATRIX.md for the full specification.
 
@@ -67,6 +69,10 @@ IDENTITY_CONFIRMED_NO_MATCH = "IDENTITY_CONFIRMED_NO_MATCH"
 # compare against -- missing evidence, never treated as negative
 # evidence. See evaluate_candidate_identity() / is_reference_evaluable().
 IDENTITY_NO_USABLE_EVIDENCE = "IDENTITY_NO_USABLE_EVIDENCE"
+# scripts/correct_candidate_extraction.py's IDENTITY_CONFLICT recovery
+# gate -- see assess_conflict_is_title_only_recoverable().
+IDENTITY_CONFLICT_TITLE_ONLY_RECOVERABLE = "IDENTITY_CONFLICT_TITLE_ONLY_RECOVERABLE"
+IDENTITY_CONFLICT_NOT_RECOVERABLE = "IDENTITY_CONFLICT_NOT_RECOVERABLE"
 
 
 # --- shared helpers ------------------------------------------------------
@@ -1228,3 +1234,153 @@ def choose_best_reference(references: Sequence[dict[str, Any]]) -> dict[str, Any
         return (metadata_score, -priority)
 
     return max(references, key=score)
+
+
+# --- IDENTITY_CONFLICT extraction-recovery gate -----------------------
+#
+# scripts/correct_candidate_extraction.py refuses to touch any candidate
+# outside workflow_status=EXTRACTED / identity_status=IDENTITY_PENDING --
+# by design, it never guesses whether a later state is still safe to
+# correct (CLAUDE.md golden principle #6/#7: never silently overwrite
+# already-decided identity). That guard is right for the general case,
+# but it also blocks the one narrow, safe exception this project needs:
+# a candidate whose IDENTITY_CONFLICT was caused *only* by a bad
+# extracted_title (e.g. a rule-based extractor capturing a commercial/
+# preorder announcement instead of the real product name), where the
+# underlying reference evidence itself is not in dispute at all.
+#
+# assess_conflict_is_title_only_recoverable() is the validator that
+# makes that exception safe: it re-derives, from the candidate's own
+# currently-registered references, whether every rejection signal traces
+# back to title similarity alone. Any independent ISBN, specific-author,
+# or (for 2+ title-matching references) publisher disagreement blocks
+# recovery outright -- a title fix can never paper over a real
+# conflicting-evidence problem. This function never itself decides that a
+# correction *should* happen, only whether one *may safely be attempted*.
+
+
+def assess_conflict_is_title_only_recoverable(
+    candidate: dict[str, Any],
+    references: Sequence[dict[str, Any]],
+) -> DecisionResult:
+    """
+    Decide whether a candidate currently at IDENTITY_CONFLICT may safely
+    enter the extraction-correction recovery path.
+
+    Reuses evaluate_single_reference_identity() (unchanged) against every
+    currently usable reference -- the same per-reference evidence
+    evaluate_candidate_identity() itself already computes -- rather than
+    trusting the stored conflict_fields column, which build_hardened_
+    candidate_payload() (scripts/match_candidate_identity.py) writes as
+    the literal ["title"] for every AUTO_REJECT outcome including an
+    ISBN-conflict one. That stored label is not a reliable signal here;
+    this function re-derives the true cause directly from evidence.
+
+    AUTO_PASS (IDENTITY_CONFLICT_TITLE_ONLY_RECOVERABLE) only when:
+      - at least one usable reference exists, AND
+      - no usable reference shows a validated-ISBN conflict, AND
+      - the candidate names no specific author that conflicts with any
+        usable reference's specific author, AND
+      - when 2+ usable references exist, they do not conflict with each
+        other on publisher/imprint (the only conflict a multi-reference
+        set can raise that a single reference cannot).
+
+    Everything else -- no usable evidence, an ISBN conflict, a specific-
+    author conflict, or a publisher conflict -- is BLOCKED
+    (IDENTITY_CONFLICT_NOT_RECOVERABLE): a real disagreement between
+    credible sources, which extraction correction must never be used to
+    route around.
+    """
+    usable = [reference for reference in references if is_reference_evaluable(reference)]
+
+    if not usable:
+        return DecisionResult(
+            outcome=Outcome.BLOCKED,
+            rule_code=IDENTITY_CONFLICT_NOT_RECOVERABLE,
+            reason=(
+                "No usable reference evidence is registered for this "
+                "candidate; there is nothing to re-verify a title "
+                "correction against."
+            ),
+            evidence={"usable_reference_count": 0},
+        )
+
+    per_reference = [
+        (reference, evaluate_single_reference_identity(candidate, reference))
+        for reference in usable
+    ]
+
+    isbn_conflicts = [
+        reference.get("reference_id")
+        for reference, result in per_reference
+        if result.evidence.get("isbn_conflict")
+    ]
+
+    if isbn_conflicts:
+        return DecisionResult(
+            outcome=Outcome.BLOCKED,
+            rule_code=IDENTITY_CONFLICT_NOT_RECOVERABLE,
+            reason=(
+                "An ISBN conflict exists independent of title quality; "
+                "extraction correction cannot resolve this."
+            ),
+            evidence={"conflicting_reference_ids": isbn_conflicts},
+        )
+
+    candidate_author = candidate.get("extracted_author")
+
+    if is_specific_author(candidate_author):
+        author_conflicts = [
+            reference.get("reference_id")
+            for reference, _result in per_reference
+            if is_specific_author(reference.get("reference_author"))
+            and normalize_text(reference.get("reference_author"))
+            != normalize_text(candidate_author)
+        ]
+
+        if author_conflicts:
+            return DecisionResult(
+                outcome=Outcome.BLOCKED,
+                rule_code=IDENTITY_CONFLICT_NOT_RECOVERABLE,
+                reason=(
+                    "A specific-author conflict exists independent of "
+                    "title quality; extraction correction cannot resolve "
+                    "this."
+                ),
+                evidence={"conflicting_reference_ids": author_conflicts},
+            )
+
+    if len(usable) >= 2:
+        publishers = [
+            reference.get("reference_publisher") for reference, _result in per_reference
+        ]
+
+        if publishers_conflict(publishers):
+            return DecisionResult(
+                outcome=Outcome.BLOCKED,
+                rule_code=IDENTITY_CONFLICT_NOT_RECOVERABLE,
+                reason=(
+                    "A publisher/imprint conflict exists among this "
+                    "candidate's references, independent of title "
+                    "quality; extraction correction cannot resolve this."
+                ),
+                evidence={
+                    "reference_publishers": publishers,
+                },
+            )
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=IDENTITY_CONFLICT_TITLE_ONLY_RECOVERABLE,
+        reason=(
+            "Every usable reference's rejection traces back to title "
+            "similarity alone -- no ISBN, specific-author, or publisher "
+            "conflict exists. Safe for extraction-correction recovery."
+        ),
+        evidence={
+            "usable_reference_count": len(usable),
+            "usable_reference_ids": [
+                reference.get("reference_id") for reference, _result in per_reference
+            ],
+        },
+    )

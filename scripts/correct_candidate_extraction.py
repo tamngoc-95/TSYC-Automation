@@ -11,7 +11,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.decisions import Outcome
 from src.domain.identity_status import IdentityStatus
+from src.domain.rules.identity_rules import assess_conflict_is_title_only_recoverable
 from src.repositories.supabase_repository import SupabaseRepository
 
 from create_candidates_from_cleaned_posts import extract_book_identity
@@ -21,15 +23,38 @@ configure_utf8_console()
 
 CORRECTION_METHOD = "facebook_candidate_title_correction_v1.0.0"
 
+STANDARD_CORRECTION_REASON = (
+    "Facebook invisible Unicode obfuscation "
+    "(U+034F COMBINING GRAPHEME JOINER) defeated the "
+    "original title extractor. Re-derived after the "
+    "normalization fix in clean_facebook_raw_pages.py / "
+    "create_candidates_from_cleaned_posts.py."
+)
+
+# scripts/match_candidate_identity.py's AUTO_REJECT write path
+# (build_hardened_candidate_payload) always records conflict_fields as
+# the literal ["title"], including for an ISBN-conflict AUTO_REJECT --
+# assess_conflict_is_title_only_recoverable() re-derives the true cause
+# directly from reference evidence rather than trusting that label, so
+# this recovery reason is only ever recorded when that re-derivation
+# actually confirmed the conflict was title-only.
+TITLE_ONLY_CONFLICT_CORRECTION_REASON = "EXTRACTION_CORRECTION_AFTER_TITLE_CONFLICT"
+
 # Candidates may only be corrected while they are still in their initial,
-# unreviewed extraction state. Once a candidate has moved past this state
-# (identity verified, content approved, image approved, etc.), any field
-# it carries may already be relied upon downstream -- CLAUDE.md golden
-# principle #6 forbids overwriting approved content or finalized identity
-# evidence silently. This script refuses outright rather than guessing
-# whether a later state is still "safe" to touch.
+# unreviewed extraction state (workflow_status=EXTRACTED, identity_status
+# =IDENTITY_PENDING) -- OR, as one narrow, validated exception, while at
+# IDENTITY_CONFLICT when assess_conflict_is_title_only_recoverable()
+# confirms the conflict traces back to title quality alone, with no
+# independent ISBN/author/publisher disagreement. Every other identity
+# state (IDENTITY_VERIFIED, or IDENTITY_CONFLICT for a non-title reason)
+# is still refused outright -- CLAUDE.md golden principle #6 forbids
+# overwriting approved content or finalized identity evidence silently,
+# and this script never guesses whether an unlisted later state is still
+# "safe" to touch.
 ALLOWED_WORKFLOW_STATUS = "EXTRACTED"
 ALLOWED_IDENTITY_STATUS = IdentityStatus.IDENTITY_PENDING
+CONFLICT_WORKFLOW_STATUS = IdentityStatus.IDENTITY_CONFLICT
+CONFLICT_IDENTITY_STATUS = IdentityStatus.IDENTITY_CONFLICT
 
 
 def normalize_confirmation(
@@ -145,15 +170,46 @@ def get_raw_page(
     return records[0] if records else None
 
 
+def get_references_for_candidate(
+    repository: SupabaseRepository,
+    candidate_id: str,
+) -> list[dict[str, Any]]:
+    """Return every product_references row for one candidate."""
+    response = (
+        repository.client
+        .table("product_references")
+        .select(
+            "reference_id,"
+            "candidate_id,"
+            "reference_title,"
+            "reference_author,"
+            "reference_isbn,"
+            "reference_publisher,"
+            "match_decision"
+        )
+        .eq(
+            "candidate_id",
+            candidate_id,
+        )
+        .execute()
+    )
+
+    return response.data or []
+
+
 def build_correction_payload(
     candidate: dict[str, Any],
     extraction: dict[str, Any],
+    reason: str = STANDARD_CORRECTION_REASON,
 ) -> dict[str, Any]:
     """Build the update payload for a deterministic title correction.
 
     Only extraction-derived fields are touched. candidate_code,
     raw_page_id, source_url_id, candidate_type, identity_status, and
-    workflow_status are never included here.
+    workflow_status are never included here -- identity_status recovery
+    (if any) is left entirely to a subsequent
+    match_candidate_identity.py --mode RECOMPUTE, which re-derives it
+    from the corrected evidence rather than this script guessing it.
     """
     existing_evidence = candidate.get("source_evidence") or {}
 
@@ -167,13 +223,7 @@ def build_correction_payload(
                 timezone.utc
             ).isoformat(),
             "correction_method": CORRECTION_METHOD,
-            "reason": (
-                "Facebook invisible Unicode obfuscation "
-                "(U+034F COMBINING GRAPHEME JOINER) defeated the "
-                "original title extractor. Re-derived after the "
-                "normalization fix in clean_facebook_raw_pages.py / "
-                "create_candidates_from_cleaned_posts.py."
-            ),
+            "reason": reason,
             "old_extracted_title": candidate.get("extracted_title"),
             "new_extracted_title": extraction["extracted_title"],
             "old_extracted_author": candidate.get("extracted_author"),
@@ -300,57 +350,83 @@ def print_planned_change(
             print(f"  - {warning}")
 
 
-def main() -> None:
-    """Correct one candidate's extracted title from its raw page."""
-    load_dotenv(
-        PROJECT_ROOT / ".env"
-    )
+def run_correction(
+    repository: SupabaseRepository,
+    candidate_code: str,
+    confirm_correct: bool,
+    non_interactive: bool,
+    prompt: Any = input,
+) -> dict[str, Any] | None:
+    """
+    Run the full correction flow for one exact candidate_code: resolve
+    and gate the target, re-derive its title from source evidence,
+    diff against the stored value, confirm, write, and log. Returns the
+    verified post-write row, or None when the run is a no-op (title
+    already matches) or is cancelled.
 
-    args = parse_arguments()
-
-    if args.non_interactive and not args.confirm_correct:
-        raise RuntimeError(
-            "--non-interactive requires --confirm-correct."
-        )
-
-    print(
-        "Candidate extraction correction started."
-    )
-    print(
-        f"Method: {CORRECTION_METHOD}"
-    )
-    print(
-        f"Target candidate code: {args.candidate_code}"
-    )
-
-    repository = SupabaseRepository()
-
+    Extracted from main() so it is directly testable against a fake
+    repository -- mirrors prepare_product_content.py's
+    run_revise_action().
+    """
     candidate = get_candidate_by_code(
         repository=repository,
-        candidate_code=args.candidate_code,
+        candidate_code=candidate_code,
     )
 
     if candidate is None:
         raise RuntimeError(
             "No candidate matched the exact candidate_code: "
-            f"{args.candidate_code}"
+            f"{candidate_code}"
         )
 
-    if candidate.get("workflow_status") != ALLOWED_WORKFLOW_STATUS:
+    is_standard_state = (
+        candidate.get("workflow_status") == ALLOWED_WORKFLOW_STATUS
+        and candidate.get("identity_status") == ALLOWED_IDENTITY_STATUS
+    )
+    is_conflict_state = (
+        candidate.get("workflow_status") == CONFLICT_WORKFLOW_STATUS
+        and candidate.get("identity_status") == CONFLICT_IDENTITY_STATUS
+    )
+
+    correction_reason = STANDARD_CORRECTION_REASON
+
+    if not is_standard_state and not is_conflict_state:
         raise RuntimeError(
-            "Refusing to correct this candidate: workflow_status is "
-            f"{candidate.get('workflow_status')!r}, not "
-            f"{ALLOWED_WORKFLOW_STATUS!r}. Only a candidate still in its "
-            "initial extraction state may be corrected by this script."
+            "Refusing to correct this candidate: workflow_status/"
+            f"identity_status is {candidate.get('workflow_status')!r}/"
+            f"{candidate.get('identity_status')!r}. Only a candidate "
+            f"still in its initial extraction state ({ALLOWED_WORKFLOW_STATUS!r}/"
+            f"{ALLOWED_IDENTITY_STATUS!r}) or at IDENTITY_CONFLICT with a "
+            "validated title-only cause may be corrected by this script."
         )
 
-    if candidate.get("identity_status") != ALLOWED_IDENTITY_STATUS:
-        raise RuntimeError(
-            "Refusing to correct this candidate: identity_status is "
-            f"{candidate.get('identity_status')!r}, not "
-            f"{ALLOWED_IDENTITY_STATUS!r}. Only a candidate with no "
-            "identity decision yet may be corrected by this script."
+    if is_conflict_state:
+        references = get_references_for_candidate(
+            repository=repository,
+            candidate_id=candidate["candidate_id"],
         )
+
+        recovery_decision = assess_conflict_is_title_only_recoverable(
+            candidate=candidate,
+            references=references,
+        )
+
+        print()
+        print("=" * 78)
+        print("IDENTITY_CONFLICT RECOVERY ASSESSMENT")
+        print("=" * 78)
+        print(f"Outcome: {recovery_decision.outcome} ({recovery_decision.rule_code})")
+        print(f"Reason: {recovery_decision.reason}")
+
+        if recovery_decision.outcome != Outcome.AUTO_PASS:
+            raise RuntimeError(
+                "Refusing to correct this candidate: it is at "
+                "IDENTITY_CONFLICT, and assess_conflict_is_title_only_"
+                f"recoverable() found the conflict is NOT title-only "
+                f"({recovery_decision.rule_code}): {recovery_decision.reason}"
+            )
+
+        correction_reason = TITLE_ONLY_CONFLICT_CORRECTION_REASON
 
     raw_page_id = candidate.get("raw_page_id")
 
@@ -411,15 +487,15 @@ def main() -> None:
 
     print()
 
-    if args.confirm_correct:
+    if confirm_correct:
         confirmation = "CORRECT"
 
-    elif args.non_interactive:
+    elif non_interactive:
         confirmation = ""
 
     else:
         confirmation = normalize_confirmation(
-            input(
+            prompt(
                 "Type CORRECT to apply this exact change, "
                 "or press Enter to cancel: "
             )
@@ -435,6 +511,7 @@ def main() -> None:
     payload = build_correction_payload(
         candidate=candidate,
         extraction=extraction,
+        reason=correction_reason,
     )
 
     response = (
@@ -461,8 +538,8 @@ def main() -> None:
         log_level="INFO",
         status="CORRECTED",
         message=(
-            "Candidate extraction fields corrected after the Facebook "
-            "invisible Unicode obfuscation defect fix."
+            "Candidate extraction fields corrected: "
+            f"{correction_reason}"
         ),
         error_details={
             "candidate_code": candidate.get("candidate_code"),
@@ -470,6 +547,7 @@ def main() -> None:
             "old_extracted_title": candidate.get("extracted_title"),
             "new_extracted_title": extraction["extracted_title"],
             "correction_method": CORRECTION_METHOD,
+            "correction_reason": correction_reason,
         },
     )
 
@@ -531,6 +609,41 @@ def main() -> None:
     print()
     print(
         "Candidate extraction correction finished."
+    )
+
+    return verified
+
+
+def main() -> None:
+    """Parse arguments and run the correction flow for one candidate."""
+    load_dotenv(
+        PROJECT_ROOT / ".env"
+    )
+
+    args = parse_arguments()
+
+    if args.non_interactive and not args.confirm_correct:
+        raise RuntimeError(
+            "--non-interactive requires --confirm-correct."
+        )
+
+    print(
+        "Candidate extraction correction started."
+    )
+    print(
+        f"Method: {CORRECTION_METHOD}"
+    )
+    print(
+        f"Target candidate code: {args.candidate_code}"
+    )
+
+    repository = SupabaseRepository()
+
+    run_correction(
+        repository=repository,
+        candidate_code=args.candidate_code,
+        confirm_correct=args.confirm_correct,
+        non_interactive=args.non_interactive,
     )
 
 
