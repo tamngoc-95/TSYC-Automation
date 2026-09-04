@@ -35,12 +35,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.domain.content_status import InternalProductContentStatus
-from src.domain.decisions import Outcome
+from src.domain.decisions import DecisionResult, Outcome
 from src.domain.identity_status import IdentityStatus, MatchDecision
 from src.domain.image_status import InternalProductImageStatus
 from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
+from src.domain.rules import image_rules, readiness_rules
 from src.domain.woocommerce_status import WooCommerceStatus, WooCommerceSyncStatus
 from src.repositories.supabase_repository import SupabaseRepository  # noqa: E402
+from src.services.historical_image_extraction import (  # noqa: E402
+    check_capability as check_historical_image_capability,
+    filter_image_paths as filter_historical_image_paths,
+)
 
 # PUBLISHABLE_RIGHTS_STATUSES (imported above) must exactly match
 # product_images_publish_eligibility_check
@@ -70,6 +75,8 @@ DERIVED_STATES = {
     "CONTENT_DRAFTED",
     "CONTENT_APPROVED",
     "IMAGE_PENDING",
+    "IMAGE_CAPABILITY_UNAVAILABLE",
+    "IMAGE_GROUP_OWNERSHIP_AMBIGUOUS",
     "IMAGE_VALIDATED",
     "READY_FOR_DRAFT",
     "DRAFT_CREATION_IN_PROGRESS",
@@ -91,6 +98,8 @@ TERMINAL_OR_MANUAL_STATES = {
     "IMAGE_REVIEW_REQUIRED",
     "RIGHTS_REVIEW_REQUIRED",
     "RECOVERY_REVIEW_REQUIRED",
+    "IMAGE_GROUP_OWNERSHIP_AMBIGUOUS",
+    "IMAGE_CAPABILITY_UNAVAILABLE",
 }
 
 
@@ -216,6 +225,47 @@ def load_candidate_bundle(
 
     internal_product = internal_product_rows[0] if internal_product_rows else None
 
+    # Historical (FB-HIST) capability + sibling-ownership signals.
+    # Computed only when relevant (no images yet ingested for a candidate
+    # whose source_evidence carries local_media_paths) -- this is I/O
+    # (filesystem probe + one extra bounded read), which is exactly why
+    # it lives here in the I/O layer rather than in the pure
+    # derive_candidate_state() below (see that function's docstring: "a
+    # pure derivation layer... it only reads fields the writer scripts
+    # already produce").
+    source_evidence = candidate.get("source_evidence") or {}
+    local_media_paths = filter_historical_image_paths(
+        source_evidence.get("local_media_paths") or []
+    )
+
+    historical_capability_available: bool | None = None
+    historical_capability_reason: str | None = None
+    sibling_candidate_codes: list[str] = []
+
+    if local_media_paths and not images:
+        capability = check_historical_image_capability(PROJECT_ROOT)
+        historical_capability_available = capability.available
+        historical_capability_reason = capability.reason
+
+        raw_page_id = candidate.get("raw_page_id")
+
+        if raw_page_id:
+            sibling_rows = (
+                repository.client
+                .table("product_candidates")
+                .select("candidate_id, candidate_code")
+                .eq("raw_page_id", raw_page_id)
+                .execute()
+                .data
+                or []
+            )
+            sibling_candidate_codes = [
+                sibling["candidate_code"]
+                for sibling in sibling_rows
+                if sibling.get("candidate_id") != candidate_id
+                and sibling.get("candidate_code")
+            ]
+
     contents: list[dict[str, Any]] = []
     sync: dict[str, Any] | None = None
 
@@ -253,6 +303,10 @@ def load_candidate_bundle(
         "internal_product": internal_product,
         "contents": contents,
         "sync": sync,
+        "historical_local_media_paths": local_media_paths,
+        "historical_capability_available": historical_capability_available,
+        "historical_capability_reason": historical_capability_reason,
+        "sibling_candidate_codes": sibling_candidate_codes,
     }
 
 
@@ -353,6 +407,64 @@ def _derive_image_content_state(
 
     if internal_product.get("image_status") != InternalProductImageStatus.APPROVED:
         if not images:
+            historical_media_paths = bundle.get("historical_local_media_paths") or []
+
+            if historical_media_paths:
+                # FB-HIST candidate with no product_images rows yet: this
+                # is the CLAUDE.md Phase 4 gate -- do not fall through to
+                # the generic "run the collector" message below (that
+                # message names the live-crawl collector, which cannot
+                # help a historical candidate at all).
+                ownership_decision = image_rules.evaluate_historical_image_ownership(
+                    bundle.get("sibling_candidate_codes") or []
+                )
+
+                if ownership_decision.outcome != Outcome.AUTO_PASS:
+                    return CandidateState(
+                        candidate_code=candidate_code,
+                        candidate_id=candidate_id,
+                        product_code=product_code,
+                        derived_state="IMAGE_GROUP_OWNERSHIP_AMBIGUOUS",
+                        human_gate=True,
+                        human_gate_reason=ownership_decision.reason,
+                        warnings=warnings,
+                    )
+
+                capability_decision = image_rules.evaluate_historical_image_capability(
+                    available=bool(bundle.get("historical_capability_available")),
+                    reason=(
+                        bundle.get("historical_capability_reason")
+                        or "Historical image ingestion capability status is unknown."
+                    ),
+                )
+
+                if capability_decision.outcome != Outcome.AUTO_PASS:
+                    return CandidateState(
+                        candidate_code=candidate_code,
+                        candidate_id=candidate_id,
+                        product_code=product_code,
+                        derived_state="IMAGE_CAPABILITY_UNAVAILABLE",
+                        blocked=True,
+                        blocked_reason=capability_decision.reason,
+                        warnings=warnings,
+                    )
+
+                return CandidateState(
+                    candidate_code=candidate_code,
+                    candidate_id=candidate_id,
+                    product_code=product_code,
+                    derived_state="IMAGE_PENDING",
+                    human_gate=True,
+                    human_gate_reason=(
+                        "Historical local media is available and "
+                        "unambiguously owned by this candidate. Run "
+                        "scripts/extract_historical_facebook_images.py "
+                        "then scripts/upload_facebook_images_to_supabase.py "
+                        "to ingest images for this candidate."
+                    ),
+                    warnings=warnings,
+                )
+
             return CandidateState(
                 candidate_code=candidate_code,
                 candidate_id=candidate_id,
@@ -733,3 +845,188 @@ def derive_candidate_state(
     # woocommerce_status == "NOT_CREATED" (or any other pre-draft value):
     # advance through the image/content sub-state machine.
     return _derive_image_content_state(bundle)
+
+
+# ---------------------------------------------------------------------
+# Named stage preflights (CLAUDE.md pipeline stabilization Phase 4)
+# ---------------------------------------------------------------------
+#
+# Each function below answers one narrow, named question -- "is this
+# candidate structurally ready to attempt <stage>" -- for
+# scripts/run_batch.py's --dry-run report and for tests that want to
+# assert one milestone in isolation. None of them introduce a second
+# state machine: every one either reuses derive_candidate_state()'s own
+# classification, or (for READY_FOR_DRAFT) calls the exact same rule
+# module scripts/check_draft_readiness.py already calls, over the same
+# bundle load_candidate_bundle() already read. There is exactly one
+# place that decides what happens next -- derive_candidate_state -- and
+# these never contradict it.
+
+READY_FOR_IDENTITY = "READY_FOR_IDENTITY"
+READY_FOR_CONTENT = "READY_FOR_CONTENT"
+READY_FOR_IMAGE = "READY_FOR_IMAGE"
+READY_FOR_DRAFT_PREFLIGHT = "READY_FOR_DRAFT"
+
+_IDENTITY_NOT_YET_READY_STATES = {"EXTRACTED", "REFERENCE_REGISTERED"}
+_IMAGE_BLOCKED_STATES = {"IMAGE_CAPABILITY_UNAVAILABLE"}
+_IMAGE_REVIEW_STATES = {
+    "IMAGE_PENDING",
+    "IMAGE_GROUP_OWNERSHIP_AMBIGUOUS",
+    "RIGHTS_REVIEW_REQUIRED",
+    "IMAGE_REVIEW_REQUIRED",
+}
+
+
+def stage_preflight_identity(bundle: dict[str, Any]) -> DecisionResult:
+    """READY_FOR_IDENTITY: true once a reference source has been
+    registered and collected for this candidate (match_candidate_
+    identity.py can run), or identity is already resolved."""
+    state = derive_candidate_state(bundle)
+
+    if state.derived_state in _IDENTITY_NOT_YET_READY_STATES:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED if state.human_gate else Outcome.BLOCKED,
+            rule_code=READY_FOR_IDENTITY,
+            reason=state.human_gate_reason
+            or state.blocked_reason
+            or f"Candidate is at {state.derived_state}; no reference has "
+            "been collected yet.",
+            evidence={"derived_state": state.derived_state},
+        )
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=READY_FOR_IDENTITY,
+        reason=f"Candidate is at {state.derived_state}; reference metadata "
+        "is available for identity matching.",
+        evidence={"derived_state": state.derived_state},
+    )
+
+
+def stage_preflight_content(bundle: dict[str, Any]) -> DecisionResult:
+    """READY_FOR_CONTENT: true once an internal_products row exists
+    (prepare_product_content.py requires internal_product_id)."""
+    state = derive_candidate_state(bundle)
+
+    if state.product_code is None:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED if state.human_gate else Outcome.BLOCKED,
+            rule_code=READY_FOR_CONTENT,
+            reason=state.human_gate_reason
+            or state.blocked_reason
+            or f"Candidate is at {state.derived_state}; no internal "
+            "product has been created yet.",
+            evidence={"derived_state": state.derived_state},
+        )
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=READY_FOR_CONTENT,
+        reason="Internal product exists; content drafting/approval can "
+        "proceed.",
+        evidence={
+            "derived_state": state.derived_state,
+            "product_code": state.product_code,
+        },
+    )
+
+
+def stage_preflight_image(bundle: dict[str, Any]) -> DecisionResult:
+    """READY_FOR_IMAGE: BLOCKED specifically at IMAGE_CAPABILITY_
+    UNAVAILABLE -- the FB-HIST gate CLAUDE.md Phase 4 requires to fail
+    before production work when the historical image capability (the
+    Facebook export archive) is unavailable. REVIEW_REQUIRED for every
+    other unresolved image gate (no images yet, ambiguous multi-product
+    post ownership, unresolved rights, unresolved main-image selection).
+    """
+    state = derive_candidate_state(bundle)
+
+    if state.derived_state in _IMAGE_BLOCKED_STATES:
+        return DecisionResult(
+            outcome=Outcome.BLOCKED,
+            rule_code=READY_FOR_IMAGE,
+            reason=state.blocked_reason
+            or "Historical image ingestion capability is unavailable.",
+            evidence={"derived_state": state.derived_state},
+        )
+
+    if state.derived_state in _IMAGE_REVIEW_STATES:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=READY_FOR_IMAGE,
+            reason=state.human_gate_reason
+            or f"Candidate is at {state.derived_state}.",
+            evidence={"derived_state": state.derived_state},
+        )
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=READY_FOR_IMAGE,
+        reason=f"Candidate is at {state.derived_state}; the image gate is "
+        "satisfied or not yet reached.",
+        evidence={"derived_state": state.derived_state},
+    )
+
+
+def stage_preflight_draft(bundle: dict[str, Any]) -> DecisionResult:
+    """READY_FOR_DRAFT preflight: re-evaluates the exact same
+    src.domain.rules.readiness_rules.evaluate_readiness() gate
+    scripts/check_draft_readiness.py already calls, over the data
+    load_candidate_bundle() already read -- no second copy of the
+    readiness business rule, no extra DB round-trip."""
+    internal_product = bundle["internal_product"]
+
+    if not internal_product:
+        return DecisionResult(
+            outcome=Outcome.BLOCKED,
+            rule_code=READY_FOR_DRAFT_PREFLIGHT,
+            reason="No internal product exists yet.",
+        )
+
+    approved_content = next(
+        (
+            content
+            for content in bundle["contents"]
+            if content.get("content_language") == "vi"
+            and content.get("content_status") == InternalProductContentStatus.APPROVED
+            and content.get("review_required") is False
+        ),
+        None,
+    )
+
+    selected_images = [
+        image
+        for image in bundle["images"]
+        if image.get("is_selected_main_image") is True
+    ]
+
+    sync = bundle["sync"] or {}
+    response_payload = sync.get("response_payload")
+    recovery_required = bool(
+        isinstance(response_payload, dict)
+        and response_payload.get("recovery_required") is True
+    )
+    has_created_woo_sync = bool(
+        sync.get("woocommerce_product_id")
+        or sync.get("woocommerce_status") == WooCommerceSyncStatus.DRAFT_CREATED
+    )
+
+    return readiness_rules.evaluate_readiness(
+        product=internal_product,
+        candidate=bundle["candidate"],
+        approved_content=approved_content,
+        selected_images=selected_images,
+        recovery_required=recovery_required,
+        has_created_woo_sync=has_created_woo_sync,
+    )
+
+
+def evaluate_stage_preflights(bundle: dict[str, Any]) -> dict[str, DecisionResult]:
+    """All four named stage preflights for one candidate, keyed by name --
+    the shape scripts/run_batch.py's --dry-run report consumes."""
+    return {
+        READY_FOR_IDENTITY: stage_preflight_identity(bundle),
+        READY_FOR_CONTENT: stage_preflight_content(bundle),
+        READY_FOR_IMAGE: stage_preflight_image(bundle),
+        READY_FOR_DRAFT_PREFLIGHT: stage_preflight_draft(bundle),
+    }

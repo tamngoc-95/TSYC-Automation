@@ -40,6 +40,9 @@ IMAGE_COMBO_FULL_SET = "IMAGE_COMBO_FULL_SET"
 IMAGE_MULTIPLE_EQUIVALENT_CANDIDATES = "IMAGE_MULTIPLE_EQUIVALENT_CANDIDATES"
 IMAGE_RIGHTS_UNKNOWN = "IMAGE_RIGHTS_UNKNOWN"
 IMAGE_PRODUCT_MISMATCH = "IMAGE_PRODUCT_MISMATCH"
+IMAGE_GROUP_OWNERSHIP_UNAMBIGUOUS = "IMAGE_GROUP_OWNERSHIP_UNAMBIGUOUS"
+IMAGE_GROUP_OWNERSHIP_AMBIGUOUS = "IMAGE_GROUP_OWNERSHIP_AMBIGUOUS"
+IMAGE_CAPABILITY_UNAVAILABLE = "IMAGE_CAPABILITY_UNAVAILABLE"
 
 _RIGHTS_RULE_CODE = {
     RightsStatus.STORE_OWNED: IMAGE_STORE_OWNED_EXACT,
@@ -197,6 +200,82 @@ def evaluate_main_image_selection(
             "selected_image_id": selected.get("image_id"),
             "is_combo": is_combo,
         },
+    )
+
+
+# --- historical (FB-HIST) image sourcing --------------------------------
+
+
+def evaluate_historical_image_capability(
+    available: bool,
+    reason: str,
+) -> DecisionResult:
+    """
+    Whether the historical image extraction capability (the gitignored
+    Facebook export archive -- see
+    src.services.historical_image_extraction) is usable right now.
+
+    BLOCKED, not REVIEW_REQUIRED: a missing/unreadable export archive is
+    an environmental precondition, not a business judgment call -- the
+    same candidate will fail the same way on every retry until the
+    archive is made available, exactly like Outcome.BLOCKED's contract.
+    """
+    if not available:
+        return DecisionResult(
+            outcome=Outcome.BLOCKED,
+            rule_code=IMAGE_CAPABILITY_UNAVAILABLE,
+            reason=reason,
+            evidence={"available": False},
+        )
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=IMAGE_CAPABILITY_UNAVAILABLE,
+        reason=reason,
+        evidence={"available": True},
+    )
+
+
+def evaluate_historical_image_ownership(
+    sibling_candidate_codes: Sequence[str],
+) -> DecisionResult:
+    """
+    Decide whether a historical candidate's source Facebook post is
+    shared with any other candidate.
+
+    CLAUDE.md section 11: "For multi-book Facebook posts: ... do not
+    silently attach all shared-post images to the newest candidate;
+    explicit candidate mapping is required where image ownership is
+    ambiguous." A historical post that produced more than one
+    product_candidates row (this candidate plus at least one sibling
+    sharing the same raw_page_id) is exactly that case -- images must
+    never be auto-associated to one of them; a human must map each image
+    to its correct candidate first.
+    """
+    if sibling_candidate_codes:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=IMAGE_GROUP_OWNERSHIP_AMBIGUOUS,
+            reason=(
+                "This candidate's source Facebook post also produced "
+                f"{len(sibling_candidate_codes)} other candidate(s) "
+                f"({', '.join(sorted(sibling_candidate_codes))}). Images "
+                "cannot be auto-associated to one candidate from a "
+                "shared multi-product post -- assign each image to its "
+                "correct candidate explicitly before ingestion."
+            ),
+            evidence={"sibling_candidate_codes": tuple(sorted(sibling_candidate_codes))},
+        )
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=IMAGE_GROUP_OWNERSHIP_UNAMBIGUOUS,
+        reason=(
+            "This candidate is the sole product extracted from its source "
+            "Facebook post; its local media can be associated to it "
+            "unambiguously."
+        ),
+        evidence={"sibling_candidate_codes": ()},
     )
 
 

@@ -1266,3 +1266,150 @@ def test_woo_approval_request_silent_when_nothing_ready(capsys):
 
     output = capsys.readouterr().out
     assert output == ""
+
+
+# --------------------------------------------------------------------------
+# 21. Dry-run plan (CLAUDE.md pipeline stabilization Phase 6): every
+# candidate reports CURRENT_STAGE / NEXT_SAFE_ACTION / BLOCKER /
+# EXPECTED_FINAL_STATE so an operator never has to manually invoke
+# pipeline_state.py or a stage script to see what would happen next.
+# --------------------------------------------------------------------------
+
+
+def test_dry_run_plan_reports_all_four_named_fields_for_an_automatable_state():
+    report = run_batch.CandidateReport(
+        candidate_code=CANDIDATE_CODE,
+        initial_state="REFERENCE_REGISTERED",
+        final_state="REFERENCE_REGISTERED",
+        result="DRY_RUN",
+        next_action_kind="invoke",
+        next_action_description="Collect metadata from the already-selected reference source.",
+    )
+
+    import io
+    import contextlib
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        run_batch.print_dry_run_plan([report], requested=1)
+
+    output = buffer.getvalue()
+    assert f"CANDIDATE: {CANDIDATE_CODE}" in output
+    assert "CURRENT_STAGE: REFERENCE_REGISTERED" in output
+    assert "NEXT_SAFE_ACTION: Collect metadata" in output
+    assert "BLOCKER: none" in output
+    assert "EXPECTED_FINAL_STATE: REFERENCE_COLLECTED" in output
+
+
+def test_dry_run_plan_reports_blocker_for_a_human_gate():
+    report = run_batch.CandidateReport(
+        candidate_code=CANDIDATE_CODE,
+        initial_state="CONTENT_REVIEW_REQUIRED",
+        final_state="CONTENT_REVIEW_REQUIRED",
+        result="DRY_RUN",
+        human_gate=True,
+        human_gate_reason="Automatic content approval was declined.",
+        next_action_kind="human_gate",
+        next_action_description="",
+    )
+
+    import io
+    import contextlib
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        run_batch.print_dry_run_plan([report], requested=1)
+
+    output = buffer.getvalue()
+    assert "CURRENT_STAGE: CONTENT_REVIEW_REQUIRED" in output
+    assert "NEXT_SAFE_ACTION: none -- requires human decision" in output
+    assert "BLOCKER: Automatic content approval was declined." in output
+    assert "EXPECTED_FINAL_STATE: CONTENT_REVIEW_REQUIRED" in output
+
+
+def test_dry_run_plan_reports_blocked_state_distinctly_from_human_gate():
+    report = run_batch.CandidateReport(
+        candidate_code=CANDIDATE_CODE,
+        initial_state="IMAGE_CAPABILITY_UNAVAILABLE",
+        final_state="IMAGE_CAPABILITY_UNAVAILABLE",
+        result="BLOCKED",
+        blocked=True,
+        blocked_reason="Historical image ingestion capability is unavailable.",
+        next_action_kind="blocked",
+        next_action_description="",
+    )
+
+    import io
+    import contextlib
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        run_batch.print_dry_run_plan([report], requested=1)
+
+    output = buffer.getvalue()
+    assert "NEXT_SAFE_ACTION: none -- structural precondition unmet" in output
+    assert "BLOCKER: Historical image ingestion capability is unavailable." in output
+
+
+def test_dry_run_plan_skips_not_processed_candidates():
+    processed = run_batch.CandidateReport(
+        candidate_code="CAN-A",
+        initial_state="RECONCILED",
+        final_state="RECONCILED",
+        result="TERMINAL",
+        next_action_kind="terminal",
+        next_action_description="",
+    )
+    not_processed = run_batch.CandidateReport(
+        candidate_code="CAN-B",
+        initial_state="NOT_PROCESSED",
+        final_state="NOT_PROCESSED",
+        result="NOT_PROCESSED",
+    )
+
+    import io
+    import contextlib
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        run_batch.print_dry_run_plan([processed, not_processed], requested=2)
+
+    output = buffer.getvalue()
+    assert "CAN-A" in output
+    assert "CAN-B" not in output
+    assert "Candidates planned: 1" in output
+
+
+def test_main_dry_run_includes_the_plan_report(capsys):
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+        ],
+        product_references=[make_reference()],
+    )
+    runner, calls = recording_runner()
+
+    exit_code = run_batch.main(
+        [
+            "--candidate-code",
+            CANDIDATE_CODE,
+            "--max-candidates",
+            "1",
+            "--dry-run",
+            "--non-interactive",
+        ],
+        repository=repository,
+        subprocess_runner=runner,
+        confirm=always_confirm,
+    )
+
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert calls == []
+    assert "DRY-RUN PLAN" in output
+    assert f"CANDIDATE: {CANDIDATE_CODE}" in output
+    assert "CURRENT_STAGE:" in output
+    assert "NEXT_SAFE_ACTION:" in output
+    assert "BLOCKER:" in output
+    assert "EXPECTED_FINAL_STATE:" in output

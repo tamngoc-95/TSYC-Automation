@@ -18,19 +18,33 @@ from src.repositories.supabase_repository import SupabaseRepository
 configure_utf8_console()
 
 
+# Default local-cache batch code, preserved for backward compatibility
+# with every existing caller that does not pass --batch-code. A
+# candidate's own batch_code (production live-crawl batches, or a
+# historical batch such as FB-HIST-2026-AUTOIMPORT) is unrelated to this
+# value -- this is purely the local
+# data/raw/facebook-images/<batch-code>/ cache directory name, which the
+# collector (download_facebook_post_images.py) and the historical
+# extractor (extract_historical_facebook_images.py) both write into and
+# this script reads back out of. --batch-code generalizes this script
+# (TSYC pipeline stabilization Phase 3) so the same, unchanged insert
+# logic below serves both sources.
 BATCH_CODE = "FB-2026-001"
 STORAGE_BUCKET = "product-images"
 
 UPLOADER_NAME = "facebook_image_supabase_uploader"
 UPLOADER_VERSION = "0.8.1"
 
-LOCAL_IMAGE_ROOT = (
-    PROJECT_ROOT
-    / "data"
-    / "raw"
-    / "facebook-images"
-    / BATCH_CODE
-)
+
+def local_image_root_for(batch_code: str) -> Path:
+    """The local cache directory for one batch code."""
+    return PROJECT_ROOT / "data" / "raw" / "facebook-images" / batch_code
+
+
+# Preserved as a module-level default so any existing caller that
+# imports LOCAL_IMAGE_ROOT directly (rather than calling
+# find_metadata_files(local_image_root=...)) keeps working unchanged.
+LOCAL_IMAGE_ROOT = local_image_root_for(BATCH_CODE)
 
 ALLOWED_MIME_TYPES = {
     "image/jpeg",
@@ -93,6 +107,18 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--batch-code",
+        default=BATCH_CODE,
+        help=(
+            "Local cache batch subdirectory under "
+            f"data/raw/facebook-images/. Default: {BATCH_CODE}. Pass the "
+            "same --batch-code an upstream extractor "
+            "(extract_historical_facebook_images.py) used to write "
+            "local files."
+        ),
+    )
+
+    parser.add_argument(
         "--images",
         default=None,
         help=(
@@ -119,17 +145,17 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def find_metadata_files() -> list[Path]:
-    """Find local Facebook image metadata files."""
-    if not LOCAL_IMAGE_ROOT.exists():
+def find_metadata_files(local_image_root: Path = LOCAL_IMAGE_ROOT) -> list[Path]:
+    """Find local Facebook image metadata files under one batch root."""
+    if not local_image_root.exists():
         raise RuntimeError(
             "Local Facebook image directory does not exist: "
-            f"{LOCAL_IMAGE_ROOT}"
+            f"{local_image_root}"
         )
 
     metadata_files = [
         file_path
-        for file_path in LOCAL_IMAGE_ROOT.rglob("*.json")
+        for file_path in local_image_root.rglob("*.json")
         if file_path.name != "download_summary.json"
     ]
 
@@ -315,6 +341,7 @@ def validate_metadata(
 def build_storage_path(
     metadata: dict[str, Any],
     image_path: Path,
+    batch_code: str = BATCH_CODE,
 ) -> str:
     """Build a deterministic Storage path using SHA-256."""
     raw_page_id = str(
@@ -335,7 +362,7 @@ def build_storage_path(
 
     return (
         f"facebook/"
-        f"{BATCH_CODE}/"
+        f"{batch_code}/"
         f"{raw_page_id}/"
         f"{image_hash}{extension}"
     )
@@ -568,6 +595,7 @@ def upload_one_image(
     repository: SupabaseRepository,
     metadata_path: Path,
     candidate_id: str,
+    batch_code: str = BATCH_CODE,
 ) -> str:
     """Upload one image and create its database record."""
     metadata = load_json(
@@ -599,6 +627,7 @@ def upload_one_image(
     storage_path = build_storage_path(
         metadata=metadata,
         image_path=image_path,
+        batch_code=batch_code,
     )
 
     print()
@@ -1509,12 +1538,13 @@ def main() -> None:
         f"Bucket: {STORAGE_BUCKET}"
     )
     print(
-        f"Batch: {BATCH_CODE}"
+        f"Batch: {args.batch_code}"
     )
 
     repository = SupabaseRepository()
 
-    metadata_files = find_metadata_files()
+    local_image_root = local_image_root_for(args.batch_code)
+    metadata_files = find_metadata_files(local_image_root)
 
     print(
         "Image metadata files found: "
@@ -1648,6 +1678,7 @@ def main() -> None:
                 repository=repository,
                 metadata_path=metadata_path,
                 candidate_id=selected_candidate_id,
+                batch_code=args.batch_code,
             )
 
             results[status] += 1

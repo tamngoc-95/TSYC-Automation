@@ -221,6 +221,12 @@ class CandidateReport:
     # dispatch decisions. See pipeline_state.CandidateState.outcome.
     outcome: str = Outcome.AUTO_PASS
     outcome_reason: str | None = None
+    # The last decide_action() call's (kind, description) for this
+    # candidate -- captured for every run (dry-run and real) so
+    # print_dry_run_plan() below has one source of truth instead of
+    # re-deriving the decision a second time.
+    next_action_kind: str = ""
+    next_action_description: str = ""
 
 
 def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
@@ -584,6 +590,8 @@ def process_one_candidate(
 
     for _ in range(MAX_STAGES_PER_CANDIDATE):
         kind, dispatch, description = decide_action(state, args.allow_woo_draft)
+        report.next_action_kind = kind
+        report.next_action_description = description
 
         next_stage_label = (
             dispatch.script
@@ -956,6 +964,94 @@ def print_grouped_summary(reports: list[CandidateReport], requested: int) -> Non
     print(f"Candidates processed: {sum(len(v) for k, v in groups.items() if k != 'NOT_PROCESSED')}")
 
 
+# CLAUDE.md Phase 6: one hop's worth of prediction only -- the derived
+# state immediately after the *single* dispatched action succeeds, not a
+# multi-stage simulation (a dry run performs no I/O, so it cannot know
+# whether a later automated check will actually pass). Where a script's
+# own deterministic validation can go either way, both branches are
+# named rather than picking one.
+_EXPECTED_NEXT_STATE_AFTER_ACTION: dict[str, str] = {
+    "REFERENCE_REGISTERED": "REFERENCE_COLLECTED",
+    "REFERENCE_COLLECTED": (
+        "IDENTITY_VERIFIED (or IDENTITY_PENDING/IDENTITY_CONFLICT if "
+        "evidence is inconclusive)"
+    ),
+    "IDENTITY_VERIFIED": "INTERNAL_PRODUCT_CREATED",
+    "INTERNAL_PRODUCT_CREATED": "CONTENT_DRAFTED",
+    "CONTENT_DRAFTED": (
+        "CONTENT_APPROVED (or CONTENT_REVIEW_REQUIRED if automatic "
+        "approval checks do not all pass)"
+    ),
+    "IMAGE_VALIDATED": "READY_FOR_DRAFT",
+    "DRAFT_CREATED": "RECONCILED",
+}
+
+
+def print_dry_run_plan(reports: list[CandidateReport], requested: int) -> None:
+    """CLAUDE.md Phase 6: the stable dry-run/read-only planning report.
+
+    Per candidate: CURRENT_STAGE / NEXT_SAFE_ACTION / BLOCKER /
+    EXPECTED_FINAL_STATE -- so an operator never has to manually invoke
+    scripts/pipeline_state.py or an individual stage script just to see
+    what would happen next. Read-only: reuses the exact decision
+    (report.next_action_kind/description) --dry-run already computed;
+    invokes no writer and performs no additional I/O.
+    """
+    print()
+    print("=" * 78)
+    print("DRY-RUN PLAN (read-only; no writer was invoked)")
+    print("=" * 78)
+
+    planned = 0
+
+    for report in reports:
+        if report.result == "NOT_PROCESSED":
+            continue
+
+        planned += 1
+
+        if report.result in ("NOT_FOUND", "BATCH_MISMATCH"):
+            print()
+            print(f"CANDIDATE: {report.candidate_code}")
+            print(f"CURRENT_STAGE: {report.result}")
+            print("NEXT_SAFE_ACTION: none -- candidate could not be resolved")
+            print(f"BLOCKER: {report.result}")
+            print(f"EXPECTED_FINAL_STATE: {report.result}")
+            continue
+
+        current_stage = report.initial_state
+        kind = report.next_action_kind
+        blocker = report.human_gate_reason or report.blocked_reason or "none"
+
+        if kind == "invoke":
+            next_action = report.next_action_description
+            expected_final_state = _EXPECTED_NEXT_STATE_AFTER_ACTION.get(
+                current_stage,
+                "(next milestone not pre-mapped -- re-run after this "
+                "stage to confirm)",
+            )
+        elif kind == "terminal":
+            next_action = "none -- already complete"
+            expected_final_state = current_stage
+        elif kind == "blocked":
+            next_action = "none -- structural precondition unmet"
+            expected_final_state = current_stage
+        else:  # "human_gate"
+            next_action = "none -- requires human decision"
+            expected_final_state = current_stage
+
+        print()
+        print(f"CANDIDATE: {report.candidate_code}")
+        print(f"CURRENT_STAGE: {current_stage}")
+        print(f"NEXT_SAFE_ACTION: {next_action}")
+        print(f"BLOCKER: {blocker}")
+        print(f"EXPECTED_FINAL_STATE: {expected_final_state}")
+
+    print()
+    print(f"Candidates requested: {requested}")
+    print(f"Candidates planned: {planned}")
+
+
 def print_woo_approval_request(
     reports: list[CandidateReport],
     allow_woo_draft: bool,
@@ -1103,6 +1199,9 @@ def main(
 
     if args.verbose:
         print_detailed_summary(reports, len(allowlist))
+
+    if args.dry_run:
+        print_dry_run_plan(reports, len(allowlist))
 
     print_grouped_summary(reports, len(allowlist))
     print_woo_approval_request(reports, args.allow_woo_draft)

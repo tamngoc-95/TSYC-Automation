@@ -219,3 +219,53 @@ def test_undetermined_match_requires_review():
 
     assert result.outcome == Outcome.REVIEW_REQUIRED
     assert result.rule_code == rules.IMAGE_PRODUCT_MISMATCH
+
+
+# --- evaluate_historical_image_capability -------------------------------
+# (TSYC pipeline stabilization Phase 3: FB-HIST image ingestion)
+
+
+def test_historical_capability_available_auto_passes():
+    result = rules.evaluate_historical_image_capability(
+        available=True,
+        reason="Facebook export archive found: facebook-export.zip.",
+    )
+
+    assert result.outcome == Outcome.AUTO_PASS
+    assert result.rule_code == rules.IMAGE_CAPABILITY_UNAVAILABLE
+
+
+def test_historical_capability_unavailable_is_blocked_not_review():
+    """A missing export archive is an environmental precondition, not a
+    business judgment call -- BLOCKED, not REVIEW_REQUIRED."""
+    result = rules.evaluate_historical_image_capability(
+        available=False,
+        reason="Historical image ingestion capability is unavailable: no "
+        "Facebook export archive was found.",
+    )
+
+    assert result.outcome == Outcome.BLOCKED
+    assert result.rule_code == rules.IMAGE_CAPABILITY_UNAVAILABLE
+
+
+# --- evaluate_historical_image_ownership --------------------------------
+
+
+def test_historical_ownership_unambiguous_when_no_siblings():
+    result = rules.evaluate_historical_image_ownership([])
+
+    assert result.outcome == Outcome.AUTO_PASS
+    assert result.rule_code == rules.IMAGE_GROUP_OWNERSHIP_UNAMBIGUOUS
+
+
+def test_historical_ownership_ambiguous_when_siblings_share_post():
+    """CLAUDE.md section 11: a multi-book Facebook post must never have
+    its images silently attached to one candidate."""
+    result = rules.evaluate_historical_image_ownership(
+        ["FB-HIST-2026-001-CAN-0002", "FB-HIST-2026-001-CAN-0003"]
+    )
+
+    assert result.outcome == Outcome.REVIEW_REQUIRED
+    assert result.rule_code == rules.IMAGE_GROUP_OWNERSHIP_AMBIGUOUS
+    assert "FB-HIST-2026-001-CAN-0002" in result.reason
+    assert "FB-HIST-2026-001-CAN-0003" in result.reason

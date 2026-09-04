@@ -65,10 +65,18 @@ one.
 | Image | `IMAGE_MULTIPLE_EQUIVALENT_CANDIDATES` | More than one image is equally eligible for main-image selection | — | — | **Yes** | No |
 | Image | `IMAGE_RIGHTS_UNKNOWN` | `usage_rights_status` is `RIGHTS_UNKNOWN`, `REFERENCE_ONLY`, unrecognized, or a would-be-publishable status lacks a confirmed policy basis; or no image is eligible at all | — | — | **Yes** | No |
 | Image | `IMAGE_PRODUCT_MISMATCH` | An image is confirmed not to represent the linked candidate | AUTO_REJECT | — | No (see note) | No |
+| Image | `IMAGE_CAPABILITY_UNAVAILABLE` | Historical (FB-HIST) image extraction is attempted but the Facebook export archive is missing/unreadable | — | — | No | **Yes** (structural precondition, not a business judgment) |
+| Image | `IMAGE_GROUP_OWNERSHIP_UNAMBIGUOUS` | A historical candidate's source Facebook post produced no other candidate | AUTO_PASS — local media may be associated to this candidate | — | No | No |
+| Image | `IMAGE_GROUP_OWNERSHIP_AMBIGUOUS` | A historical candidate's source Facebook post also produced one or more other candidates (a multi-book post) — CLAUDE.md section 11 | — | — | **Yes** | No |
 
 Note: `IMAGE_PRODUCT_MISMATCH` also covers the confirmed-match
 (AUTO_PASS) and not-yet-determined (REVIEW_REQUIRED) outcomes of the
 same underlying check — see `evaluate_image_product_match()`.
+
+`IMAGE_CAPABILITY_UNAVAILABLE` / `IMAGE_GROUP_OWNERSHIP_*` are
+`pipeline_state.py`'s FB-HIST image gates (TSYC pipeline stabilization
+Phase 3/4) — see `src.services.historical_image_extraction` and
+`scripts/extract_historical_facebook_images.py`.
 
 ---
 
