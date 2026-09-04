@@ -120,6 +120,28 @@ def parse_arguments() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--reset-stuck-in-progress",
+        action="store_true",
+        help=(
+            "Recovery only: reset a source_urls row stuck at crawl_status="
+            "IN_PROGRESS back to PENDING, so it can be retried. Refuses "
+            "unless the row is actually IN_PROGRESS and no product_"
+            "references row exists yet for that candidate from that "
+            "source (the same 'reconcile before retry' rule CLAUDE.md "
+            "applies to WooCommerce recovery, section 2.6/18) -- this "
+            "only recovers a crawl interrupted before anything was ever "
+            "written, e.g. the process was killed mid-fetch. Requires "
+            "--source-url-id and --confirm-reset."
+        ),
+    )
+
+    parser.add_argument(
+        "--confirm-reset",
+        action="store_true",
+        help="Confirm --reset-stuck-in-progress without interactive input.",
+    )
+
     return parser.parse_args()
 
 
@@ -1807,6 +1829,106 @@ def update_discovery_status(
     )
 
 
+def reset_stuck_in_progress_source(
+    repository: SupabaseRepository,
+    source_url_id: str,
+) -> None:
+    """
+    Recover a source_urls row stuck at crawl_status=IN_PROGRESS -- e.g.
+    the collector process was killed mid-fetch, after IN_PROGRESS was
+    written but before COLLECTED/FAILED ever could be (see the crawl-body
+    except in main(), which cannot run if the process itself is killed).
+
+    Mirrors CLAUDE.md's "reconcile before retry" rule for uncertain
+    WooCommerce operations (section 2.6/18): refuses unless (a) the row
+    is actually IN_PROGRESS and (b) no product_references row exists yet
+    from this exact source for its candidate -- i.e. nothing was in fact
+    collected, so resetting to PENDING for a normal retry is safe. Never
+    touches a row in any other crawl_status, and never touches a row that
+    already produced a reference (that would risk a second reference row
+    from a second, possibly-different crawl of the same source -- a
+    genuine recovery/reconciliation call, not a bounded technical reset).
+    """
+    source_response = (
+        repository.client
+        .table("source_urls")
+        .select(
+            "source_url_id, crawl_status"
+        )
+        .eq(
+            "source_url_id",
+            source_url_id,
+        )
+        .limit(1)
+        .execute()
+    )
+
+    source_records = source_response.data or []
+
+    if not source_records:
+        raise RuntimeError(
+            f"No source_urls row found for source_url_id={source_url_id}."
+        )
+
+    if source_records[0].get("crawl_status") != "IN_PROGRESS":
+        raise RuntimeError(
+            "Refusing to reset: crawl_status is "
+            f"{source_records[0].get('crawl_status')!r}, not IN_PROGRESS."
+        )
+
+    discovery_response = (
+        repository.client
+        .table("candidate_reference_sources")
+        .select(
+            "candidate_id"
+        )
+        .eq(
+            "source_url_id",
+            source_url_id,
+        )
+        .execute()
+    )
+
+    for discovery in discovery_response.data or []:
+        reference_response = (
+            repository.client
+            .table("product_references")
+            .select(
+                "reference_id"
+            )
+            .eq(
+                "candidate_id",
+                discovery["candidate_id"],
+            )
+            .eq(
+                "source_url_id",
+                source_url_id,
+            )
+            .limit(1)
+            .execute()
+        )
+
+        if reference_response.data:
+            raise RuntimeError(
+                "Refusing to reset: a product_references row already "
+                "exists from this source for candidate_id="
+                f"{discovery['candidate_id']} -- this is not an "
+                "interrupted-before-anything-was-written case."
+            )
+
+    update_source_status(
+        repository=repository,
+        source_url_id=source_url_id,
+        crawl_status="PENDING",
+        last_error=(
+            "Reset from stuck IN_PROGRESS by --reset-stuck-in-progress: "
+            "no product_references row existed, so nothing was collected "
+            "before the prior attempt was interrupted."
+        ),
+        set_last_crawled_at=False,
+    )
+
+
 def find_existing_raw_page(
     repository: SupabaseRepository,
     source_url_id: str,
@@ -2161,6 +2283,54 @@ def collect_page(
     )
 
 
+def select_parser_or_mark_failed(
+    repository: SupabaseRepository,
+    source_url: str,
+    source_url_id: str,
+    discovery_id: str,
+) -> str:
+    """
+    select_parser(), but a no-parser-for-this-domain failure is recorded
+    on the source_urls / candidate_reference_sources rows instead of
+    propagating with no write at all.
+
+    select_parser() runs before crawl_status is ever set to IN_PROGRESS
+    (mirroring an interrupted crawl would be wrong here -- nothing was
+    ever attempted). Without this wrapper, an unsupported domain left the
+    source_urls row stuck at PENDING forever -- indistinguishable from
+    one nothing had tried yet, so run_batch.py re-selected it (and
+    re-failed the same way) on every future pass instead of the
+    candidate ever becoming free to register a different, supported
+    source. Mirrors the crawl-body except in main(): mark FAILED with
+    the exact error, same as any other collection failure, then re-raise
+    so the caller's own exit-code/reporting behavior is unchanged.
+    """
+    try:
+        return select_parser(
+            source_url
+        )
+    except Exception as error:
+        error_message = (
+            f"{type(error).__name__}: {error}"
+        )
+
+        update_source_status(
+            repository=repository,
+            source_url_id=source_url_id,
+            crawl_status="FAILED",
+            last_error=error_message[:4000],
+            set_last_crawled_at=True,
+        )
+
+        update_discovery_status(
+            repository=repository,
+            discovery_id=discovery_id,
+            discovery_status="FAILED",
+        )
+
+        raise
+
+
 def select_parser(
     source_url: str,
 ) -> str:
@@ -2378,6 +2548,28 @@ def main() -> None:
 
     repository = SupabaseRepository()
 
+    if args.reset_stuck_in_progress:
+        if not args.source_url_id:
+            raise RuntimeError(
+                "--reset-stuck-in-progress requires --source-url-id."
+            )
+
+        if not args.confirm_reset:
+            raise RuntimeError(
+                "--reset-stuck-in-progress requires --confirm-reset."
+            )
+
+        reset_stuck_in_progress_source(
+            repository=repository,
+            source_url_id=args.source_url_id,
+        )
+
+        print(
+            f"Source URL {args.source_url_id}: reset IN_PROGRESS -> PENDING."
+        )
+
+        return
+
     queue_item = select_next_reference_queue_item(
         repository=repository,
         candidate_code=args.candidate_code,
@@ -2416,8 +2608,11 @@ def main() -> None:
         discovery["discovery_id"]
     )
 
-    parser_name = select_parser(
-        source["source_url"]
+    parser_name = select_parser_or_mark_failed(
+        repository=repository,
+        source_url=source["source_url"],
+        source_url_id=source_url_id,
+        discovery_id=discovery_id,
     )
 
     update_source_status(
