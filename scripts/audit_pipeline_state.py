@@ -638,6 +638,20 @@ def audit_images(
             )
 
 
+# Historical-migration draft-safe policy (explicit shop-owner business
+# authorization, CLAUDE.md section 6.2/9.4/13): create_internal_product.py
+# deliberately sets an FB-HIST candidate's primary_reference_id to a
+# POSSIBLE_MATCH/MANUAL_REVIEW reference used only as enrichment (see
+# get_best_reference_for_historical()), or to no reference at all when
+# none exists. Mirrors that exact same enrichment set -- NO_MATCH is
+# deliberately excluded there and stays excluded here too; a confirmed
+# rejection is never treated as an acceptable primary reference.
+_HISTORICAL_ENRICHMENT_MATCH_DECISIONS = (
+    MatchDecision.POSSIBLE_MATCH,
+    MatchDecision.MANUAL_REVIEW,
+)
+
+
 def audit_references(
     candidates: list[dict[str, Any]],
     references: list[dict[str, Any]],
@@ -649,6 +663,12 @@ def audit_references(
         str(reference.get("reference_id")): reference
         for reference in references
         if reference.get("reference_id")
+    }
+
+    candidates_by_id = {
+        str(candidate.get("candidate_id")): candidate
+        for candidate in candidates
+        if candidate.get("candidate_id")
     }
 
     refs_by_candidate: dict[str, list[dict[str, Any]]] = {}
@@ -704,7 +724,31 @@ def audit_references(
             or product.get("internal_product_id")
         )
 
+        candidate = candidates_by_id.get(
+            str(product.get("candidate_id"))
+        )
+        is_historical = is_historical_candidate_code(
+            candidate.get("candidate_code") if candidate else None
+        )
+
         if not reference_id:
+            if is_historical:
+                # CLAUDE.md section 2 "reference discovery is enrichment,
+                # not a mandatory blocker": a historical draft-safe
+                # candidate may legitimately have zero usable references
+                # at all.
+                add_issue(
+                    issues,
+                    "WARNING",
+                    product_code,
+                    "PRIMARY_REFERENCE_MISSING_HISTORICAL",
+                    "Internal product has no primary_reference_id. "
+                    "Expected under the historical draft-safe policy when "
+                    "no reference was found; enrichment only, does not "
+                    "block WooCommerce draft creation.",
+                )
+                continue
+
             add_issue(
                 issues,
                 "ERROR",
@@ -744,13 +788,27 @@ def audit_references(
         if reference.get(
             "match_decision"
         ) != MatchDecision.MATCH:
-            add_issue(
-                issues,
-                "ERROR",
-                product_code,
-                "PRIMARY_REFERENCE_NOT_MATCHED",
-                "Primary reference does not have match_decision=MATCH.",
-            )
+            if is_historical and reference.get(
+                "match_decision"
+            ) in _HISTORICAL_ENRICHMENT_MATCH_DECISIONS:
+                add_issue(
+                    issues,
+                    "WARNING",
+                    product_code,
+                    "PRIMARY_REFERENCE_NOT_MATCHED_HISTORICAL",
+                    "Primary reference does not have match_decision="
+                    "MATCH. Expected under the historical draft-safe "
+                    "policy: the reference is enrichment context only, "
+                    "does not block WooCommerce draft creation.",
+                )
+            else:
+                add_issue(
+                    issues,
+                    "ERROR",
+                    product_code,
+                    "PRIMARY_REFERENCE_NOT_MATCHED",
+                    "Primary reference does not have match_decision=MATCH.",
+                )
 
 
 def audit_woocommerce(

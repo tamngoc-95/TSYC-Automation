@@ -66,6 +66,12 @@ ACCEPTED_WARNING_CODES = {
     # expected and accepted -- see
     # audit_pipeline_state.py::audit_candidate_product_linkage().
     "IDENTITY_NOT_VERIFIED_HISTORICAL",
+    # Same policy, applied to primary-reference linkage (CLAUDE.md
+    # section 6.2/9.4/13): an FB-HIST internal product may have a
+    # POSSIBLE_MATCH/MANUAL_REVIEW primary reference (enrichment only)
+    # or none at all -- see audit_pipeline_state.py::audit_references().
+    "PRIMARY_REFERENCE_MISSING_HISTORICAL",
+    "PRIMARY_REFERENCE_NOT_MATCHED_HISTORICAL",
 }
 
 # The full named state machine from the Phase C plan. run_batch.py's
