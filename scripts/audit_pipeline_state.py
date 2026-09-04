@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from create_internal_product import is_historical_candidate_code
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.content_status import ContentStatus, InternalProductContentStatus
 from src.domain.identity_status import IdentityStatus, MatchDecision
@@ -362,16 +363,48 @@ def audit_candidate_product_linkage(
             )
             continue
 
-        if candidate.get(
-            "identity_status"
-        ) != IdentityStatus.IDENTITY_VERIFIED:
-            add_issue(
-                issues,
-                "ERROR",
-                product_code,
-                "IDENTITY_NOT_VERIFIED",
-                "Internal product exists while candidate identity is not verified.",
-            )
+        identity_status = candidate.get("identity_status")
+
+        if identity_status != IdentityStatus.IDENTITY_VERIFIED:
+            if is_historical_candidate_code(candidate.get("candidate_code")):
+                # Historical-migration draft-safe policy (explicit
+                # shop-owner business authorization, CLAUDE.md section
+                # 9/13): create_internal_product.py deliberately accepts
+                # FB-HIST candidates at IDENTITY_PENDING with no/
+                # POSSIBLE_MATCH/MANUAL_REVIEW reference. A confirmed
+                # IDENTITY_CONFLICT is still a real invariant violation
+                # (create_internal_product.py must never have accepted
+                # it) and stays an ERROR; unverified-but-not-conflicted
+                # identity is only a WARNING here. Non-historical
+                # candidates keep the strict ERROR below, unchanged.
+                if identity_status == IdentityStatus.IDENTITY_CONFLICT:
+                    add_issue(
+                        issues,
+                        "ERROR",
+                        product_code,
+                        "IDENTITY_CONFLICT_WITH_INTERNAL_PRODUCT",
+                        "Internal product exists while candidate identity "
+                        "has a confirmed conflict.",
+                    )
+                else:
+                    add_issue(
+                        issues,
+                        "WARNING",
+                        product_code,
+                        "IDENTITY_NOT_VERIFIED_HISTORICAL",
+                        "Internal product exists under the historical "
+                        "draft-safe policy while candidate identity is "
+                        "not fully verified. This does not block "
+                        "WooCommerce draft creation.",
+                    )
+            else:
+                add_issue(
+                    issues,
+                    "ERROR",
+                    product_code,
+                    "IDENTITY_NOT_VERIFIED",
+                    "Internal product exists while candidate identity is not verified.",
+                )
 
         if not product.get("isbn"):
             add_issue(
@@ -876,7 +909,25 @@ def audit_ready_for_draft(
 
         blockers: list[str] = []
 
-        if not candidate or candidate.get(
+        if not candidate:
+            blockers.append(
+                "identity is not verified"
+            )
+        elif is_historical_candidate_code(candidate.get("candidate_code")):
+            # Historical-migration draft-safe policy (explicit shop-owner
+            # business authorization, CLAUDE.md section 6/17): FB-HIST
+            # candidates may reach READY_FOR_DRAFT with identity_status
+            # IDENTITY_PENDING (unverified) as long as it is not a
+            # confirmed IDENTITY_CONFLICT -- exactly what
+            # evaluate_historical_draft_safe_readiness() already gated on
+            # before READY_FOR_DRAFT was set. Non-historical candidates
+            # keep the strict IDENTITY_VERIFIED-only check below,
+            # completely unchanged.
+            if candidate.get("identity_status") == IdentityStatus.IDENTITY_CONFLICT:
+                blockers.append(
+                    "identity has a confirmed conflict"
+                )
+        elif candidate.get(
             "identity_status"
         ) != IdentityStatus.IDENTITY_VERIFIED:
             blockers.append(

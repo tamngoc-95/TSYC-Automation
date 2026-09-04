@@ -102,16 +102,60 @@ def clean_text(
     return normalized or None
 
 
+# Historical-migration draft-safe policy (explicit shop-owner business
+# authorization): a candidate whose code carries this prefix may reach
+# internal_product creation at IDENTITY_PENDING, not only IDENTITY_
+# VERIFIED -- CLAUDE.md section 2's "Historical migration draft
+# contract". Deliberately a code-prefix check, not a batch/table flag:
+# every FB-HIST candidate already carries this prefix by construction
+# (scripts/import_historical_facebook_candidates*.py), so this can never
+# accidentally loosen the live (FB-2026-001) pipeline, which this policy
+# was never asked to touch and whose identity_status filter below stays
+# exactly IDENTITY_VERIFIED-only.
+HISTORICAL_CANDIDATE_CODE_PREFIX = "FB-HIST"
+
+# IDENTITY_VERIFIED is always allowed (a historical candidate that fully
+# verified needs no relaxation); IDENTITY_PENDING is the additional
+# state the historical draft-safe policy allows through -- IDENTITY_
+# CONFLICT (a confirmed contradiction) is deliberately excluded, exactly
+# as CLAUDE.md's "no known contradiction proving the candidate is wrong"
+# requirement states.
+HISTORICAL_ALLOWED_IDENTITY_STATUSES = (
+    IdentityStatus.IDENTITY_VERIFIED,
+    IdentityStatus.IDENTITY_PENDING,
+)
+
+
+def is_historical_candidate_code(candidate_code: str | None) -> bool:
+    """True when a candidate_code is part of the historical migration
+    (FB-HIST-prefixed), never the live FB-2026-001 pipeline."""
+    return bool(candidate_code) and str(candidate_code).startswith(
+        HISTORICAL_CANDIDATE_CODE_PREFIX
+    )
+
+
 def get_verified_candidate(
     repository: SupabaseRepository,
     candidate_code: str | None = None,
     candidate_id: str | None = None,
 ) -> dict[str, Any] | None:
     """
-    Return one identity-verified candidate without an internal product.
+    Return one candidate eligible for internal_product creation, without
+    an internal product yet.
 
-    When a candidate code or ID is supplied, only that candidate is evaluated.
+    An exact --candidate-code selector for a historical (FB-HIST-
+    prefixed) candidate is evaluated against IDENTITY_VERIFIED OR
+    IDENTITY_PENDING (never IDENTITY_CONFLICT) -- the historical
+    draft-safe policy. Every other selector (including the no-selector
+    auto-scan path, and any live-pipeline candidate_code) is evaluated
+    against IDENTITY_VERIFIED only, exactly as before this policy.
     """
+    allowed_identity_statuses = (
+        HISTORICAL_ALLOWED_IDENTITY_STATUSES
+        if is_historical_candidate_code(candidate_code)
+        else (IdentityStatus.IDENTITY_VERIFIED,)
+    )
+
     query = (
         repository.client
         .table("product_candidates")
@@ -137,9 +181,9 @@ def get_verified_candidate(
             "source_evidence,"
             "created_at"
         )
-        .eq(
+        .in_(
             "identity_status",
-            IdentityStatus.IDENTITY_VERIFIED,
+            list(allowed_identity_statuses),
         )
     )
 
@@ -168,7 +212,8 @@ def get_verified_candidate(
 
     if (candidate_code or candidate_id) and not candidates:
         raise RuntimeError(
-            "No IDENTITY_VERIFIED candidate matched the supplied selector."
+            "No candidate matched the supplied selector at an eligible "
+            f"identity_status ({', '.join(allowed_identity_statuses)})."
         )
 
     for candidate in candidates:
@@ -211,6 +256,32 @@ def get_verified_candidate(
 
     return None
 
+_REFERENCE_SELECT_COLUMNS = (
+    "reference_id,"
+    "candidate_id,"
+    "source_url_id,"
+    "source_type,"
+    "source_name,"
+    "source_url,"
+    "reference_title,"
+    "reference_isbn,"
+    "reference_author,"
+    "reference_publisher,"
+    "reference_page_count,"
+    "reference_weight_grams,"
+    "reference_length_cm,"
+    "reference_width_cm,"
+    "reference_height_cm,"
+    "reference_cover_price_vnd,"
+    "reference_description,"
+    "reference_image_url,"
+    "match_decision,"
+    "match_confidence,"
+    "source_priority,"
+    "raw_metadata"
+)
+
+
 def get_best_matched_reference(
     repository: SupabaseRepository,
     candidate_id: str,
@@ -219,30 +290,7 @@ def get_best_matched_reference(
     response = (
         repository.client
         .table("product_references")
-        .select(
-            "reference_id,"
-            "candidate_id,"
-            "source_url_id,"
-            "source_type,"
-            "source_name,"
-            "source_url,"
-            "reference_title,"
-            "reference_isbn,"
-            "reference_author,"
-            "reference_publisher,"
-            "reference_page_count,"
-            "reference_weight_grams,"
-            "reference_length_cm,"
-            "reference_width_cm,"
-            "reference_height_cm,"
-            "reference_cover_price_vnd,"
-            "reference_description,"
-            "reference_image_url,"
-            "match_decision,"
-            "match_confidence,"
-            "source_priority,"
-            "raw_metadata"
-        )
+        .select(_REFERENCE_SELECT_COLUMNS)
         .eq(
             "candidate_id",
             candidate_id,
@@ -283,6 +331,66 @@ def get_best_matched_reference(
         )
 
     return reference
+
+
+# match_decision values usable as enrichment context for a historical
+# draft-safe candidate when no MATCH reference exists. NO_MATCH is
+# deliberately excluded even here -- a confirmed rejection is never
+# reused as enrichment, only "not yet conclusive" evidence is.
+_HISTORICAL_ENRICHMENT_MATCH_DECISIONS = (
+    MatchDecision.POSSIBLE_MATCH,
+    MatchDecision.MANUAL_REVIEW,
+)
+
+
+def get_best_reference_for_historical(
+    repository: SupabaseRepository,
+    candidate_id: str,
+) -> dict[str, Any] | None:
+    """
+    Return the best available reference for a historical draft-safe
+    candidate: a MATCH reference if one exists (unchanged from
+    get_best_matched_reference()), else the highest-priority POSSIBLE_
+    MATCH/MANUAL_REVIEW reference as enrichment context, else None (a
+    historical draft-safe candidate may legitimately have zero usable
+    references at all -- CLAUDE.md section 2 "reference discovery is
+    enrichment, not a mandatory blocker").
+    """
+    matched = get_best_matched_reference(
+        repository=repository,
+        candidate_id=candidate_id,
+    )
+
+    if matched is not None:
+        return matched
+
+    response = (
+        repository.client
+        .table("product_references")
+        .select(_REFERENCE_SELECT_COLUMNS)
+        .eq(
+            "candidate_id",
+            candidate_id,
+        )
+        .in_(
+            "match_decision",
+            list(_HISTORICAL_ENRICHMENT_MATCH_DECISIONS),
+        )
+        .order(
+            "source_priority",
+            desc=False,
+        )
+        .order(
+            "match_confidence",
+            desc=True,
+        )
+        .limit(1)
+        .execute()
+    )
+
+    references = response.data or []
+
+    return references[0] if references else None
 
 
 def get_candidate_images(
@@ -430,10 +538,19 @@ def determine_image_status(
 
 def build_product_metadata(
     candidate: dict[str, Any],
-    reference: dict[str, Any],
+    reference: dict[str, Any] | None,
     images: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Build traceable internal product metadata."""
+    """Build traceable internal product metadata.
+
+    reference is None for a historical draft-safe candidate with zero
+    usable references (CLAUDE.md section 2: "reference discovery is
+    enrichment, not a mandatory blocker") -- every reference.get() below
+    reads through an empty dict in that case rather than fabricating a
+    reference that was never found.
+    """
+    reference = reference or {}
+
     return {
         "creator_name": CREATOR_NAME,
         "creator_version": CREATOR_VERSION,
@@ -505,47 +622,81 @@ def build_product_metadata(
 def create_internal_product(
     repository: SupabaseRepository,
     candidate: dict[str, Any],
-    reference: dict[str, Any],
+    reference: dict[str, Any] | None,
     images: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Create one internal product."""
-    if candidate.get("identity_status") != IdentityStatus.IDENTITY_VERIFIED:
+    """Create one internal product.
+
+    reference is optional (None) only for a historical (FB-HIST-
+    prefixed) candidate under the draft-safe policy -- CLAUDE.md section
+    2: reference discovery is enrichment, not a mandatory blocker. Every
+    other candidate (the live pipeline) keeps the original, unchanged
+    requirement: exactly one MATCH reference, always present.
+    """
+    is_historical = is_historical_candidate_code(candidate.get("candidate_code"))
+
+    allowed_identity_statuses = (
+        HISTORICAL_ALLOWED_IDENTITY_STATUSES
+        if is_historical
+        else (IdentityStatus.IDENTITY_VERIFIED,)
+    )
+
+    if candidate.get("identity_status") not in allowed_identity_statuses:
         raise RuntimeError(
-            "Candidate identity must be IDENTITY_VERIFIED."
+            "Candidate identity must be "
+            + " or ".join(allowed_identity_statuses)
+            + f"; found {candidate.get('identity_status')!r}."
         )
 
     if reference is None:
-        raise RuntimeError(
-            "No matched product reference was found for this candidate."
+        if not is_historical:
+            raise RuntimeError(
+                "No matched product reference was found for this candidate."
+            )
+        # Historical draft-safe: zero usable references is allowed --
+        # nothing further to validate about a reference that does not
+        # exist.
+    else:
+        allowed_match_decisions = (
+            (MatchDecision.MATCH,) + _HISTORICAL_ENRICHMENT_MATCH_DECISIONS
+            if is_historical
+            else (MatchDecision.MATCH,)
         )
 
-    if reference.get("match_decision") != MatchDecision.MATCH:
-        raise RuntimeError(
-            "Primary reference must have match_decision = MATCH."
-        )
+        if reference.get("match_decision") not in allowed_match_decisions:
+            raise RuntimeError(
+                "Primary reference must have match_decision = "
+                + " or ".join(allowed_match_decisions)
+                + "."
+            )
 
-    if str(reference.get("candidate_id")) != str(
-        candidate.get("candidate_id")
-    ):
-        raise RuntimeError(
-            "Primary reference is not linked to the selected candidate."
-        )
+        if str(reference.get("candidate_id")) != str(
+            candidate.get("candidate_id")
+        ):
+            raise RuntimeError(
+                "Primary reference is not linked to the selected candidate."
+            )
 
-    if not reference.get("reference_id"):
-        raise RuntimeError(
-            "Primary reference has no reference_id."
-        )
+        if not reference.get("reference_id"):
+            raise RuntimeError(
+                "Primary reference has no reference_id."
+            )
 
-    if not reference.get("source_url_id"):
-        raise RuntimeError(
-            "Primary reference has no source_url_id."
-        )
+        if not reference.get("source_url_id"):
+            raise RuntimeError(
+                "Primary reference has no source_url_id."
+            )
+
+    # reference may be None here only for a historical draft-safe
+    # candidate with zero usable references -- read through an empty
+    # dict rather than crashing on None.get(...).
+    reference_data = reference or {}
 
     title = clean_text(
         candidate.get(
             "verified_title"
         )
-        or reference.get(
+        or reference_data.get(
             "reference_title"
         )
         or candidate.get(
@@ -557,7 +708,7 @@ def create_internal_product(
         candidate.get(
             "verified_author"
         )
-        or reference.get(
+        or reference_data.get(
             "reference_author"
         )
         or candidate.get(
@@ -569,7 +720,7 @@ def create_internal_product(
         candidate.get(
             "verified_isbn"
         )
-        or reference.get(
+        or reference_data.get(
             "reference_isbn"
         )
         or candidate.get(
@@ -581,7 +732,7 @@ def create_internal_product(
         candidate.get(
             "verified_publisher"
         )
-        or reference.get(
+        or reference_data.get(
             "reference_publisher"
         )
     )
@@ -591,7 +742,7 @@ def create_internal_product(
     )
 
     if page_count is None:
-        page_count = reference.get(
+        page_count = reference_data.get(
             "reference_page_count"
         )
 
@@ -600,7 +751,7 @@ def create_internal_product(
     )
 
     if weight_grams is None:
-        weight_grams = reference.get(
+        weight_grams = reference_data.get(
             "reference_weight_grams"
         )
 
@@ -609,7 +760,7 @@ def create_internal_product(
     )
 
     if length_cm is None:
-        length_cm = reference.get(
+        length_cm = reference_data.get(
             "reference_length_cm"
         )
 
@@ -618,7 +769,7 @@ def create_internal_product(
     )
 
     if width_cm is None:
-        width_cm = reference.get(
+        width_cm = reference_data.get(
             "reference_width_cm"
         )
 
@@ -627,11 +778,11 @@ def create_internal_product(
     )
 
     if height_cm is None:
-        height_cm = reference.get(
+        height_cm = reference_data.get(
             "reference_height_cm"
         )
 
-    cover_price_vnd = reference.get(
+    cover_price_vnd = reference_data.get(
         "reference_cover_price_vnd"
     )
 
@@ -661,9 +812,9 @@ def create_internal_product(
         "candidate_id": candidate[
             "candidate_id"
         ],
-        "primary_reference_id": reference[
+        "primary_reference_id": reference_data.get(
             "reference_id"
-        ],
+        ),
         "product_code": product_code,
         "product_type": map_product_type(
             candidate.get(
@@ -768,10 +919,12 @@ def update_candidate_workflow(
 
 def print_preview(
     candidate: dict[str, Any],
-    reference: dict[str, Any],
+    reference: dict[str, Any] | None,
     images: list[dict[str, Any]],
 ) -> None:
     """Print the product creation source data."""
+    reference = reference or {}
+
     print()
     print("=" * 72)
     print("INTERNAL PRODUCT PREVIEW")
@@ -886,14 +1039,21 @@ def main() -> None:
         )
         return
 
-    reference = get_best_matched_reference(
-        repository=repository,
-        candidate_id=candidate[
-            "candidate_id"
-        ],
+    is_historical = is_historical_candidate_code(candidate.get("candidate_code"))
+
+    reference = (
+        get_best_reference_for_historical(
+            repository=repository,
+            candidate_id=candidate["candidate_id"],
+        )
+        if is_historical
+        else get_best_matched_reference(
+            repository=repository,
+            candidate_id=candidate["candidate_id"],
+        )
     )
 
-    if reference is None:
+    if reference is None and not is_historical:
         raise RuntimeError(
             "No matched product reference was found "
             "for the verified candidate."

@@ -152,3 +152,159 @@ def evaluate_readiness(
         warnings=tuple(warnings),
         evidence=evidence,
     )
+
+
+# --- historical-migration draft-safe readiness (explicit shop-owner
+# business authorization) -------------------------------------------------
+#
+# A separate, looser gate for FB-HIST candidates that never reach full
+# IDENTITY_VERIFIED. Reference discovery is enrichment, not a mandatory
+# blocker: ISBN, author, publisher, weight, page count, and a second
+# reference are all optional (non-blocking warnings only). What is NOT
+# relaxed: a meaningful title, a clear (non-conflicted) sellable unit, a
+# single validated/publish-eligible/rights-publishable main image
+# confirmed to depict this exact candidate, approved customer-facing
+# content, no active recovery condition, and no already-created Woo
+# sync. This is a second entry point into the same READY_FOR_DRAFT rule
+# code/shape as evaluate_readiness() above, not a parallel system --
+# scripts/run_batch.py and pipeline_state.py choose between the two
+# based only on whether the candidate is historical.
+
+HISTORICAL_DRAFT_SAFE = "HISTORICAL_DRAFT_SAFE"
+
+
+def evaluate_historical_draft_safe_readiness(
+    product: dict[str, Any],
+    candidate: dict[str, Any] | None,
+    approved_content: dict[str, Any] | None,
+    selected_images: Sequence[dict[str, Any]],
+    recovery_required: bool = False,
+    has_created_woo_sync: bool = False,
+) -> DecisionResult:
+    """
+    Decide whether one historical internal product may become
+    READY_FOR_DRAFT under the shop owner's historical-migration
+    draft-safe policy.
+
+    AUTO_PASS requires all of:
+      - a meaningful title (verified_title or extracted_title, non-empty)
+      - candidate_type (sellable-unit shape) is known
+      - identity_status is not IDENTITY_CONFLICT (no confirmed
+        contradiction proving this candidate is wrong)
+      - content_status = APPROVED, and an APPROVED content row exists
+      - exactly one selected main image, VALIDATED, publish eligible,
+        rights publishable
+      - recovery_required = false
+      - no created Woo sync already exists for this product
+
+    Non-blocking warnings: identity not fully verified, missing ISBN,
+    author, publisher, weight, dimensions, page count, and
+    pricing_status != APPROVED. Never invents any of these -- they stay
+    null/pending, exactly as CLAUDE.md section 2.2 already requires.
+    """
+    if candidate is None:
+        return DecisionResult(
+            outcome=Outcome.BLOCKED,
+            rule_code=HISTORICAL_DRAFT_SAFE,
+            reason="Linked product candidate was not found.",
+        )
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    title = candidate.get("verified_title") or candidate.get("extracted_title")
+
+    if not title or not str(title).strip():
+        blockers.append("No meaningful product title exists.")
+
+    if not candidate.get("candidate_type"):
+        blockers.append("Candidate type (sellable-unit shape) is unknown.")
+
+    if candidate.get("identity_status") == IdentityStatus.IDENTITY_CONFLICT:
+        blockers.append(
+            "A confirmed identity conflict exists; this is not a clear "
+            "sellable unit."
+        )
+
+    if product.get("content_status") != InternalProductContentStatus.APPROVED:
+        blockers.append("Internal product content is not approved.")
+
+    if approved_content is None:
+        blockers.append("Approved customer-facing content was not found.")
+
+    if len(selected_images) != 1:
+        blockers.append("Exactly one selected main image is required.")
+    else:
+        image = selected_images[0]
+
+        if image.get("image_status") != ImageStatus.VALIDATED:
+            blockers.append("Selected main image is not validated.")
+
+        if image.get("is_publish_eligible") is not True:
+            blockers.append("Selected main image is not publish eligible.")
+
+        if image.get("usage_rights_status") not in PUBLISHABLE_RIGHTS_STATUSES:
+            blockers.append("Selected main image usage rights are not publishable.")
+
+    if recovery_required:
+        blockers.append(
+            "A WooCommerce recovery condition is active; do not proceed "
+            "until it is resolved."
+        )
+
+    if has_created_woo_sync:
+        blockers.append(
+            "A WooCommerce sync record already exists for this product; "
+            "draft creation must not be repeated."
+        )
+
+    if candidate.get("identity_status") != IdentityStatus.IDENTITY_VERIFIED:
+        warnings.append(
+            "Identity is not fully verified; historical draft-safe "
+            "policy applied instead."
+        )
+
+    if not product.get("isbn"):
+        warnings.append("ISBN is missing.")
+
+    if not product.get("author"):
+        warnings.append("Author is missing.")
+
+    if not product.get("publisher"):
+        warnings.append("Publisher is missing.")
+
+    if product.get("weight_grams") is None:
+        warnings.append("Product weight is missing.")
+
+    if product.get("length_cm") is None or product.get("width_cm") is None or (
+        product.get("height_cm") is None
+    ):
+        warnings.append("Product dimensions are missing.")
+
+    if product.get("page_count") is None:
+        warnings.append("Page count is missing.")
+
+    if product.get("pricing_status") != "APPROVED":
+        warnings.append(
+            "Pricing is not approved. The shop owner must add or review "
+            "the price before publishing."
+        )
+
+    evidence = {"blockers": tuple(blockers), "warning_count": len(warnings)}
+
+    if blockers:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=HISTORICAL_DRAFT_SAFE,
+            reason="; ".join(blockers),
+            warnings=tuple(warnings),
+            evidence=evidence,
+        )
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=HISTORICAL_DRAFT_SAFE,
+        reason="All historical draft-safe gates are satisfied.",
+        warnings=tuple(warnings),
+        evidence=evidence,
+    )

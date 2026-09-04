@@ -122,6 +122,25 @@ AUTOMATABLE_DISPATCH: dict[str, DispatchEntry] = {
         ],
         description="Create the internal product record.",
     ),
+    # Historical-migration draft-safe policy (explicit shop-owner business
+    # authorization). create_internal_product.py itself already accepts
+    # FB-HIST candidates at IDENTITY_PENDING with no/POSSIBLE_MATCH
+    # reference -- see is_historical_candidate_code() there. Same script,
+    # same args as IDENTITY_VERIFIED above.
+    "IDENTITY_PENDING_HISTORICAL_DRAFT_SAFE": DispatchEntry(
+        script="create_internal_product.py",
+        build_args=lambda state: [
+            "--candidate-code",
+            state.candidate_code,
+            "--non-interactive",
+            "--confirm-create",
+        ],
+        description=(
+            "Create the internal product record under the historical "
+            "draft-safe policy (identity not fully verified; reference "
+            "enrichment optional)."
+        ),
+    ),
     "INTERNAL_PRODUCT_CREATED": DispatchEntry(
         script="prepare_product_content.py",
         build_args=lambda state: [
@@ -176,6 +195,29 @@ AUTOMATABLE_DISPATCH: dict[str, DispatchEntry] = {
         description=(
             "Reconcile local state with the remote WooCommerce product "
             "(read-only against WooCommerce; never creates or publishes)."
+        ),
+    ),
+    # Historical-migration draft-safe policy (explicit shop-owner business
+    # authorization, CLAUDE.md section 6/17): WooCommerce DRAFT creation
+    # for FB-HIST candidates is a reversible, authorized migration
+    # operation once evaluate_historical_draft_safe_readiness() has
+    # already passed (readiness itself is re-checked fresh by
+    # create_woocommerce_draft.py immediately before POST, exactly as for
+    # every other candidate). Does NOT require --allow-woo-draft. Never
+    # publishes, never sets a price -- same script, same args as
+    # WOO_DRAFT_DISPATCH below.
+    "READY_FOR_DRAFT_HISTORICAL": DispatchEntry(
+        script="create_woocommerce_draft.py",
+        build_args=lambda state: [
+            "--product-code",
+            state.product_code,
+            "--non-interactive",
+            "--confirm-create",
+        ],
+        description=(
+            "Create the WooCommerce draft product under the historical "
+            "draft-safe policy (automatically authorized; draft only -- "
+            "never publishes, never sets a price)."
         ),
     ),
 }

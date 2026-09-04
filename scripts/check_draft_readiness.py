@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from create_internal_product import is_historical_candidate_code
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.content_status import ContentStatus
 from src.domain.decisions import Outcome
@@ -98,14 +99,19 @@ def get_candidate(
     repository: SupabaseRepository,
     candidate_id: str | None,
 ) -> dict[str, Any] | None:
-    """Return candidate identity status."""
+    """Return candidate identity status (plus the fields the historical
+    draft-safe readiness gate additionally needs: candidate_code,
+    candidate_type, verified_title/extracted_title)."""
     if not candidate_id:
         return None
 
     response = (
         repository.client
         .table("product_candidates")
-        .select("candidate_id,identity_status")
+        .select(
+            "candidate_id,candidate_code,candidate_type,identity_status,"
+            "verified_title,extracted_title"
+        )
         .eq("candidate_id", candidate_id)
         .limit(1)
         .execute()
@@ -208,8 +214,19 @@ def evaluate_readiness(
     Return (blockers, warnings) via the shared readiness rule engine
     (src.domain.rules.readiness_rules) -- kept as this exact tuple shape
     so print_result()/main() below are unaffected by the extraction.
+
+    Historical (FB-HIST) candidates are evaluated under the shop owner's
+    historical-migration draft-safe policy
+    (evaluate_historical_draft_safe_readiness); everything else keeps the
+    original strict evaluate_readiness() gate, completely unchanged.
     """
-    result = readiness_rules.evaluate_readiness(
+    candidate_code = candidate.get("candidate_code") if candidate else None
+    evaluator = (
+        readiness_rules.evaluate_historical_draft_safe_readiness
+        if is_historical_candidate_code(candidate_code)
+        else readiness_rules.evaluate_readiness
+    )
+    result = evaluator(
         product=product,
         candidate=candidate,
         approved_content=approved_content,

@@ -34,6 +34,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from create_internal_product import is_historical_candidate_code  # noqa: E402
 from src.domain.content_status import InternalProductContentStatus
 from src.domain.decisions import DecisionResult, Outcome
 from src.domain.identity_status import IdentityStatus, MatchDecision
@@ -58,6 +59,13 @@ from src.services.historical_image_extraction import (  # noqa: E402
 ACCEPTED_WARNING_CODES = {
     "ISBN_MISSING",
     "WEIGHT_MISSING",
+    # Historical-migration draft-safe policy (explicit shop-owner
+    # business authorization, CLAUDE.md section 9/13): an internal
+    # product created for an FB-HIST candidate whose identity is not yet
+    # fully verified (but is not a confirmed IDENTITY_CONFLICT) is
+    # expected and accepted -- see
+    # audit_pipeline_state.py::audit_candidate_product_linkage().
+    "IDENTITY_NOT_VERIFIED_HISTORICAL",
 }
 
 # The full named state machine from the Phase C plan. run_batch.py's
@@ -69,6 +77,7 @@ DERIVED_STATES = {
     "REFERENCE_REGISTERED",
     "REFERENCE_COLLECTED",
     "IDENTITY_PENDING",
+    "IDENTITY_PENDING_HISTORICAL_DRAFT_SAFE",
     "IDENTITY_CONFLICT",
     "IDENTITY_VERIFIED",
     "INTERNAL_PRODUCT_CREATED",
@@ -79,6 +88,7 @@ DERIVED_STATES = {
     "IMAGE_GROUP_OWNERSHIP_AMBIGUOUS",
     "IMAGE_VALIDATED",
     "READY_FOR_DRAFT",
+    "READY_FOR_DRAFT_HISTORICAL",
     "DRAFT_CREATION_IN_PROGRESS",
     "DRAFT_CREATED",
     "RECONCILED",
@@ -603,6 +613,7 @@ def _derive_pre_product_state(
     candidate_code = candidate["candidate_code"]
     candidate_id = candidate["candidate_id"]
     identity_status = candidate.get("identity_status")
+    is_historical = is_historical_candidate_code(candidate_code)
 
     if identity_status == IdentityStatus.REJECTED:
         return CandidateState(
@@ -688,6 +699,27 @@ def _derive_pre_product_state(
                     derived_state="REFERENCE_COLLECTED",
                 )
 
+            if is_historical:
+                # Historical-migration draft-safe policy (explicit shop-
+                # owner business authorization): reference discovery is
+                # enrichment, not a mandatory blocker. Resolved references
+                # with no MATCH still let create_internal_product.py run
+                # (it accepts POSSIBLE_MATCH/MANUAL_REVIEW/no-reference for
+                # FB-HIST candidates) -- readiness itself is decided later
+                # by evaluate_historical_draft_safe_readiness().
+                return CandidateState(
+                    candidate_code=candidate_code,
+                    candidate_id=candidate_id,
+                    product_code=None,
+                    derived_state="IDENTITY_PENDING_HISTORICAL_DRAFT_SAFE",
+                    warnings=[
+                        "Reference metadata was collected, but automatic "
+                        "identity matching was inconclusive (no MATCH "
+                        "decision). Proceeding under the historical "
+                        "draft-safe policy with unverified identity."
+                    ],
+                )
+
             return CandidateState(
                 candidate_code=candidate_code,
                 candidate_id=candidate_id,
@@ -715,6 +747,27 @@ def _derive_pre_product_state(
                 candidate_id=candidate_id,
                 product_code=None,
                 derived_state="REFERENCE_REGISTERED",
+            )
+
+        if is_historical:
+            # No reference source is selected/registered at all for this
+            # historical candidate. Per the shop owner's business
+            # authorization, this is enrichment that was not found -- not
+            # a mandatory blocker -- so fall straight through to the
+            # draft-safe path instead of stopping for a human source-
+            # priority decision (the discovery/no-discovery branches
+            # below remain a human gate for non-historical candidates).
+            return CandidateState(
+                candidate_code=candidate_code,
+                candidate_id=candidate_id,
+                product_code=None,
+                derived_state="IDENTITY_PENDING_HISTORICAL_DRAFT_SAFE",
+                warnings=[
+                    "No reference source was found/selected for this "
+                    "historical candidate. Proceeding under the "
+                    "historical draft-safe policy with unverified "
+                    "identity and no enrichment reference."
+                ],
             )
 
         if discovery_sources:
@@ -828,6 +881,24 @@ def derive_candidate_state(
         )
 
     if woocommerce_status == WooCommerceStatus.READY_FOR_DRAFT:
+        if is_historical_candidate_code(candidate_code):
+            # Historical-migration draft-safe policy (explicit shop-owner
+            # business authorization, CLAUDE.md section 6/17): WooCommerce
+            # DRAFT creation (status="draft", never "publish", never a
+            # price) is a reversible, authorized migration operation for
+            # FB-HIST candidates that already passed
+            # evaluate_historical_draft_safe_readiness(). No per-batch
+            # --allow-woo-draft confirmation is required. Non-historical
+            # candidates are completely unaffected -- they keep the
+            # human_gate=True branch below unconditionally.
+            return CandidateState(
+                candidate_code=candidate_code,
+                candidate_id=candidate_id,
+                product_code=product_code,
+                derived_state="READY_FOR_DRAFT_HISTORICAL",
+                warnings=warnings,
+            )
+
         return CandidateState(
             candidate_code=candidate_code,
             candidate_id=candidate_id,
@@ -970,9 +1041,10 @@ def stage_preflight_image(bundle: dict[str, Any]) -> DecisionResult:
 
 def stage_preflight_draft(bundle: dict[str, Any]) -> DecisionResult:
     """READY_FOR_DRAFT preflight: re-evaluates the exact same
-    src.domain.rules.readiness_rules.evaluate_readiness() gate
-    scripts/check_draft_readiness.py already calls, over the data
-    load_candidate_bundle() already read -- no second copy of the
+    src.domain.rules.readiness_rules gate scripts/check_draft_readiness.py
+    already calls (evaluate_readiness for non-historical candidates,
+    evaluate_historical_draft_safe_readiness for FB-HIST candidates), over
+    the data load_candidate_bundle() already read -- no second copy of the
     readiness business rule, no extra DB round-trip."""
     internal_product = bundle["internal_product"]
 
@@ -1011,9 +1083,16 @@ def stage_preflight_draft(bundle: dict[str, Any]) -> DecisionResult:
         or sync.get("woocommerce_status") == WooCommerceSyncStatus.DRAFT_CREATED
     )
 
-    return readiness_rules.evaluate_readiness(
+    candidate = bundle["candidate"]
+    evaluator = (
+        readiness_rules.evaluate_historical_draft_safe_readiness
+        if is_historical_candidate_code(candidate.get("candidate_code"))
+        else readiness_rules.evaluate_readiness
+    )
+
+    return evaluator(
         product=internal_product,
-        candidate=bundle["candidate"],
+        candidate=candidate,
         approved_content=approved_content,
         selected_images=selected_images,
         recovery_required=recovery_required,

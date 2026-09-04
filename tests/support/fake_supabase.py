@@ -3,9 +3,9 @@ by the TSYC pipeline scripts.
 
 This is a test double, not a mock of behavior we assume -- it re-implements
 the tiny subset of the Postgrest fluent query builder that
-scripts/*.py actually call (`.table().select().eq().not_.is_().order()
-.limit().execute()`, plus `.insert()`, `.update()`, `.delete()`), backed by
-plain Python dict rows held in memory.
+scripts/*.py actually call (`.table().select().eq().neq().in_().not_.is_()
+.order().limit().execute()`, plus `.insert()`, `.update()`, `.delete()`),
+backed by plain Python dict rows held in memory.
 
 No network access, no credentials, no live Supabase project. Safe to import
 and use from any pytest test.
@@ -68,6 +68,7 @@ class FakeQueryBuilder:
         self._payload: Any = None
         self._eq_filters: list[tuple[str, Any]] = []
         self._neq_filters: list[tuple[str, Any]] = []
+        self._in_filters: list[tuple[str, list[Any]]] = []
         self._not_null_filters: list[str] = []
         self._null_filters: list[str] = []
         self._orders: list[tuple[str, bool]] = []
@@ -103,6 +104,12 @@ class FakeQueryBuilder:
         self._neq_filters.append((column, value))
         return self
 
+    def in_(self, column: str, values: list[Any]) -> "FakeQueryBuilder":
+        """Mimic `.in_(column, [...])` -- row passes if its value is a
+        member of the given list."""
+        self._in_filters.append((column, list(values)))
+        return self
+
     def is_(self, column: str, value: str) -> "FakeQueryBuilder":
         """Mimic the bare `.is_(column, "null")` IS NULL filter (distinct
         from `.not_.is_(column, "null")`'s IS NOT NULL, above)."""
@@ -136,6 +143,10 @@ class FakeQueryBuilder:
 
         for column, value in self._neq_filters:
             if row.get(column) == value:
+                return False
+
+        for column, values in self._in_filters:
+            if row.get(column) not in values:
                 return False
 
         for column in self._not_null_filters:

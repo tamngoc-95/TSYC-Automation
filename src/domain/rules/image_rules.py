@@ -29,6 +29,7 @@ See docs/TSYC_DECISION_MATRIX.md for the full specification.
 """
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import Any, Sequence
 
 from src.domain.decisions import DecisionResult, Outcome
@@ -79,6 +80,25 @@ _RIGHTS_RULE_CODE = {
     RightsStatus.SUPPLIER_APPROVED: IMAGE_APPROVED_SUPPLIER_EXACT,
     RightsStatus.PUBLISHER_APPROVED: IMAGE_APPROVED_PUBLISHER_EXACT,
 }
+
+# Historical-migration image-rights policy (explicit shop-owner business
+# authorization, 2026-09-04 -- see CLAUDE.md section 14.3/14.4 and the
+# TSYC decision matrix for the full policy text). Canonical mapping from
+# an already-approved reference source_type to the rights status it
+# authorizes: PUBLISHER maps to PUBLISHER_APPROVED; AUTHORIZED_SUPPLIER/
+# BOOKSTORE/FAHASA all map to SUPPLIER_APPROVED -- the same mapping this
+# project's own production precedent already used (100% of BOOKSTORE-
+# sourced images classified SUPPLIER_APPROVED to date). A source_type
+# not in this mapping (an unconfigured/unknown domain, or OTHER) is
+# never auto-authorized by this policy.
+APPROVED_REFERENCE_SOURCE_RIGHTS = MappingProxyType(
+    {
+        "PUBLISHER": RightsStatus.PUBLISHER_APPROVED,
+        "AUTHORIZED_SUPPLIER": RightsStatus.SUPPLIER_APPROVED,
+        "BOOKSTORE": RightsStatus.SUPPLIER_APPROVED,
+        "FAHASA": RightsStatus.SUPPLIER_APPROVED,
+    }
+)
 
 
 # --- rights classification -------------------------------------------------
@@ -145,6 +165,58 @@ def evaluate_rights_classification(
         rule_code=rule_code,
         reason=f"{rights_status} classification has an established policy basis.",
         evidence={"rights_status": rights_status},
+    )
+
+
+def evaluate_historical_image_rights_policy(
+    *,
+    is_own_facebook_export: bool = False,
+    reference_source_type: str | None = None,
+) -> DecisionResult:
+    """
+    Determine rights classification for one image under the shop
+    owner's explicit historical-migration image-rights policy: an image
+    from the shop's own Facebook export is STORE_OWNED; an image
+    downloaded from an already-approved reference source type
+    (APPROVED_REFERENCE_SOURCE_RIGHTS) is authorized at the rights
+    status that mapping names. Neither case requires a separate
+    per-image human rights approval.
+
+    Delegates the actual AUTO_PASS/REVIEW_REQUIRED decision to
+    evaluate_rights_classification() unchanged -- this function's only
+    job is to decide policy_established from the two facts the historical
+    pipeline actually has (which export the image came from, which
+    reference source_type it was downloaded from), never to duplicate
+    that function's own classification logic.
+
+    An unconfigured/unknown domain or source_type (reference_source_type
+    not in APPROVED_REFERENCE_SOURCE_RIGHTS, and is_own_facebook_export
+    False) always falls through to RIGHTS_UNKNOWN / REVIEW_REQUIRED --
+    CLAUDE.md 14.3/14.4's "do not assume every image is approved" still
+    applies to anything outside this exact, configured allowlist.
+
+    Never a substitute for the separate, still-mandatory candidate-
+    relevance/ownership check (evaluate_image_product_match): a
+    pre-authorized rights basis does not mean the image is confirmed to
+    actually depict this candidate.
+    """
+    if is_own_facebook_export:
+        return evaluate_rights_classification(
+            rights_status=RightsStatus.STORE_OWNED,
+            policy_established=True,
+        )
+
+    approved_rights = APPROVED_REFERENCE_SOURCE_RIGHTS.get(reference_source_type or "")
+
+    if approved_rights is not None:
+        return evaluate_rights_classification(
+            rights_status=approved_rights,
+            policy_established=True,
+        )
+
+    return evaluate_rights_classification(
+        rights_status=RightsStatus.RIGHTS_UNKNOWN,
+        policy_established=False,
     )
 
 

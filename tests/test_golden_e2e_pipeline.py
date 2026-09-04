@@ -96,6 +96,7 @@ def test_golden_valid_historical_candidate_reaches_ready_for_draft():
     candidate = _candidate(
         candidate_code="FB-HIST-2026-AUTOIMPORT-CAN-0010",
         identity_status="IDENTITY_VERIFIED",
+        candidate_type="SINGLE_BOOK",
     )
     reference = {
         "reference_id": REFERENCE_ID,
@@ -144,8 +145,11 @@ def test_golden_valid_historical_candidate_reaches_ready_for_draft():
     state = derive_candidate_state(bundle)
     assert state.derived_state == "IMAGE_VALIDATED"
 
-    # Once check_draft_readiness.py has written READY_FOR_DRAFT, the
-    # candidate becomes the single required human (Woo) gate.
+    # Once check_draft_readiness.py has written READY_FOR_DRAFT, a
+    # historical (FB-HIST) candidate reaches the historical-migration
+    # draft-safe policy's automatically-authorized state (explicit
+    # shop-owner business authorization, CLAUDE.md section 6/17) --
+    # unlike a live-pipeline candidate, this is NOT a human gate.
     ready_internal_product = dict(internal_product, woocommerce_status="READY_FOR_DRAFT")
     ready_bundle = load_candidate_bundle(
         _bundle_repository(
@@ -158,9 +162,9 @@ def test_golden_valid_historical_candidate_reaches_ready_for_draft():
         candidate["candidate_code"],
     )
     ready_state = derive_candidate_state(ready_bundle)
-    assert ready_state.derived_state == "READY_FOR_DRAFT"
-    assert ready_state.human_gate is True
-    assert ready_state.outcome == Outcome.REVIEW_REQUIRED
+    assert ready_state.derived_state == "READY_FOR_DRAFT_HISTORICAL"
+    assert ready_state.human_gate is False
+    assert ready_state.outcome == Outcome.AUTO_PASS
 
 
 # ---------------------------------------------------------------------
