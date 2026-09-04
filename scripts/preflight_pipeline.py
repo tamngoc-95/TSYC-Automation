@@ -720,6 +720,12 @@ def check_orchestrator_safety() -> PreflightCheck:
         candidate_id="preflight-check",
         product_code="TSYC-CAN-PREFLIGHT-CHECK",
         derived_state="PREFLIGHT_CHECK",
+        # Populated so every dispatch's build_args() -- including the
+        # historical image-approval entry, which reads these two fields
+        # -- can be exercised generically here, exactly like every other
+        # field on this synthetic state.
+        auto_main_image_id="preflight-check-image",
+        auto_rights_status="STORE_OWNED",
     )
     all_entries = list(run_batch.AUTOMATABLE_DISPATCH.values()) + [
         run_batch.WOO_DRAFT_DISPATCH

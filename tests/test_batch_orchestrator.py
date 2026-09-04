@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
+import pipeline_state
 import run_batch
 from pipeline_state import derive_candidate_state, load_candidate_bundle
 
@@ -855,6 +856,8 @@ def test_no_publish_or_price_action_in_dispatch_table():
     sample_state = types.SimpleNamespace(
         candidate_code=CANDIDATE_CODE,
         product_code=PRODUCT_CODE,
+        auto_main_image_id="image-1",
+        auto_rights_status="STORE_OWNED",
     )
 
     all_entries = list(run_batch.AUTOMATABLE_DISPATCH.values()) + [
@@ -1413,3 +1416,156 @@ def test_main_dry_run_includes_the_plan_report(capsys):
     assert "NEXT_SAFE_ACTION:" in output
     assert "BLOCKER:" in output
     assert "EXPECTED_FINAL_STATE:" in output
+
+
+# --------------------------------------------------------------------------
+# 10. Historical image ingestion is dispatched automatically (no human gate)
+# --------------------------------------------------------------------------
+
+
+HISTORICAL_CANDIDATE_CODE = "FB-HIST-2026-001-CAN-0001"
+HISTORICAL_CANDIDATE_ID = "88888888-8888-8888-8888-888888888888"
+HISTORICAL_PRODUCT_ID = "99999999-9999-9999-9999-999999999999"
+
+
+def make_historical_candidate(**overrides: Any) -> dict[str, Any]:
+    row = {
+        "candidate_id": HISTORICAL_CANDIDATE_ID,
+        "candidate_code": HISTORICAL_CANDIDATE_CODE,
+        "raw_page_id": "historical-raw-page-1",
+        "identity_status": "IDENTITY_PENDING",
+        "source_evidence": {"local_media_paths": ["a/b/media/1.jpg"]},
+    }
+    row.update(overrides)
+    return row
+
+
+def make_historical_internal_product(**overrides: Any) -> dict[str, Any]:
+    row = {
+        "internal_product_id": HISTORICAL_PRODUCT_ID,
+        "candidate_id": HISTORICAL_CANDIDATE_ID,
+        "product_code": f"TSYC-{HISTORICAL_CANDIDATE_CODE}",
+        "content_status": "PENDING",
+        "image_status": "PENDING",
+        "woocommerce_status": "NOT_CREATED",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_historical_image_ingest_and_approval_dispatch_chain(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A historical candidate with local Facebook-export media and no
+    product_images yet flows through IMAGE_INGEST_PENDING_HISTORICAL
+    (ingest_historical_images.py) then IMAGE_APPROVAL_PENDING_HISTORICAL
+    (review_product_images.py) with no human gate in between -- exactly
+    what CLAUDE.md 6.2/14.1/14.7 authorizes. The stub subprocess_runner
+    below writes the same rows the real scripts write, so
+    derive_candidate_state() advances exactly as it would in production.
+    """
+    from src.services.historical_image_extraction import CapabilityStatus
+
+    monkeypatch.setattr(
+        pipeline_state,
+        "check_historical_image_capability",
+        lambda _root: CapabilityStatus(available=True, reason="archive found"),
+    )
+
+    repository = make_repository(
+        product_candidates=[make_historical_candidate()],
+        internal_products=[make_historical_internal_product()],
+    )
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess:
+        script = argv[1]
+
+        if script.endswith("ingest_historical_images.py"):
+            repository.client.tables.setdefault("product_images", []).append(
+                {
+                    "image_id": "img-1",
+                    "candidate_id": HISTORICAL_CANDIDATE_ID,
+                    "reference_id": None,
+                    "usage_rights_status": "RIGHTS_UNKNOWN",
+                    "is_selected_main_image": False,
+                    "is_publish_eligible": False,
+                }
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        if script.endswith("review_product_images.py"):
+            assert "--main-image-id" in argv
+            assert argv[argv.index("--main-image-id") + 1] == "img-1"
+            assert "--rights-status" in argv
+            assert argv[argv.index("--rights-status") + 1] == "STORE_OWNED"
+
+            image = repository.client.tables["product_images"][0]
+            image.update(
+                {
+                    "usage_rights_status": "STORE_OWNED",
+                    "is_selected_main_image": True,
+                    "is_publish_eligible": True,
+                }
+            )
+            repository.client.tables["internal_products"][0]["image_status"] = (
+                "APPROVED"
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    args = make_args()
+
+    report = run_batch.process_one_candidate(
+        HISTORICAL_CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert report.initial_state == "IMAGE_INGEST_PENDING_HISTORICAL"
+    assert report.actions_executed[:2] == [
+        "ingest_historical_images.py",
+        "review_product_images.py",
+    ]
+    assert report.human_gate is False
+    # Once image_status reaches APPROVED, derive_candidate_state() moves
+    # on to the content sub-state machine -- confirms the image stage
+    # itself is fully behind the candidate, not stuck re-deriving one of
+    # the two new states.
+    assert report.final_state not in (
+        "IMAGE_INGEST_PENDING_HISTORICAL",
+        "IMAGE_APPROVAL_PENDING_HISTORICAL",
+    )
+
+
+def test_historical_image_ambiguous_ownership_isolates_without_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A shared multi-candidate Facebook post must never be dispatched
+    automatically -- it stays a human gate, and does not stop the rest
+    of the batch (CLAUDE.md section 11)."""
+    from src.services.historical_image_extraction import CapabilityStatus
+
+    monkeypatch.setattr(
+        pipeline_state,
+        "check_historical_image_capability",
+        lambda _root: CapabilityStatus(available=True, reason="archive found"),
+    )
+
+    sibling = make_historical_candidate(
+        candidate_id="sibling-1",
+        candidate_code="FB-HIST-2026-001-CAN-0002",
+    )
+
+    repository = make_repository(
+        product_candidates=[make_historical_candidate(), sibling],
+        internal_products=[make_historical_internal_product()],
+    )
+    runner, calls = recording_runner()
+    args = make_args()
+
+    report = run_batch.process_one_candidate(
+        HISTORICAL_CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert calls == []
+    assert report.result == "HUMAN_GATE"
+    assert report.final_state == "IMAGE_GROUP_OWNERSHIP_AMBIGUOUS"

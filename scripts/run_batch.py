@@ -141,6 +141,56 @@ AUTOMATABLE_DISPATCH: dict[str, DispatchEntry] = {
             "enrichment optional)."
         ),
     ),
+    # Historical-migration draft-safe image automation (explicit
+    # shop-owner business authorization, CLAUDE.md section 6.2/14.7).
+    # pipeline_state.py only reaches this state once ownership
+    # (evaluate_historical_image_ownership) and extraction capability
+    # (evaluate_historical_image_capability) have already both passed
+    # deterministically -- ingesting this candidate's own Facebook-
+    # export images is then a bounded, non-judgment action. A single
+    # dispatch because extraction alone writes no Supabase-visible
+    # state (see ingest_historical_images.py's own docstring).
+    "IMAGE_INGEST_PENDING_HISTORICAL": DispatchEntry(
+        script="ingest_historical_images.py",
+        build_args=lambda state: [
+            "--candidate-code",
+            state.candidate_code,
+            "--non-interactive",
+            "--confirm-ingest",
+        ],
+        description=(
+            "Extract and upload this historical candidate's own "
+            "Facebook-export images (extract_historical_facebook_"
+            "images.py + upload_facebook_images_to_supabase.py)."
+        ),
+    ),
+    # Historical-migration draft-safe image automation, continued:
+    # pipeline_state.py only sets auto_main_image_id/auto_rights_status
+    # (and this derived state) when exactly one image exists and its
+    # rights are deterministically STORE_OWNED (own Facebook export) or
+    # already publishable -- CLAUDE.md 14.5 "exactly one eligible image
+    # exists" plus 14.7. More than one image never reaches this state;
+    # it stays at the existing IMAGE_REVIEW_REQUIRED/RIGHTS_REVIEW_
+    # REQUIRED human gate, unchanged.
+    "IMAGE_APPROVAL_PENDING_HISTORICAL": DispatchEntry(
+        script="review_product_images.py",
+        build_args=lambda state: [
+            "--candidate-code",
+            state.candidate_code,
+            "--non-interactive",
+            "--approve",
+            "--confirm-approve",
+            "--main-image-id",
+            state.auto_main_image_id,
+            "--rights-status",
+            state.auto_rights_status,
+        ],
+        description=(
+            "Validate and approve the single unambiguous historical "
+            "image as the main image, at its deterministically "
+            "authorized usage-rights status."
+        ),
+    ),
     "INTERNAL_PRODUCT_CREATED": DispatchEntry(
         script="prepare_product_content.py",
         build_args=lambda state: [
@@ -1019,6 +1069,11 @@ _EXPECTED_NEXT_STATE_AFTER_ACTION: dict[str, str] = {
         "evidence is inconclusive)"
     ),
     "IDENTITY_VERIFIED": "INTERNAL_PRODUCT_CREATED",
+    "IMAGE_INGEST_PENDING_HISTORICAL": (
+        "IMAGE_APPROVAL_PENDING_HISTORICAL (or a review-required image "
+        "state if the ingested image count is not exactly one)"
+    ),
+    "IMAGE_APPROVAL_PENDING_HISTORICAL": "INTERNAL_PRODUCT_CREATED",
     "INTERNAL_PRODUCT_CREATED": "CONTENT_DRAFTED",
     "CONTENT_DRAFTED": (
         "CONTENT_APPROVED (or CONTENT_REVIEW_REQUIRED if automatic "

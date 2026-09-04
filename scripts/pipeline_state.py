@@ -90,6 +90,8 @@ DERIVED_STATES = {
     "CONTENT_DRAFTED",
     "CONTENT_APPROVED",
     "IMAGE_PENDING",
+    "IMAGE_INGEST_PENDING_HISTORICAL",
+    "IMAGE_APPROVAL_PENDING_HISTORICAL",
     "IMAGE_CAPABILITY_UNAVAILABLE",
     "IMAGE_GROUP_OWNERSHIP_AMBIGUOUS",
     "IMAGE_VALIDATED",
@@ -134,6 +136,15 @@ class CandidateState:
     blocked: bool = False
     blocked_reason: str | None = None
     warnings: list[str] = field(default_factory=list)
+    # Populated only for derived_state=="IMAGE_APPROVAL_PENDING_HISTORICAL"
+    # -- the exact single image_id and usage_rights_status
+    # scripts/run_batch.py's dispatch passes through to
+    # review_product_images.py --main-image-id/--rights-status. Kept on
+    # CandidateState (rather than recomputed by run_batch.py) so there is
+    # exactly one place that decides them, matching this module's own
+    # "pure derivation layer" contract.
+    auto_main_image_id: str | None = None
+    auto_rights_status: str | None = None
 
     @property
     def outcome(self) -> str:
@@ -401,6 +412,48 @@ def _derive_recovery_state(
     return None
 
 
+def _historical_reference_image_fallback_hint(bundle: dict[str, Any]) -> str | None:
+    """
+    For a historical candidate that cannot get a deterministic single
+    main image from its own Facebook export (zero or several images),
+    surface -- but never auto-execute -- an available approved-reference
+    image fallback (CLAUDE.md section 8.1 source priority:
+    image_rules.select_preferred_image_reference).
+
+    Deliberately does not dispatch scripts/download_bookstore_product_
+    image.py itself: that script drives a real browser against a live
+    external site, which this orchestrator does not invoke unattended
+    across a production batch. This function only tells a human
+    reviewer that a usable MATCH reference exists, naming its source
+    type, so they do not have to search for one manually.
+    """
+    candidate = bundle["candidate"]
+    match_references = [
+        reference
+        for reference in bundle["references"]
+        if reference.get("match_decision") == MatchDecision.MATCH
+    ]
+
+    if not match_references:
+        return None
+
+    decision = image_rules.select_preferred_image_reference(
+        candidate, match_references
+    )
+
+    if decision.outcome != Outcome.AUTO_PASS:
+        return None
+
+    source_type = decision.evidence.get("source_type")
+
+    return (
+        f"A {source_type} reference is available as a fallback image "
+        "source (download_bookstore_product_image.py currently supports "
+        "BOOKSTORE references only; other source types require manual "
+        "download)."
+    )
+
+
 def _derive_image_content_state(
     bundle: dict[str, Any],
 ) -> CandidateState:
@@ -465,19 +518,18 @@ def _derive_image_content_state(
                         warnings=warnings,
                     )
 
+                # Historical-migration draft-safe policy (explicit
+                # shop-owner business authorization, CLAUDE.md section
+                # 6.2/14.7): ownership is unambiguous (checked above) and
+                # the extraction capability is available (checked above)
+                # -- ingesting this candidate's own Facebook-export
+                # images is a deterministic, bounded, non-judgment
+                # action. Automatable: no human_gate.
                 return CandidateState(
                     candidate_code=candidate_code,
                     candidate_id=candidate_id,
                     product_code=product_code,
-                    derived_state="IMAGE_PENDING",
-                    human_gate=True,
-                    human_gate_reason=(
-                        "Historical local media is available and "
-                        "unambiguously owned by this candidate. Run "
-                        "scripts/extract_historical_facebook_images.py "
-                        "then scripts/upload_facebook_images_to_supabase.py "
-                        "to ingest images for this candidate."
-                    ),
+                    derived_state="IMAGE_INGEST_PENDING_HISTORICAL",
                     warnings=warnings,
                 )
 
@@ -495,25 +547,85 @@ def _derive_image_content_state(
                 warnings=warnings,
             )
 
+        is_historical = is_historical_candidate_code(candidate_code)
+
+        # Historical-migration draft-safe auto-approval (CLAUDE.md
+        # 6.2/14.5/14.7): exactly one image exists and it is either
+        # already publishable or came straight from this candidate's own
+        # Facebook export (no reference_id -- ownership was already
+        # confirmed unambiguous before ingestion, above) -- STORE_OWNED
+        # applies deterministically. More than one image, or a single
+        # reference-sourced image with unmapped rights, is never
+        # auto-selected: CLAUDE.md 14.5 requires subjective judgment
+        # whenever more than one plausible image exists.
+        if is_historical and len(images) == 1:
+            only_image = images[0]
+            existing_rights = only_image.get("usage_rights_status")
+
+            if existing_rights in PUBLISHABLE_RIGHTS_STATUSES:
+                auto_rights_status = existing_rights
+            elif not only_image.get("reference_id"):
+                rights_decision = image_rules.evaluate_historical_image_rights_policy(
+                    is_own_facebook_export=True
+                )
+                auto_rights_status = (
+                    rights_decision.evidence.get("rights_status")
+                    if rights_decision.outcome == Outcome.AUTO_PASS
+                    else None
+                )
+            else:
+                auto_rights_status = None
+
+            if auto_rights_status:
+                return CandidateState(
+                    candidate_code=candidate_code,
+                    candidate_id=candidate_id,
+                    product_code=product_code,
+                    derived_state="IMAGE_APPROVAL_PENDING_HISTORICAL",
+                    auto_main_image_id=str(only_image["image_id"]),
+                    auto_rights_status=auto_rights_status,
+                    warnings=warnings,
+                )
+
+        historical_fallback_hint = (
+            _historical_reference_image_fallback_hint(bundle)
+            if is_historical
+            else None
+        )
+
         has_publishable_rights = any(
             image.get("usage_rights_status") in PUBLISHABLE_RIGHTS_STATUSES
             for image in images
         )
 
         if not has_publishable_rights:
+            reason = (
+                "No image has a publishable usage-rights status. Image "
+                "rights cannot be inferred automatically -- confirm "
+                "rights via review_product_images.py."
+            )
+
+            if historical_fallback_hint:
+                reason += f" {historical_fallback_hint}"
+
             return CandidateState(
                 candidate_code=candidate_code,
                 candidate_id=candidate_id,
                 product_code=product_code,
                 derived_state="RIGHTS_REVIEW_REQUIRED",
                 human_gate=True,
-                human_gate_reason=(
-                    "No image has a publishable usage-rights status. Image "
-                    "rights cannot be inferred automatically -- confirm "
-                    "rights via review_product_images.py."
-                ),
+                human_gate_reason=reason,
                 warnings=warnings,
             )
+
+        reason = (
+            "Images with usable rights exist, but no single validated, "
+            "selected, publish-eligible main image has been approved. "
+            "Run review_product_images.py to select and approve one."
+        )
+
+        if historical_fallback_hint:
+            reason += f" {historical_fallback_hint}"
 
         return CandidateState(
             candidate_code=candidate_code,
@@ -521,11 +633,7 @@ def _derive_image_content_state(
             product_code=product_code,
             derived_state="IMAGE_REVIEW_REQUIRED",
             human_gate=True,
-            human_gate_reason=(
-                "Images with usable rights exist, but no single validated, "
-                "selected, publish-eligible main image has been approved. "
-                "Run review_product_images.py to select and approve one."
-            ),
+            human_gate_reason=reason,
             warnings=warnings,
         )
 

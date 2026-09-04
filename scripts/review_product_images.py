@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from create_internal_product import is_historical_candidate_code
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.decisions import Outcome
 from src.domain.identity_status import IdentityStatus
@@ -379,10 +380,28 @@ def validate_approval_request(
     rights_status: str | None,
 ) -> dict[str, Any]:
     """Validate an image approval request and return the selected image."""
-    if candidate.get("identity_status") != IdentityStatus.IDENTITY_VERIFIED:
-        raise RuntimeError(
-            "Image approval requires candidate identity_status=IDENTITY_VERIFIED."
+    identity_status = candidate.get("identity_status")
+
+    if identity_status != IdentityStatus.IDENTITY_VERIFIED:
+        # Historical-migration draft-safe policy (explicit shop-owner
+        # business authorization, CLAUDE.md section 6.2/9.4): an FB-HIST
+        # candidate may reach image approval with identity_status still
+        # IDENTITY_PENDING (unverified but not a confirmed conflict) --
+        # exactly the same carve-out create_internal_product.py and
+        # audit_pipeline_state.py already apply. Live candidates keep
+        # the strict IDENTITY_VERIFIED-only check, unchanged.
+        historical_allowed = (
+            is_historical_candidate_code(candidate.get("candidate_code"))
+            and identity_status != IdentityStatus.IDENTITY_CONFLICT
         )
+
+        if not historical_allowed:
+            raise RuntimeError(
+                "Image approval requires candidate identity_status="
+                "IDENTITY_VERIFIED (or, for an FB-HIST candidate under "
+                "the historical draft-safe policy, any status other "
+                "than IDENTITY_CONFLICT)."
+            )
 
     if not images:
         raise RuntimeError(
