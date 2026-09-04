@@ -1,14 +1,27 @@
 """
 Download and register one individual product image from the exact
-already-verified BOOKSTORE reference page for one TSYC candidate.
+already-verified reference page for one TSYC candidate.
 
 This script operates on exactly one candidate per run. It never crawls,
 searches, or discovers pages -- it loads only the single, already
-registered and authorized source_urls row linked through the candidate's
-existing MATCH / BOOKSTORE product_reference.
+registered and authorized source_urls row linked through one of the
+candidate's existing MATCH product_references.
+
+A candidate frequently carries more than one MATCH product_reference
+(e.g. both a BOOKSTORE and a FAHASA row -- collect_reference_metadata.py
+registers both when both are available). Which one to download from is
+resolved deterministically by
+src.domain.rules.image_rules.select_preferred_image_reference(): ranked
+by the canonical source priority (CLAUDE.md section 8.1: PUBLISHER >
+AUTHORIZED_SUPPLIER > BOOKSTORE > FAHASA > FACEBOOK > OTHER), with a
+same-priority tie only auto-resolved when the tied references agree on
+edition evidence, and the selected reference re-checked against the
+candidate's own verified identity (ISBN/title/publisher) before it is
+ever used. Anything short of a clean, single, identity-consistent
+selection stops with a RuntimeError instead of guessing.
 
 Safety guarantees:
-- Exact candidate targeting only. No batch mode, no automatic selection,
+- Exact candidate targeting only. No batch mode, no arbitrary selection,
   no fallback to another candidate or another source.
 - All precondition gates (identity, reference, source, internal product,
   blocking review issues) are verified before Playwright is ever launched.
@@ -56,8 +69,9 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.decisions import Outcome
 from src.domain.identity_status import IdentityStatus, MatchDecision
-from src.domain.reference_sources import REFERENCE_SOURCE_PRIORITY, SourceType
+from src.domain.rules.image_rules import select_preferred_image_reference
 from src.repositories.supabase_repository import SupabaseRepository
 import collect_reference_metadata as reference_metadata
 
@@ -68,13 +82,12 @@ BATCH_CODE = "FB-2026-001"
 STORAGE_BUCKET = "product-images"
 
 COLLECTOR_NAME = "bookstore_product_image_downloader"
-COLLECTOR_VERSION = "0.1.0"
+COLLECTOR_VERSION = "0.2.0"
 
-SOURCE_TYPE = "BOOKSTORE"  # product_images.source_type -- a different,
-# wider enum than src.domain.reference_sources.SourceType (which is
-# scoped to product_references.source_type only), so left as a plain
-# literal here.
-BOOKSTORE_SOURCE_PRIORITY = REFERENCE_SOURCE_PRIORITY[SourceType.BOOKSTORE]
+# product_images.source_type is written from the actually-selected
+# reference's own source_type (see select_preferred_image_reference /
+# build_product_images_payload) -- never hardcoded to "BOOKSTORE" -- so
+# provenance on the row always matches where the image really came from.
 
 LOCAL_IMAGE_ROOT = (
     PROJECT_ROOT
@@ -189,6 +202,9 @@ def resolve_candidate(
             "extracted_title, "
             "verified_title, "
             "verified_author, "
+            "verified_isbn, "
+            "verified_publisher, "
+            "possible_isbn, "
             "identity_status"
         )
         .eq(
@@ -225,11 +241,22 @@ def resolve_candidate(
     return candidate
 
 
-def resolve_match_bookstore_reference(
+def resolve_preferred_match_reference(
     repository: SupabaseRepository,
-    candidate_id: str,
+    candidate: dict[str, Any],
 ) -> dict[str, Any]:
-    """Resolve exactly one MATCH / BOOKSTORE product_reference."""
+    """
+    Resolve exactly one MATCH product_reference to download an image
+    from, deterministically, even when the candidate carries more than
+    one MATCH reference (e.g. BOOKSTORE + FAHASA -- the normal case for
+    a TSYC historical candidate).
+
+    All ranking/tie-break/edition-safety logic lives in
+    src.domain.rules.image_rules.select_preferred_image_reference(); this
+    function only fetches the rows and turns a non-AUTO_PASS decision
+    into the same fail-closed RuntimeError this script has always raised
+    for an unresolved reference. No source type is hardcoded here.
+    """
     response = (
         repository.client
         .table("product_references")
@@ -240,11 +267,13 @@ def resolve_match_bookstore_reference(
             "source_type, "
             "source_priority, "
             "match_decision, "
-            "reference_title"
+            "reference_title, "
+            "reference_isbn, "
+            "reference_publisher"
         )
         .eq(
             "candidate_id",
-            candidate_id,
+            candidate["candidate_id"],
         )
         .eq(
             "match_decision",
@@ -260,42 +289,63 @@ def resolve_match_bookstore_reference(
             "No MATCH product_reference exists for this candidate."
         )
 
-    if len(rows) != 1:
+    decision = select_preferred_image_reference(
+        candidate=candidate,
+        match_references=rows,
+    )
+
+    if decision.outcome != Outcome.AUTO_PASS:
         raise RuntimeError(
-            "Candidate has more than one MATCH product_reference. Exact "
-            "targeting requires exactly one relevant match; resolve the "
-            "ambiguity before downloading an image."
+            f"Could not deterministically select an image reference "
+            f"({decision.rule_code}): {decision.reason}"
         )
 
-    reference = rows[0]
+    selected_reference_id = decision.evidence.get("reference_id")
 
-    if reference.get("source_type") != SourceType.BOOKSTORE:
-        raise RuntimeError(
-            "The MATCH product_reference is not source_type BOOKSTORE "
-            f"(found: {reference.get('source_type')!r})."
-        )
+    reference = next(
+        (
+            row
+            for row in rows
+            if row.get("reference_id") == selected_reference_id
+        ),
+        None,
+    )
 
-    if reference.get("source_priority") != BOOKSTORE_SOURCE_PRIORITY:
+    if reference is None:
+        # Defensive: the pure function only ever selects a reference_id
+        # out of the exact rows it was given, so this should be
+        # unreachable. Fail loudly rather than silently downloading
+        # from an un-resolved reference.
         raise RuntimeError(
-            "The MATCH product_reference source_priority is not "
-            f"compatible with BOOKSTORE (expected "
-            f"{BOOKSTORE_SOURCE_PRIORITY}, found "
-            f"{reference.get('source_priority')!r})."
+            "select_preferred_image_reference() returned a reference_id "
+            f"({selected_reference_id!r}) not present in the fetched "
+            "MATCH references."
         )
 
     if not reference.get("source_url_id"):
         raise RuntimeError(
-            "The MATCH product_reference has no source_url_id."
+            "The selected MATCH product_reference has no source_url_id."
         )
+
+    print()
+    print(
+        "Selected image reference: "
+        f"source_type={reference.get('source_type')!r}, "
+        f"rule={decision.rule_code}."
+    )
+    print(f"Reason: {decision.reason}")
 
     return reference
 
 
-def resolve_authorized_bookstore_source(
+def resolve_authorized_reference_source(
     repository: SupabaseRepository,
     source_url_id: str,
+    expected_source_type: str,
 ) -> dict[str, Any]:
-    """Resolve exactly one authorized BOOKSTORE source_urls row."""
+    """Resolve exactly one authorized source_urls row, of the same
+    source_type as the selected product_reference (BOOKSTORE, FAHASA, or
+    any other type select_preferred_image_reference() may pick)."""
     response = (
         repository.client
         .table("source_urls")
@@ -331,10 +381,11 @@ def resolve_authorized_bookstore_source(
 
     source = rows[0]
 
-    if source.get("source_type") != "BOOKSTORE":
+    if source.get("source_type") != expected_source_type:
         raise RuntimeError(
-            "The linked source_urls row is not source_type BOOKSTORE "
-            f"(found: {source.get('source_type')!r})."
+            "The linked source_urls row does not match the selected "
+            f"reference's source_type (expected {expected_source_type!r}, "
+            f"found {source.get('source_type')!r})."
         )
 
     if source.get("is_authorized") is not True:
@@ -591,6 +642,7 @@ def save_local_cache_copy(
     page_url: str,
     reference_id: str,
     source_url_id: str,
+    source_type: str,
     extraction_method: str,
     content: bytes,
     content_type: str,
@@ -636,7 +688,7 @@ def save_local_cache_copy(
         "candidate_code": candidate_code,
         "reference_id": reference_id,
         "source_url_id": source_url_id,
-        "source_type": SOURCE_TYPE,
+        "source_type": source_type,
         "bookstore_page_url": page_url,
         "bookstore_image_url": image_url,
         "extraction_method": extraction_method,
@@ -832,8 +884,12 @@ def build_product_images_payload(
         "candidate_id": candidate["candidate_id"],
         "reference_id": reference["reference_id"],
 
-        # Valid value from product_images_source_type_check.
-        "source_type": SOURCE_TYPE,
+        # The actually-selected reference's own source_type (BOOKSTORE,
+        # FAHASA, ...) -- a valid value from
+        # product_images_source_type_check, and never hardcoded, so
+        # provenance on the row always matches where the image really
+        # came from.
+        "source_type": reference["source_type"],
 
         # The actual product image asset URL.
         "source_url": image_url,
@@ -930,7 +986,7 @@ def print_preflight_summary(
         f"{source.get('source_type')}"
     )
     print(
-        "Exact BOOKSTORE page URL: "
+        f"Exact {source.get('source_type')} page URL: "
         f"{source.get('source_url')}"
     )
     print(
@@ -991,14 +1047,15 @@ def main() -> None:
         candidate_code=args.candidate_code,
     )
 
-    reference = resolve_match_bookstore_reference(
+    reference = resolve_preferred_match_reference(
         repository=repository,
-        candidate_id=candidate["candidate_id"],
+        candidate=candidate,
     )
 
-    source = resolve_authorized_bookstore_source(
+    source = resolve_authorized_reference_source(
         repository=repository,
         source_url_id=reference["source_url_id"],
+        expected_source_type=reference["source_type"],
     )
 
     internal_product = resolve_internal_product(
@@ -1200,6 +1257,7 @@ def main() -> None:
                 page_url=page_url,
                 reference_id=reference["reference_id"],
                 source_url_id=source["source_url_id"],
+                source_type=reference["source_type"],
                 extraction_method=extraction_method,
                 content=content,
                 content_type=content_type,
