@@ -158,6 +158,21 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--confirm-reauthorize",
+        action="store_true",
+        help=(
+            "When --source-type/--source-url resolve to an already-"
+            "REUSED source_urls row whose is_authorized is False, "
+            "upgrade it to True (requires --authorized on this same "
+            "invocation). Corrects a source registered without "
+            "--authorized by mistake -- source_urls rows are otherwise "
+            "immutable on reuse (see get_or_create_source_url). Never "
+            "downgrades True to False, never touches any other field, "
+            "and is a no-op when the row is already authorized."
+        ),
+    )
+
+    parser.add_argument(
         "--non-interactive",
         action="store_true",
         help=(
@@ -1055,6 +1070,55 @@ def get_or_create_source_url(
     return created_source, True
 
 
+def reauthorize_existing_source_url(
+    repository: SupabaseRepository,
+    source_record: dict[str, Any],
+    requested_is_authorized: bool,
+) -> bool:
+    """
+    Upgrade an already-registered source_urls row from is_authorized
+    False to True, when --confirm-reauthorize was explicitly passed.
+
+    Guarded, bounded, single-field correction for a source that was
+    registered without --authorized by mistake -- get_or_create_source_url
+    never updates an existing row on reuse, so without this there is no
+    approved-script path back except raw SQL (forbidden by CLAUDE.md
+    section 4.3 / 7). Returns True if a write was performed, False for a
+    safe no-op (already authorized). Never sets is_authorized to False --
+    that would silently downgrade a source another workflow may already
+    be relying on, which CLAUDE.md section 2.7 forbids.
+    """
+    if source_record.get("is_authorized") is True:
+        return False
+
+    if requested_is_authorized is not True:
+        raise RuntimeError(
+            "--confirm-reauthorize requires --authorized on this same "
+            "invocation -- it only ever upgrades False to True, never "
+            "the reverse."
+        )
+
+    (
+        repository.client
+        .table("source_urls")
+        .update(
+            {
+                "is_authorized": True,
+                "updated_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            }
+        )
+        .eq(
+            "source_url_id",
+            source_record["source_url_id"],
+        )
+        .execute()
+    )
+
+    return True
+
+
 def find_existing_discovery(
     repository: SupabaseRepository,
     candidate_id: str,
@@ -1425,6 +1489,22 @@ def main() -> None:
     print(
         f"Source URL ID: {source_url_id}"
     )
+
+    if not source_created and args.confirm_reauthorize:
+        reauthorized = reauthorize_existing_source_url(
+            repository=repository,
+            source_record=source_record,
+            requested_is_authorized=registration["is_authorized"],
+        )
+
+        print(
+            "Source URL authorization: "
+            + (
+                "UPDATED (False -> True)"
+                if reauthorized
+                else "UNCHANGED (already authorized)"
+            )
+        )
 
     existing_discovery = (
         find_existing_discovery(
