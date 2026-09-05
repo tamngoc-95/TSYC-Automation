@@ -68,10 +68,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+from create_internal_product import is_historical_candidate_code
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.decisions import Outcome
 from src.domain.identity_status import IdentityStatus, MatchDecision
-from src.domain.rules.image_rules import select_preferred_image_reference
+from src.domain.rules.image_rules import (
+    select_historical_draft_safe_image_reference,
+    select_preferred_image_reference,
+)
 from src.repositories.supabase_repository import SupabaseRepository
 import collect_reference_metadata as reference_metadata
 
@@ -199,6 +203,7 @@ def resolve_candidate(
         .select(
             "candidate_id, "
             "candidate_code, "
+            "candidate_type, "
             "extracted_title, "
             "verified_title, "
             "verified_author, "
@@ -232,32 +237,36 @@ def resolve_candidate(
     candidate = rows[0]
 
     if candidate.get("identity_status") != IdentityStatus.IDENTITY_VERIFIED:
-        raise RuntimeError(
-            "Candidate identity_status is not IDENTITY_VERIFIED "
-            f"(current: {candidate.get('identity_status')!r}): "
-            f"{candidate_code}"
+        # Historical-migration draft-safe policy (explicit shop-owner
+        # business authorization, CLAUDE.md section 6.2/9.4): an FB-HIST
+        # candidate may reach an image download with identity_status
+        # still IDENTITY_PENDING (never IDENTITY_CONFLICT) -- the same
+        # carve-out create_internal_product.py and review_product_
+        # images.py already apply. Live candidates keep the strict
+        # IDENTITY_VERIFIED-only check, unchanged.
+        historical_allowed = (
+            is_historical_candidate_code(candidate.get("candidate_code"))
+            and candidate.get("identity_status") != IdentityStatus.IDENTITY_CONFLICT
         )
+
+        if not historical_allowed:
+            raise RuntimeError(
+                "Candidate identity_status is not IDENTITY_VERIFIED "
+                f"(current: {candidate.get('identity_status')!r}): "
+                f"{candidate_code}"
+            )
 
     return candidate
 
 
-def resolve_preferred_match_reference(
+def _fetch_candidate_references(
     repository: SupabaseRepository,
-    candidate: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Resolve exactly one MATCH product_reference to download an image
-    from, deterministically, even when the candidate carries more than
-    one MATCH reference (e.g. BOOKSTORE + FAHASA -- the normal case for
-    a TSYC historical candidate).
-
-    All ranking/tie-break/edition-safety logic lives in
-    src.domain.rules.image_rules.select_preferred_image_reference(); this
-    function only fetches the rows and turns a non-AUTO_PASS decision
-    into the same fail-closed RuntimeError this script has always raised
-    for an unresolved reference. No source type is hardcoded here.
-    """
-    response = (
+    candidate_id: str,
+    match_decision: str | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch product_references rows for one candidate, optionally
+    filtered to an exact match_decision."""
+    query = (
         repository.client
         .table("product_references")
         .select(
@@ -269,25 +278,119 @@ def resolve_preferred_match_reference(
             "match_decision, "
             "reference_title, "
             "reference_isbn, "
-            "reference_publisher"
+            "reference_author, "
+            "reference_publisher, "
+            "reference_image_url"
         )
         .eq(
             "candidate_id",
-            candidate["candidate_id"],
+            candidate_id,
         )
-        .eq(
-            "match_decision",
-            MatchDecision.MATCH,
-        )
-        .execute()
     )
 
-    rows = response.data or []
+    if match_decision is not None:
+        query = query.eq("match_decision", match_decision)
 
-    if not rows:
-        raise RuntimeError(
-            "No MATCH product_reference exists for this candidate."
+    return query.execute().data or []
+
+
+def resolve_preferred_match_reference(
+    repository: SupabaseRepository,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Resolve exactly one product_reference to download an image from,
+    deterministically, even when the candidate carries more than one
+    eligible reference (e.g. BOOKSTORE + FAHASA -- the normal case for a
+    TSYC historical candidate).
+
+    Live (non-historical) candidates: unchanged. All ranking/tie-break/
+    edition-safety logic lives in src.domain.rules.image_rules.
+    select_preferred_image_reference(), which requires match_decision==
+    MATCH; this function only fetches the rows and turns a non-AUTO_PASS
+    decision into the same fail-closed RuntimeError this script has
+    always raised for an unresolved reference.
+
+    FB-HIST candidates (CLAUDE.md section 6.2/8.1): when no MATCH
+    reference exists, falls back to image_rules.select_historical_
+    draft_safe_image_reference() over every reference the candidate has
+    (POSSIBLE_MATCH/MANUAL_REVIEW eligible, subject to its own
+    conflict/rights/usability checks) instead of refusing outright. A
+    MATCH reference, when one exists, is still preferred first via the
+    exact same live-pipeline selection -- the historical fallback is
+    only ever reached in its absence.
+    """
+    match_rows = _fetch_candidate_references(
+        repository=repository,
+        candidate_id=candidate["candidate_id"],
+        match_decision=MatchDecision.MATCH,
+    )
+
+    is_historical = is_historical_candidate_code(candidate.get("candidate_code"))
+
+    if not match_rows:
+        if not is_historical:
+            raise RuntimeError(
+                "No MATCH product_reference exists for this candidate."
+            )
+
+        all_rows = _fetch_candidate_references(
+            repository=repository,
+            candidate_id=candidate["candidate_id"],
         )
+
+        if not all_rows:
+            raise RuntimeError(
+                "No product_reference exists for this historical candidate."
+            )
+
+        fallback_decision = select_historical_draft_safe_image_reference(
+            candidate=candidate,
+            references=all_rows,
+        )
+
+        if fallback_decision.outcome != Outcome.AUTO_PASS:
+            raise RuntimeError(
+                "Could not find a draft-safe historical image reference "
+                f"({fallback_decision.rule_code}): {fallback_decision.reason}"
+            )
+
+        selected_reference_id = fallback_decision.evidence.get("reference_id")
+
+        reference = next(
+            (
+                row
+                for row in all_rows
+                if row.get("reference_id") == selected_reference_id
+            ),
+            None,
+        )
+
+        if reference is None:
+            raise RuntimeError(
+                "select_historical_draft_safe_image_reference() returned a "
+                f"reference_id ({selected_reference_id!r}) not present in "
+                "the fetched references."
+            )
+
+        if not reference.get("source_url_id"):
+            raise RuntimeError(
+                "The selected draft-safe product_reference has no "
+                "source_url_id."
+            )
+
+        print()
+        print(
+            "Selected historical draft-safe image reference: "
+            f"source_type={reference.get('source_type')!r}, "
+            f"match_decision={reference.get('match_decision')!r}, "
+            f"rule={fallback_decision.rule_code}."
+        )
+        print(f"Reason: {fallback_decision.reason}")
+
+        return reference
+
+    rows = match_rows
 
     decision = select_preferred_image_reference(
         candidate=candidate,

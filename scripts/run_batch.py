@@ -191,6 +191,28 @@ AUTOMATABLE_DISPATCH: dict[str, DispatchEntry] = {
             "authorized usage-rights status."
         ),
     ),
+    # Historical-migration draft-safe image-reference fallback (CLAUDE.md
+    # section 6.2/8.1/14.7). pipeline_state.py only reaches this state
+    # when image_rules.select_historical_draft_safe_image_reference()
+    # already found exactly one draft-safe reference (POSSIBLE_MATCH/
+    # MANUAL_REVIEW eligible, no conflict, approved source, publishable
+    # rights mapping) -- download_bookstore_product_image.py re-resolves
+    # and re-validates the same selection itself immediately before any
+    # write (defense in depth, same pattern as every other dispatch).
+    "IMAGE_REFERENCE_FALLBACK_PENDING_HISTORICAL": DispatchEntry(
+        script="download_bookstore_product_image.py",
+        build_args=lambda state: [
+            "--candidate-code",
+            state.candidate_code,
+            "--non-interactive",
+            "--confirm-download",
+        ],
+        description=(
+            "Download and register a draft-safe reference image as a "
+            "fallback source, bypassing an ambiguous/unavailable "
+            "Facebook-export image for this historical candidate."
+        ),
+    ),
     "INTERNAL_PRODUCT_CREATED": DispatchEntry(
         script="prepare_product_content.py",
         build_args=lambda state: [

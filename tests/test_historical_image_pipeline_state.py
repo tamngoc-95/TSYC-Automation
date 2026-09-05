@@ -258,7 +258,12 @@ def test_non_historical_candidate_keeps_original_image_pending_message(
 def test_single_facebook_export_image_is_automatable_store_owned():
     candidate = _historical_candidate()
     internal_product = _internal_product(image_status="PENDING")
-    image = _image(image_id="img-1", reference_id=None, usage_rights_status="RIGHTS_UNKNOWN")
+    image = _image(
+        image_id="img-1",
+        reference_id=None,
+        source_type="FACEBOOK",
+        usage_rights_status="RIGHTS_UNKNOWN",
+    )
     repository = _repository(candidate, internal_product, images=[image])
 
     bundle = load_candidate_bundle(repository, HISTORICAL_CANDIDATE_CODE)

@@ -231,6 +231,153 @@ def publishers_conflict(values: Sequence[str | None]) -> bool:
     return len(normalized_values) > 1
 
 
+# --- historical draft-safe reference conflict check ------------------------
+#
+# Shared by the FB-HIST-only image-reference fallback (image_rules.
+# is_historical_reference_image_draft_safe) and the FB-HIST-only content
+# auto-enrichment path (content_rules.select_historical_draft_safe_content_
+# reference). Both need the same "does this reference actually describe the
+# same sellable product" check, independent of match_decision -- this is a
+# presentation/content-safety check, not an identity-verification decision:
+# it never sets match_decision or identity_status.
+#
+# Deliberately a *new*, separate function rather than a refactor of any
+# existing single-reference check already used by the live pipeline (e.g.
+# image_rules.select_preferred_image_reference's own conflict check) --
+# CLAUDE.md's historical-migration policy is explicit that live FB-2026-*
+# behavior must be completely unaffected, so nothing here is shared with or
+# substituted into a live-pipeline code path.
+
+_TITLE_MATERIALLY_DIFFERENT_THRESHOLD = 0.60
+_TITLE_NEAR_EXACT_THRESHOLD = 0.90
+
+_COMBO_UNIT_TITLE_KEYWORDS = (
+    "combo",
+    "tron bo",
+    "bo ",
+    "boxset",
+    "box set",
+    "hop",
+    "full set",
+)
+
+
+def sellable_unit_conflicts(
+    candidate_type: str | None,
+    reference_title: str | None,
+) -> bool:
+    """
+    Conservative sellable-unit conflict check (CLAUDE.md section 14.6): a
+    BOOK_COMBO/BOOK_SET candidate whose reference title carries no
+    combo/set indicator likely describes a single volume, not the full
+    sellable unit this candidate represents.
+
+    Never flags anything for any other candidate_type (SINGLE_BOOK,
+    ACTIVITY_PRODUCT, OTHER, or unknown) -- this check only ever narrows
+    what a combo/set candidate may treat as draft-safe corroborating
+    evidence; it never restricts a single-item candidate.
+    """
+    if candidate_type not in ("BOOK_COMBO", "BOOK_SET"):
+        return False
+
+    normalized_title = normalize_text(reference_title)
+
+    if not normalized_title:
+        return False
+
+    return not any(
+        keyword in normalized_title for keyword in _COMBO_UNIT_TITLE_KEYWORDS
+    )
+
+
+def reference_business_conflict_reason(
+    candidate: dict[str, Any],
+    reference: dict[str, Any],
+) -> str | None:
+    """
+    Return a human-readable reason if `reference` conflicts with the
+    candidate's already-known identity/sellable-unit facts, or None when
+    it is safe to treat the reference as draft-safe corroborating
+    evidence (an image source or a content-enrichment source).
+
+    Checks (each independent; any single conflict disqualifies):
+      - ISBN conflict: both sides carry a valid, differing ISBN.
+      - title materially different: similarity < 0.60.
+      - publisher conflict: differing publisher and title not near-exact.
+      - author conflict: both sides name a specific, differing author.
+      - sellable-unit conflict: BOOK_COMBO/BOOK_SET candidate, reference
+        title with no combo/set indicator (sellable_unit_conflicts()).
+
+    Never decides match_decision or identity_status -- a caller must
+    never relabel a POSSIBLE_MATCH/MANUAL_REVIEW reference as MATCH
+    based on this function returning None. It only says whether the
+    reference is safe to reuse (as-is, unmodified) for an image or a
+    content description.
+    """
+    candidate_isbn_raw = candidate.get("verified_isbn") or candidate.get("possible_isbn")
+    reference_isbn_raw = reference.get("reference_isbn")
+
+    if (
+        looks_like_valid_isbn(candidate_isbn_raw)
+        and looks_like_valid_isbn(reference_isbn_raw)
+        and normalize_isbn(candidate_isbn_raw) != normalize_isbn(reference_isbn_raw)
+    ):
+        return (
+            f"Reference ISBN {reference_isbn_raw!r} conflicts with the "
+            f"candidate's verified ISBN {candidate_isbn_raw!r} (different "
+            "edition)."
+        )
+
+    candidate_title = candidate.get("verified_title") or candidate.get("extracted_title")
+    reference_title = reference.get("reference_title")
+    title_similarity = calculate_similarity(candidate_title, reference_title)
+
+    if reference_title and title_similarity < _TITLE_MATERIALLY_DIFFERENT_THRESHOLD:
+        return (
+            f"Reference title {reference_title!r} is materially different "
+            f"from the candidate's title {candidate_title!r} (similarity "
+            f"{title_similarity})."
+        )
+
+    candidate_publisher = candidate.get("verified_publisher")
+    reference_publisher = reference.get("reference_publisher")
+
+    if (
+        candidate_publisher
+        and reference_publisher
+        and title_similarity < _TITLE_NEAR_EXACT_THRESHOLD
+        and publishers_conflict([candidate_publisher, reference_publisher])
+    ):
+        return (
+            f"Reference publisher {reference_publisher!r} conflicts with "
+            f"the candidate's verified publisher {candidate_publisher!r}, "
+            "and title similarity is not near-exact."
+        )
+
+    candidate_author = candidate.get("verified_author")
+    reference_author = reference.get("reference_author")
+
+    if (
+        is_specific_author(candidate_author)
+        and is_specific_author(reference_author)
+        and normalize_text(candidate_author) != normalize_text(reference_author)
+    ):
+        return (
+            f"Reference author {reference_author!r} conflicts with the "
+            f"candidate's verified author {candidate_author!r}."
+        )
+
+    if sellable_unit_conflicts(candidate.get("candidate_type"), reference_title):
+        return (
+            f"Candidate is a {candidate.get('candidate_type')} but "
+            f"reference title {reference_title!r} shows no combo/set "
+            "indicator -- it likely represents a single volume, not the "
+            "full sellable unit."
+        )
+
+    return None
+
+
 # --- production identity-verification invariant ---------------------------
 
 

@@ -30,7 +30,7 @@ See docs/TSYC_DECISION_MATRIX.md for the full specification.
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from src.domain.decisions import DecisionResult, Outcome
 from src.domain.identity_status import MatchDecision
@@ -43,6 +43,7 @@ from src.domain.rules.identity_rules import (
     normalize_isbn,
     normalize_text,
     publishers_conflict,
+    reference_business_conflict_reason,
 )
 
 # --- rule codes ----------------------------------------------------
@@ -63,6 +64,11 @@ IMAGE_REFERENCE_TIE_BREAK_SELECTED = "IMAGE_REFERENCE_TIE_BREAK_SELECTED"
 IMAGE_REFERENCE_CONFLICT = "IMAGE_REFERENCE_CONFLICT"
 IMAGE_REFERENCE_IDENTITY_CONFLICT = "IMAGE_REFERENCE_IDENTITY_CONFLICT"
 IMAGE_REFERENCE_NONE_USABLE = "IMAGE_REFERENCE_NONE_USABLE"
+# Historical-migration draft-safe image-reference fallback (CLAUDE.md
+# section 6.2/8.1/14.7) -- see is_historical_reference_image_draft_safe()
+# and select_historical_draft_safe_image_reference() below.
+IMAGE_REFERENCE_DRAFT_SAFE_SELECTED = "IMAGE_REFERENCE_DRAFT_SAFE_SELECTED"
+IMAGE_REFERENCE_NONE_DRAFT_SAFE = "IMAGE_REFERENCE_NONE_DRAFT_SAFE"
 
 # Mirrors identity_rules.evaluate_single_reference_identity()'s own
 # title_similarity < 0.60 "too different" cutoff (IDENTITY_CONFIRMED_NO_
@@ -217,6 +223,64 @@ def evaluate_historical_image_rights_policy(
     return evaluate_rights_classification(
         rights_status=RightsStatus.RIGHTS_UNKNOWN,
         policy_established=False,
+    )
+
+
+def classify_historical_image_rights(
+    image: Mapping[str, Any],
+    reference_by_id: Mapping[str, dict[str, Any]] | None = None,
+) -> DecisionResult:
+    """
+    Per-image (not per-candidate) rights classification for an FB-HIST
+    candidate -- CLAUDE.md section 6.2/14.7: STORE_OWNED/PUBLISHER_
+    APPROVED/SUPPLIER_APPROVED apply per image based on that image's own
+    provenance, never gated on how many images the candidate happens to
+    carry. Main-image *selection* (choosing which of possibly several
+    rights-eligible images becomes the one selected main image) remains
+    a completely separate decision -- see evaluate_main_image_selection.
+
+    Provenance is never inferred beyond what the writer scripts
+    themselves already record:
+      - usage_rights_status already publishable -> kept as-is.
+      - no reference_id and source_type == "FACEBOOK" -> this candidate's
+        own Facebook export (upload_facebook_images_to_supabase.py is the
+        only writer of FACEBOOK-sourced product_images rows and never
+        sets reference_id) -> STORE_OWNED.
+      - reference_id set -> the linked reference's source_type, mapped
+        through APPROVED_REFERENCE_SOURCE_RIGHTS (download_bookstore_
+        product_image.py always writes source_type = the selected
+        reference's own source_type).
+      - anything else (no reference_id and source_type != "FACEBOOK", or
+        a reference_id with no resolvable reference row in
+        reference_by_id) -> RIGHTS_UNKNOWN, exactly as before -- an
+        unrecognized/unconfigured provenance is never auto-approved.
+    """
+    existing_rights = image.get("usage_rights_status")
+
+    if existing_rights in PUBLISHABLE_RIGHTS_STATUSES:
+        return evaluate_rights_classification(
+            rights_status=existing_rights,
+            policy_established=True,
+        )
+
+    reference_id = image.get("reference_id")
+
+    if not reference_id:
+        if image.get("source_type") == "FACEBOOK":
+            return evaluate_historical_image_rights_policy(
+                is_own_facebook_export=True,
+            )
+
+        return evaluate_rights_classification(
+            rights_status=RightsStatus.RIGHTS_UNKNOWN,
+            policy_established=False,
+        )
+
+    reference = (reference_by_id or {}).get(str(reference_id))
+    reference_source_type = reference.get("source_type") if reference else None
+
+    return evaluate_historical_image_rights_policy(
+        reference_source_type=reference_source_type,
     )
 
 
@@ -657,4 +721,213 @@ def select_preferred_image_reference(
             "source_type": selected.get("source_type"),
             "source_priority": best_priority,
         },
+    )
+
+
+# --- historical draft-safe image-reference fallback (CLAUDE.md 6.2/8.1) --
+#
+# select_preferred_image_reference() above stays completely unmodified and
+# is still the only function download_bookstore_product_image.py uses for
+# a live (non-historical) candidate: match_decision==MATCH is still
+# required, in full, for every FB-2026-* candidate.
+#
+# The functions below are FB-HIST-only and deliberately separate rather
+# than a relaxation of select_preferred_image_reference() itself, so live
+# behavior can never be affected by this policy. Neither function performs
+# an is_historical_candidate_code() check itself -- these are pure
+# decision functions and should not need the candidate_code string at all;
+# callers (pipeline_state.py, download_bookstore_product_image.py) are
+# responsible for only ever reaching them for an FB-HIST candidate.
+
+_DRAFT_SAFE_MATCH_DECISIONS = (
+    MatchDecision.MATCH,
+    MatchDecision.POSSIBLE_MATCH,
+    MatchDecision.MANUAL_REVIEW,
+)
+
+# Tie-break preference among same-source-priority draft-safe references:
+# a real MATCH still outranks a POSSIBLE_MATCH/MANUAL_REVIEW of the same
+# source priority, which in turn outranks a MANUAL_REVIEW. Never used to
+# invent a ranking among different source priorities -- source priority
+# (REFERENCE_SOURCE_PRIORITY) is always decided first.
+_MATCH_DECISION_RANK = MappingProxyType(
+    {
+        MatchDecision.MATCH: 0,
+        MatchDecision.POSSIBLE_MATCH: 1,
+        MatchDecision.MANUAL_REVIEW: 2,
+    }
+)
+
+
+def is_historical_reference_image_draft_safe(
+    candidate: dict[str, Any],
+    reference: dict[str, Any],
+) -> DecisionResult:
+    """
+    FB-HIST-only draft-safe image-reference eligibility (CLAUDE.md
+    section 6.2/8.1/14.7).
+
+    Deliberately looser than select_preferred_image_reference()'s live-
+    pipeline match_decision==MATCH requirement: a POSSIBLE_MATCH or
+    MANUAL_REVIEW reference may be used as an image fallback source for a
+    historical draft, but only when every one of these holds:
+      - candidate has a meaningful title (verified_title or
+        extracted_title, non-empty)
+      - candidate has a known candidate_type (clear sellable unit)
+      - reference has a usable image URL (reference_image_url)
+      - reference source_type maps to a publishable historical rights
+        status (APPROVED_REFERENCE_SOURCE_RIGHTS: PUBLISHER/
+        AUTHORIZED_SUPPLIER/BOOKSTORE/FAHASA only)
+      - no ISBN/title/publisher/author/sellable-unit conflict
+        (identity_rules.reference_business_conflict_reason)
+
+    Never requires IDENTITY_VERIFIED, never requires match_decision==
+    MATCH, never requires a second independent reference (CLAUDE.md
+    section 6.2's explicit relaxations). Never relabels the reference's
+    own match_decision -- this is image eligibility only; identity_status
+    and match_decision are read here, never written.
+    """
+    candidate_title = candidate.get("verified_title") or candidate.get(
+        "extracted_title"
+    )
+
+    if not candidate_title or not str(candidate_title).strip():
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=IMAGE_REFERENCE_NONE_DRAFT_SAFE,
+            reason="Candidate has no meaningful title.",
+        )
+
+    if not candidate.get("candidate_type"):
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=IMAGE_REFERENCE_NONE_DRAFT_SAFE,
+            reason="Candidate type (sellable-unit shape) is unknown.",
+        )
+
+    if not reference.get("reference_image_url"):
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=IMAGE_REFERENCE_NONE_DRAFT_SAFE,
+            reason="Reference has no usable image URL.",
+            evidence={"reference_id": reference.get("reference_id")},
+        )
+
+    reference_source_type = reference.get("source_type")
+    rights_decision = evaluate_historical_image_rights_policy(
+        reference_source_type=reference_source_type,
+    )
+
+    if rights_decision.outcome != Outcome.AUTO_PASS:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=IMAGE_RIGHTS_UNKNOWN,
+            reason=(
+                f"Reference source_type {reference_source_type!r} does "
+                "not map to a publishable historical rights status."
+            ),
+            evidence={
+                "reference_id": reference.get("reference_id"),
+                "reference_source_type": reference_source_type,
+            },
+        )
+
+    conflict_reason = reference_business_conflict_reason(candidate, reference)
+
+    if conflict_reason:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=IMAGE_REFERENCE_IDENTITY_CONFLICT,
+            reason=conflict_reason,
+            evidence={"reference_id": reference.get("reference_id")},
+        )
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=IMAGE_REFERENCE_DRAFT_SAFE_SELECTED,
+        reason=(
+            "Reference is draft-safe: approved source type, publishable "
+            "historical rights mapping, no identity/sellable-unit "
+            "conflict."
+        ),
+        evidence={
+            "reference_id": reference.get("reference_id"),
+            "source_type": reference_source_type,
+            "rights_status": rights_decision.evidence.get("rights_status"),
+            "match_decision": reference.get("match_decision"),
+        },
+    )
+
+
+def select_historical_draft_safe_image_reference(
+    candidate: dict[str, Any],
+    references: Sequence[dict[str, Any]],
+) -> DecisionResult:
+    """
+    FB-HIST-only: deterministically pick one draft-safe reference to
+    source an image fallback from, out of a candidate's references,
+    without requiring match_decision==MATCH -- see
+    is_historical_reference_image_draft_safe().
+
+    Ranking reuses the exact same canonical source-priority order as
+    select_preferred_image_reference() (REFERENCE_SOURCE_PRIORITY,
+    PUBLISHER > AUTHORIZED_SUPPLIER > BOOKSTORE > FAHASA); a same-
+    priority tie prefers a real MATCH over POSSIBLE_MATCH/MANUAL_REVIEW,
+    then falls back to list order (deterministic, since callers always
+    pass the same rows in the same order). No image-selection or write
+    ever happens here -- evidence["reference_id"] is the only output a
+    caller acts on.
+    """
+    candidates_for_selection = [
+        reference
+        for reference in references
+        if reference.get("match_decision") in _DRAFT_SAFE_MATCH_DECISIONS
+        and reference.get("source_type") in REFERENCE_SOURCE_PRIORITY
+    ]
+
+    evaluated = [
+        (reference, is_historical_reference_image_draft_safe(candidate, reference))
+        for reference in candidates_for_selection
+    ]
+
+    passing = [
+        (reference, decision)
+        for reference, decision in evaluated
+        if decision.outcome == Outcome.AUTO_PASS
+    ]
+
+    if not passing:
+        return DecisionResult(
+            outcome=Outcome.BLOCKED,
+            rule_code=IMAGE_REFERENCE_NONE_DRAFT_SAFE,
+            reason=(
+                "No reference is draft-safe for an image fallback "
+                f"(checked {len(candidates_for_selection)} candidate "
+                "reference(s))."
+            ),
+            evidence={"checked_count": len(candidates_for_selection)},
+        )
+
+    best_priority = min(
+        REFERENCE_SOURCE_PRIORITY[reference["source_type"]]
+        for reference, _ in passing
+    )
+    top_tier = [
+        (reference, decision)
+        for reference, decision in passing
+        if REFERENCE_SOURCE_PRIORITY[reference["source_type"]] == best_priority
+    ]
+    top_tier.sort(
+        key=lambda pair: _MATCH_DECISION_RANK.get(
+            pair[0].get("match_decision"), 3
+        )
+    )
+
+    selected_reference, selected_decision = top_tier[0]
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=selected_decision.rule_code,
+        reason=selected_decision.reason,
+        evidence=selected_decision.evidence,
     )

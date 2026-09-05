@@ -1486,6 +1486,7 @@ def test_historical_image_ingest_and_approval_dispatch_chain(
                     "image_id": "img-1",
                     "candidate_id": HISTORICAL_CANDIDATE_ID,
                     "reference_id": None,
+                    "source_type": "FACEBOOK",
                     "usage_rights_status": "RIGHTS_UNKNOWN",
                     "is_selected_main_image": False,
                     "is_publish_eligible": False,

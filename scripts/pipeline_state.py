@@ -92,6 +92,7 @@ DERIVED_STATES = {
     "IMAGE_PENDING",
     "IMAGE_INGEST_PENDING_HISTORICAL",
     "IMAGE_APPROVAL_PENDING_HISTORICAL",
+    "IMAGE_REFERENCE_FALLBACK_PENDING_HISTORICAL",
     "IMAGE_CAPABILITY_UNAVAILABLE",
     "IMAGE_GROUP_OWNERSHIP_AMBIGUOUS",
     "IMAGE_VALIDATED",
@@ -145,6 +146,12 @@ class CandidateState:
     # "pure derivation layer" contract.
     auto_main_image_id: str | None = None
     auto_rights_status: str | None = None
+    # Populated only for derived_state=="IMAGE_REFERENCE_FALLBACK_PENDING_
+    # HISTORICAL" -- the exact single draft-safe reference_id
+    # scripts/run_batch.py's dispatch passes through to
+    # download_bookstore_product_image.py (which re-resolves and
+    # re-validates it itself; this is not a trust-blindly hand-off).
+    auto_reference_id: str | None = None
 
     @property
     def outcome(self) -> str:
@@ -489,13 +496,56 @@ def _derive_image_content_state(
                 )
 
                 if ownership_decision.outcome != Outcome.AUTO_PASS:
+                    # Historical-migration draft-safe policy (CLAUDE.md
+                    # section 6.2/8.1): before stopping at the ownership-
+                    # ambiguous human gate, try a deterministic reference-
+                    # image fallback -- an approved-source reference that
+                    # already, unambiguously identifies this exact
+                    # candidate can supply a usable image without ever
+                    # needing to resolve which shared Facebook-post image
+                    # belongs to which candidate. Only ever attempted for
+                    # a historical candidate; a live candidate reaching
+                    # this branch (it cannot today -- ownership ambiguity
+                    # is itself a historical-only concept) would never
+                    # reach select_historical_draft_safe_image_reference.
+                    fallback_decision = (
+                        image_rules.select_historical_draft_safe_image_reference(
+                            candidate=candidate,
+                            references=bundle["references"],
+                        )
+                        if is_historical_candidate_code(candidate_code)
+                        else DecisionResult(
+                            outcome=Outcome.BLOCKED,
+                            rule_code="IMAGE_REFERENCE_NONE_DRAFT_SAFE",
+                            reason="Not a historical candidate.",
+                        )
+                    )
+
+                    if fallback_decision.outcome == Outcome.AUTO_PASS:
+                        return CandidateState(
+                            candidate_code=candidate_code,
+                            candidate_id=candidate_id,
+                            product_code=product_code,
+                            derived_state=(
+                                "IMAGE_REFERENCE_FALLBACK_PENDING_HISTORICAL"
+                            ),
+                            auto_reference_id=str(
+                                fallback_decision.evidence["reference_id"]
+                            ),
+                            warnings=warnings,
+                        )
+
                     return CandidateState(
                         candidate_code=candidate_code,
                         candidate_id=candidate_id,
                         product_code=product_code,
                         derived_state="IMAGE_GROUP_OWNERSHIP_AMBIGUOUS",
                         human_gate=True,
-                        human_gate_reason=ownership_decision.reason,
+                        human_gate_reason=(
+                            f"{ownership_decision.reason} A draft-safe "
+                            "reference-image fallback was also attempted "
+                            f"and did not qualify: {fallback_decision.reason}"
+                        ),
                         warnings=warnings,
                     )
 
@@ -549,34 +599,38 @@ def _derive_image_content_state(
 
         is_historical = is_historical_candidate_code(candidate_code)
 
-        # Historical-migration draft-safe auto-approval (CLAUDE.md
-        # 6.2/14.5/14.7): exactly one image exists and it is either
-        # already publishable or came straight from this candidate's own
-        # Facebook export (no reference_id -- ownership was already
-        # confirmed unambiguous before ingestion, above) -- STORE_OWNED
-        # applies deterministically. More than one image, or a single
-        # reference-sourced image with unmapped rights, is never
-        # auto-selected: CLAUDE.md 14.5 requires subjective judgment
-        # whenever more than one plausible image exists.
-        if is_historical and len(images) == 1:
-            only_image = images[0]
-            existing_rights = only_image.get("usage_rights_status")
+        # Historical-migration draft-safe rights auto-classification
+        # (CLAUDE.md 6.2/14.7): rights classification is per-image and
+        # never gated on how many images the candidate carries --
+        # classify_historical_image_rights() decides each image's
+        # provenance-based rights independently. Main-image *selection*
+        # (CLAUDE.md 14.5: "exactly one eligible image") stays a
+        # completely separate decision: only when exactly one image ends
+        # up rights-eligible can it be auto-selected here; two or more
+        # rights-eligible images still require a human pick.
+        eligible_images: list[tuple[dict[str, Any], str]] = []
 
-            if existing_rights in PUBLISHABLE_RIGHTS_STATUSES:
-                auto_rights_status = existing_rights
-            elif not only_image.get("reference_id"):
-                rights_decision = image_rules.evaluate_historical_image_rights_policy(
-                    is_own_facebook_export=True
-                )
-                auto_rights_status = (
-                    rights_decision.evidence.get("rights_status")
-                    if rights_decision.outcome == Outcome.AUTO_PASS
-                    else None
-                )
-            else:
-                auto_rights_status = None
+        if is_historical:
+            reference_by_id = {
+                str(reference["reference_id"]): reference
+                for reference in bundle["references"]
+                if reference.get("reference_id")
+            }
 
-            if auto_rights_status:
+            for image in images:
+                rights_decision = image_rules.classify_historical_image_rights(
+                    image,
+                    reference_by_id=reference_by_id,
+                )
+
+                if rights_decision.outcome == Outcome.AUTO_PASS:
+                    eligible_images.append(
+                        (image, rights_decision.evidence["rights_status"])
+                    )
+
+            if len(eligible_images) == 1:
+                only_image, auto_rights_status = eligible_images[0]
+
                 return CandidateState(
                     candidate_code=candidate_code,
                     candidate_id=candidate_id,
@@ -593,12 +647,46 @@ def _derive_image_content_state(
             else None
         )
 
-        has_publishable_rights = any(
-            image.get("usage_rights_status") in PUBLISHABLE_RIGHTS_STATUSES
-            for image in images
+        # Historical candidates: rely on the freshly-computed per-image
+        # classification above (which already accounts for own-Facebook-
+        # export and approved-reference provenance regardless of image
+        # count) instead of only the persisted usage_rights_status --
+        # otherwise a candidate with 2+ own-export images would show
+        # "rights unknown" even though every one of them is really
+        # STORE_OWNED-eligible (the exact stale-state bug this replaces).
+        # Live candidates: unchanged, persisted usage_rights_status only.
+        has_publishable_rights = (
+            bool(eligible_images)
+            if is_historical
+            else any(
+                image.get("usage_rights_status") in PUBLISHABLE_RIGHTS_STATUSES
+                for image in images
+            )
         )
 
         if not has_publishable_rights:
+            if is_historical:
+                fallback_decision = (
+                    image_rules.select_historical_draft_safe_image_reference(
+                        candidate=candidate,
+                        references=bundle["references"],
+                    )
+                )
+
+                if fallback_decision.outcome == Outcome.AUTO_PASS:
+                    return CandidateState(
+                        candidate_code=candidate_code,
+                        candidate_id=candidate_id,
+                        product_code=product_code,
+                        derived_state=(
+                            "IMAGE_REFERENCE_FALLBACK_PENDING_HISTORICAL"
+                        ),
+                        auto_reference_id=str(
+                            fallback_decision.evidence["reference_id"]
+                        ),
+                        warnings=warnings,
+                    )
+
             reason = (
                 "No image has a publishable usage-rights status. Image "
                 "rights cannot be inferred automatically -- confirm "
@@ -623,6 +711,16 @@ def _derive_image_content_state(
             "selected, publish-eligible main image has been approved. "
             "Run review_product_images.py to select and approve one."
         )
+
+        if is_historical and len(eligible_images) > 1:
+            reason = (
+                f"{len(eligible_images)} images are auto-classified with "
+                "publishable rights under the historical policy, but "
+                "CLAUDE.md 14.5 requires subjective judgment to select "
+                "exactly one main image among several equally eligible "
+                "images. Run review_product_images.py to select and "
+                "approve one."
+            )
 
         if historical_fallback_hint:
             reason += f" {historical_fallback_hint}"
