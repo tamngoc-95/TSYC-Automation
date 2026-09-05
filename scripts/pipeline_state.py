@@ -951,6 +951,53 @@ def _derive_pre_product_state(
             ]
 
             if unresolved:
+                if is_historical:
+                    # Historical-migration draft-safe policy (explicit
+                    # shop-owner business authorization, CLAUDE.md
+                    # section 6.2/9.4): an unresolved (never match_
+                    # decision-written) reference does not, by itself,
+                    # block the draft-safe path when match_candidate_
+                    # identity.py has already evaluated this candidate
+                    # and genuinely concluded insufficient evidence (no
+                    # active isbn/author/page_count/publisher conflict)
+                    # -- evidenced by a stamped decision_fingerprint plus
+                    # an empty conflict_fields. This is the exact same
+                    # business situation CLAUDE.md 9.4 already accepts
+                    # (a POSSIBLE_MATCH/MANUAL_REVIEW/no-reference
+                    # candidate proceeding as enrichment-only), not a
+                    # relaxation of it -- match_candidate_identity.py's
+                    # own AUTO mode simply never persists a match_
+                    # decision for a REVIEW_REQUIRED-insufficient-
+                    # evidence outcome (by design: it never forces a
+                    # decision, CLAUDE.md 9.2), so "unresolved" alone
+                    # cannot distinguish "genuinely never evaluated yet"
+                    # from "evaluated, and missing data is all that's
+                    # stopping it" without this check. Never sets
+                    # IDENTITY_VERIFIED, never invents a missing author
+                    # -- identity_status stays exactly IDENTITY_PENDING.
+                    source_evidence = candidate.get("source_evidence") or {}
+                    already_evaluated_no_conflict = bool(
+                        source_evidence.get("decision_fingerprint")
+                    ) and not (candidate.get("conflict_fields") or [])
+
+                    if already_evaluated_no_conflict:
+                        return CandidateState(
+                            candidate_code=candidate_code,
+                            candidate_id=candidate_id,
+                            product_code=None,
+                            derived_state="IDENTITY_PENDING_HISTORICAL_DRAFT_SAFE",
+                            warnings=[
+                                "Identity matching evaluated this "
+                                "candidate and found insufficient "
+                                "evidence (no active conflict) rather "
+                                "than a MATCH -- proceeding under the "
+                                "historical draft-safe policy with "
+                                "unverified identity. Reference remains "
+                                "unresolved (match_decision is not "
+                                "set); this is enrichment only."
+                            ],
+                        )
+
                 return CandidateState(
                     candidate_code=candidate_code,
                     candidate_id=candidate_id,

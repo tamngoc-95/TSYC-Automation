@@ -20,6 +20,15 @@ candidate's own verified identity (ISBN/title/publisher) before it is
 ever used. Anything short of a clean, single, identity-consistent
 selection stops with a RuntimeError instead of guessing.
 
+If the highest-priority reference's image turns out to be unusable for
+retrieval (a dead/404 asset, nothing extractable from the page, or a
+rejected URL -- ImageSourceUnusableError), main() automatically retries
+the next eligible reference in the same priority order instead of
+failing the candidate outright. This never touches match_decision or
+identity_status: a dead image link is never treated as identity
+evidence, and no reference this project's own selection logic would
+otherwise refuse is ever tried.
+
 Safety guarantees:
 - Exact candidate targeting only. No batch mode, no arbitrary selection,
   no fallback to another candidate or another source.
@@ -80,6 +89,27 @@ from src.repositories.supabase_repository import SupabaseRepository
 import collect_reference_metadata as reference_metadata
 
 configure_utf8_console()
+
+
+class ImageSourceUnusableError(RuntimeError):
+    """
+    Raised when a specific candidate reference's image source turned out
+    to be dead/unusable (HTTP 404 or other bad status on the image
+    asset, no image URL could be extracted from the page at all, or the
+    extracted URL matched a rejected keyword) -- never for a structural
+    precondition failure (missing source_url_id, unauthorized source,
+    no candidate/internal product, browser/network failure unrelated to
+    a specific asset, etc.), which must still fail the whole run
+    immediately.
+
+    CLAUDE.md section 8.1's approved source-priority fallback (PUBLISHER
+    > AUTHORIZED_SUPPLIER > BOOKSTORE > FAHASA): main() catches exactly
+    this exception to move on to the next eligible reference instead of
+    failing the candidate outright. This never touches match_decision or
+    identity_status -- a dead image link is never treated as identity
+    evidence (CLAUDE.md section 9: image sourcing and identity
+    verification are separate concerns).
+    """
 
 
 BATCH_CODE = "FB-2026-001"
@@ -297,6 +327,7 @@ def _fetch_candidate_references(
 def resolve_preferred_match_reference(
     repository: SupabaseRepository,
     candidate: dict[str, Any],
+    exclude_reference_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """
     Resolve exactly one product_reference to download an image from,
@@ -319,12 +350,25 @@ def resolve_preferred_match_reference(
     MATCH reference, when one exists, is still preferred first via the
     exact same live-pipeline selection -- the historical fallback is
     only ever reached in its absence.
+
+    exclude_reference_ids (CLAUDE.md section 8.1's approved source-
+    priority fallback): reference_id values to leave out of selection
+    entirely -- main()'s retry loop passes the reference_id(s) already
+    proven unusable (a dead image link) here, so a second call ranks and
+    returns the *next* best eligible reference instead of the same one
+    again. Never relaxes any other eligibility/conflict/rights check;
+    never falls back to a reference this same selection would otherwise
+    have refused.
     """
-    match_rows = _fetch_candidate_references(
-        repository=repository,
-        candidate_id=candidate["candidate_id"],
-        match_decision=MatchDecision.MATCH,
-    )
+    match_rows = [
+        row
+        for row in _fetch_candidate_references(
+            repository=repository,
+            candidate_id=candidate["candidate_id"],
+            match_decision=MatchDecision.MATCH,
+        )
+        if str(row.get("reference_id")) not in exclude_reference_ids
+    ]
 
     is_historical = is_historical_candidate_code(candidate.get("candidate_code"))
 
@@ -334,10 +378,14 @@ def resolve_preferred_match_reference(
                 "No MATCH product_reference exists for this candidate."
             )
 
-        all_rows = _fetch_candidate_references(
-            repository=repository,
-            candidate_id=candidate["candidate_id"],
-        )
+        all_rows = [
+            row
+            for row in _fetch_candidate_references(
+                repository=repository,
+                candidate_id=candidate["candidate_id"],
+            )
+            if str(row.get("reference_id")) not in exclude_reference_ids
+        ]
 
         if not all_rows:
             raise RuntimeError(
@@ -709,7 +757,12 @@ def download_image_bytes(
     )
 
     if not response.ok:
-        raise RuntimeError(
+        # A bad HTTP status on the image asset itself (404 most commonly
+        # -- the reference page still exists/parses, but its image has
+        # moved or been deleted) means only this source is unusable, not
+        # that the whole candidate should fail -- see
+        # ImageSourceUnusableError.
+        raise ImageSourceUnusableError(
             "BOOKSTORE image download failed with HTTP status "
             f"{response.status}."
         )
@@ -721,13 +774,13 @@ def download_image_bytes(
     )
 
     if content_type not in ALLOWED_MIME_TYPES:
-        raise RuntimeError(
+        raise ImageSourceUnusableError(
             "Downloaded content is not an allowed image type: "
             f"{content_type or '[missing]'}"
         )
 
     if not content:
-        raise RuntimeError(
+        raise ImageSourceUnusableError(
             "Downloaded image content is empty."
         )
 
@@ -1110,6 +1163,298 @@ def print_preflight_summary(
 # ---------------------------------------------------------------------------
 
 
+def attempt_download_for_reference(
+    repository: SupabaseRepository,
+    candidate: dict[str, Any],
+    reference: dict[str, Any],
+    source: dict[str, Any],
+    context: BrowserContext,
+    page_url: str,
+) -> None:
+    """
+    Attempt to extract, download, and register an image from exactly one
+    already-resolved reference/source. Returns normally on success
+    (including the two "already registered" no-op cases, which print
+    their own message and simply return). Raises ImageSourceUnusableError
+    for a failure specific to this one source (dead image link, nothing
+    extractable, a rejected URL) -- main()'s retry loop catches exactly
+    that to move on to the next eligible reference. Any other exception
+    (browser/network failure, database error, cross-candidate hash
+    conflict, ...) propagates immediately and is never retried.
+    """
+    (
+        page,
+        _raw_text,
+        _raw_html,
+        _page_title,
+    ) = reference_metadata.collect_page(
+        context=context,
+        source_url=page_url,
+    )
+
+    json_ld_objects = reference_metadata.extract_json_ld(
+        page
+    )
+
+    product_json_ld = reference_metadata.find_product_json_ld(
+        json_ld_objects
+    )
+
+    image_url = reference_metadata.extract_image_url(
+        page=page,
+        product_json_ld=product_json_ld,
+    )
+
+    if not image_url:
+        raise ImageSourceUnusableError(
+            "No product image could be extracted from the "
+            f"BOOKSTORE page: {page_url}"
+        )
+
+    extraction_method = determine_image_extraction_method(
+        product_json_ld=product_json_ld,
+        page=page,
+    )
+
+    rejection_reason = reject_reason_for_image_url(
+        image_url
+    )
+
+    if rejection_reason:
+        raise ImageSourceUnusableError(
+            "Extracted image URL was rejected: "
+            f"{rejection_reason} ({image_url})"
+        )
+
+    print()
+    print("=" * 78)
+    print("IMAGE EXTRACTION RESULT")
+    print("=" * 78)
+    print(
+        f"Extraction method: {extraction_method}"
+    )
+    print(
+        f"Candidate image URL: {image_url}"
+    )
+
+    existing_by_url = find_existing_by_source_url(
+        repository=repository,
+        candidate_id=candidate["candidate_id"],
+        source_url=image_url,
+    )
+
+    if existing_by_url:
+        print()
+        print(
+            "An image with this exact source URL is already "
+            "registered for this candidate."
+        )
+        print(
+            "Existing image_id: "
+            f"{existing_by_url.get('image_id')}"
+        )
+        print(
+            "Existing image_status: "
+            f"{existing_by_url.get('image_status')}"
+        )
+        print(
+            "No new product_images row was created."
+        )
+        return
+
+    content, content_type = download_image_bytes(
+        context=context,
+        image_url=image_url,
+        referer_url=page_url,
+    )
+
+    image_hash = calculate_sha256(
+        content
+    )
+
+    hash_matches = find_existing_by_hash(
+        repository=repository,
+        image_hash=image_hash,
+    )
+
+    same_candidate_matches = [
+        match
+        for match in hash_matches
+        if str(match.get("candidate_id"))
+        == str(candidate["candidate_id"])
+    ]
+
+    other_candidate_matches = [
+        match
+        for match in hash_matches
+        if str(match.get("candidate_id"))
+        != str(candidate["candidate_id"])
+    ]
+
+    if same_candidate_matches:
+        print()
+        print(
+            "An image with this exact content hash is already "
+            "registered for this candidate."
+        )
+        print(
+            "Existing image_id: "
+            f"{same_candidate_matches[0].get('image_id')}"
+        )
+        print(
+            "No new product_images row was created."
+        )
+        return
+
+    if other_candidate_matches:
+        raise RuntimeError(
+            "This image's content hash is already linked to a "
+            "different candidate_id="
+            f"{other_candidate_matches[0].get('candidate_id')}. "
+            "Refusing to silently reuse or relink it across "
+            "candidates. Escalate for human review before "
+            "proceeding."
+        )
+
+    extension = determine_extension(
+        content_type=content_type,
+        image_url=image_url,
+    )
+
+    local_path = save_local_cache_copy(
+        candidate_code=candidate["candidate_code"],
+        image_url=image_url,
+        page_url=page_url,
+        reference_id=reference["reference_id"],
+        source_url_id=source["source_url_id"],
+        source_type=reference["source_type"],
+        extraction_method=extraction_method,
+        content=content,
+        content_type=content_type,
+        image_hash=image_hash,
+        extension=extension,
+    )
+
+    storage_path = build_storage_path(
+        candidate_code=candidate["candidate_code"],
+        image_hash=image_hash,
+        extension=extension,
+    )
+
+    already_in_storage = storage_file_exists(
+        repository=repository,
+        storage_path=storage_path,
+    )
+
+    uploaded_in_this_run = False
+
+    if not already_in_storage:
+        upload_storage_bytes(
+            repository=repository,
+            content=content,
+            storage_path=storage_path,
+            content_type=content_type,
+        )
+
+        uploaded_in_this_run = True
+
+    original_file_name = (
+        Path(
+            urlparse(image_url).path
+        ).name
+        or f"image{extension}"
+    )
+
+    payload = build_product_images_payload(
+        candidate=candidate,
+        reference=reference,
+        source=source,
+        image_url=image_url,
+        page_url=page_url,
+        storage_path=storage_path,
+        original_file_name=original_file_name,
+        mime_type=content_type,
+        file_size_bytes=len(content),
+        image_hash=image_hash,
+    )
+
+    try:
+        inserted = insert_product_image(
+            repository=repository,
+            payload=payload,
+        )
+
+    except Exception:
+        if uploaded_in_this_run:
+            print()
+            print(
+                "Database insert failed. Removing the newly "
+                "uploaded Storage file..."
+            )
+
+            try:
+                remove_storage_file(
+                    repository=repository,
+                    storage_path=storage_path,
+                )
+
+                print(
+                    "Storage rollback completed."
+                )
+
+            except Exception as rollback_error:
+                print(
+                    "Warning: Storage rollback failed."
+                )
+                print(
+                    "Rollback error type: "
+                    f"{type(rollback_error).__name__}"
+                )
+                print(
+                    f"Rollback details: {rollback_error}"
+                )
+
+        print()
+        print(
+            "Image download SUCCEEDED but database registration "
+            "FAILED. The downloaded file remains cached locally "
+            f"for recovery: {local_path}"
+        )
+
+        raise
+
+    print()
+    print("=" * 78)
+    print("PRODUCT IMAGE REGISTERED")
+    print("=" * 78)
+    print(
+        f"Image ID: {inserted.get('image_id')}"
+    )
+    print(
+        "Image status: "
+        f"{inserted.get('image_status')}"
+    )
+    print(
+        "Is selected main image: "
+        f"{inserted.get('is_selected_main_image')}"
+    )
+    print(
+        "Is publish eligible: "
+        f"{inserted.get('is_publish_eligible')}"
+    )
+    print(
+        f"Storage path: {inserted.get('storage_path')}"
+    )
+    print(
+        f"Local cache copy: {local_path}"
+    )
+    print()
+    print(
+        "Next step: run review_product_images.py to review and "
+        "potentially select this as the validated main image."
+    )
+
+
 def main() -> None:
     """Download and register one BOOKSTORE product image for one candidate."""
     load_dotenv()
@@ -1150,6 +1495,12 @@ def main() -> None:
         candidate_code=args.candidate_code,
     )
 
+    # Resolve the first (highest-priority) candidate reference up front,
+    # purely so the preflight summary/confirmation prompt has something
+    # concrete to show before Playwright ever launches -- CLAUDE.md
+    # section 8.1's approved fallback (PUBLISHER > AUTHORIZED_SUPPLIER >
+    # BOOKSTORE > FAHASA) is only actually exercised inside the retry
+    # loop below, if this first source's image turns out to be dead.
     reference = resolve_preferred_match_reference(
         repository=repository,
         candidate=candidate,
@@ -1183,8 +1534,10 @@ def main() -> None:
 
     else:
         answer = input(
-            "Type DOWNLOAD to confirm downloading this BOOKSTORE product "
-            "image, or press Enter to cancel: "
+            "Type DOWNLOAD to confirm downloading a BOOKSTORE product "
+            "image for this candidate (other approved reference sources "
+            "may be tried in priority order if the first one's image is "
+            "unavailable), or press Enter to cancel: "
         ).strip().upper()
 
         confirmed = answer == "DOWNLOAD"
@@ -1205,9 +1558,17 @@ def main() -> None:
         )
         return
 
-    page_url = str(
-        source["source_url"]
-    )
+    # CLAUDE.md section 8.1's approved source-priority fallback: try the
+    # highest-priority reference first; if its image turns out to be
+    # unusable (dead link, nothing extractable, a rejected URL --
+    # ImageSourceUnusableError), move to the next eligible reference
+    # instead of failing the candidate outright. Never falls back on any
+    # other kind of error (browser/network/database failures still fail
+    # immediately), never touches match_decision/identity_status, and
+    # never tries a reference this same selection logic would otherwise
+    # have refused.
+    tried_reference_ids: set[str] = set()
+    last_unusable_reason: str | None = None
 
     with sync_playwright() as playwright:
         browser, context = reference_metadata.create_browser(
@@ -1215,276 +1576,72 @@ def main() -> None:
         )
 
         try:
-            (
-                page,
-                _raw_text,
-                _raw_html,
-                _page_title,
-            ) = reference_metadata.collect_page(
-                context=context,
-                source_url=page_url,
-            )
+            while True:
+                if tried_reference_ids:
+                    try:
+                        reference = resolve_preferred_match_reference(
+                            repository=repository,
+                            candidate=candidate,
+                            exclude_reference_ids=frozenset(
+                                tried_reference_ids
+                            ),
+                        )
+                    except RuntimeError as error:
+                        raise RuntimeError(
+                            "No usable image reference remains after "
+                            f"trying {len(tried_reference_ids)} eligible "
+                            f"reference(s); last error: "
+                            f"{last_unusable_reason}"
+                        ) from error
 
-            json_ld_objects = reference_metadata.extract_json_ld(
-                page
-            )
-
-            product_json_ld = reference_metadata.find_product_json_ld(
-                json_ld_objects
-            )
-
-            image_url = reference_metadata.extract_image_url(
-                page=page,
-                product_json_ld=product_json_ld,
-            )
-
-            if not image_url:
-                raise RuntimeError(
-                    "No product image could be extracted from the "
-                    f"BOOKSTORE page: {page_url}"
-                )
-
-            extraction_method = determine_image_extraction_method(
-                product_json_ld=product_json_ld,
-                page=page,
-            )
-
-            rejection_reason = reject_reason_for_image_url(
-                image_url
-            )
-
-            if rejection_reason:
-                raise RuntimeError(
-                    "Extracted image URL was rejected: "
-                    f"{rejection_reason} ({image_url})"
-                )
-
-            print()
-            print("=" * 78)
-            print("IMAGE EXTRACTION RESULT")
-            print("=" * 78)
-            print(
-                f"Extraction method: {extraction_method}"
-            )
-            print(
-                f"Candidate image URL: {image_url}"
-            )
-
-            existing_by_url = find_existing_by_source_url(
-                repository=repository,
-                candidate_id=candidate["candidate_id"],
-                source_url=image_url,
-            )
-
-            if existing_by_url:
-                print()
-                print(
-                    "An image with this exact source URL is already "
-                    "registered for this candidate."
-                )
-                print(
-                    "Existing image_id: "
-                    f"{existing_by_url.get('image_id')}"
-                )
-                print(
-                    "Existing image_status: "
-                    f"{existing_by_url.get('image_status')}"
-                )
-                print(
-                    "No new product_images row was created."
-                )
-                return
-
-            content, content_type = download_image_bytes(
-                context=context,
-                image_url=image_url,
-                referer_url=page_url,
-            )
-
-            image_hash = calculate_sha256(
-                content
-            )
-
-            hash_matches = find_existing_by_hash(
-                repository=repository,
-                image_hash=image_hash,
-            )
-
-            same_candidate_matches = [
-                match
-                for match in hash_matches
-                if str(match.get("candidate_id"))
-                == str(candidate["candidate_id"])
-            ]
-
-            other_candidate_matches = [
-                match
-                for match in hash_matches
-                if str(match.get("candidate_id"))
-                != str(candidate["candidate_id"])
-            ]
-
-            if same_candidate_matches:
-                print()
-                print(
-                    "An image with this exact content hash is already "
-                    "registered for this candidate."
-                )
-                print(
-                    "Existing image_id: "
-                    f"{same_candidate_matches[0].get('image_id')}"
-                )
-                print(
-                    "No new product_images row was created."
-                )
-                return
-
-            if other_candidate_matches:
-                raise RuntimeError(
-                    "This image's content hash is already linked to a "
-                    "different candidate_id="
-                    f"{other_candidate_matches[0].get('candidate_id')}. "
-                    "Refusing to silently reuse or relink it across "
-                    "candidates. Escalate for human review before "
-                    "proceeding."
-                )
-
-            extension = determine_extension(
-                content_type=content_type,
-                image_url=image_url,
-            )
-
-            local_path = save_local_cache_copy(
-                candidate_code=candidate["candidate_code"],
-                image_url=image_url,
-                page_url=page_url,
-                reference_id=reference["reference_id"],
-                source_url_id=source["source_url_id"],
-                source_type=reference["source_type"],
-                extraction_method=extraction_method,
-                content=content,
-                content_type=content_type,
-                image_hash=image_hash,
-                extension=extension,
-            )
-
-            storage_path = build_storage_path(
-                candidate_code=candidate["candidate_code"],
-                image_hash=image_hash,
-                extension=extension,
-            )
-
-            already_in_storage = storage_file_exists(
-                repository=repository,
-                storage_path=storage_path,
-            )
-
-            uploaded_in_this_run = False
-
-            if not already_in_storage:
-                upload_storage_bytes(
-                    repository=repository,
-                    content=content,
-                    storage_path=storage_path,
-                    content_type=content_type,
-                )
-
-                uploaded_in_this_run = True
-
-            original_file_name = (
-                Path(
-                    urlparse(image_url).path
-                ).name
-                or f"image{extension}"
-            )
-
-            payload = build_product_images_payload(
-                candidate=candidate,
-                reference=reference,
-                source=source,
-                image_url=image_url,
-                page_url=page_url,
-                storage_path=storage_path,
-                original_file_name=original_file_name,
-                mime_type=content_type,
-                file_size_bytes=len(content),
-                image_hash=image_hash,
-            )
-
-            try:
-                inserted = insert_product_image(
-                    repository=repository,
-                    payload=payload,
-                )
-
-            except Exception:
-                if uploaded_in_this_run:
-                    print()
-                    print(
-                        "Database insert failed. Removing the newly "
-                        "uploaded Storage file..."
+                    source = resolve_authorized_reference_source(
+                        repository=repository,
+                        source_url_id=reference["source_url_id"],
+                        expected_source_type=reference["source_type"],
                     )
 
-                    try:
-                        remove_storage_file(
-                            repository=repository,
-                            storage_path=storage_path,
-                        )
+                    print()
+                    print(
+                        "Trying next eligible reference: "
+                        f"source_type={reference.get('source_type')!r}, "
+                        f"reference_id={reference.get('reference_id')}."
+                    )
 
-                        print(
-                            "Storage rollback completed."
-                        )
-
-                    except Exception as rollback_error:
-                        print(
-                            "Warning: Storage rollback failed."
-                        )
-                        print(
-                            "Rollback error type: "
-                            f"{type(rollback_error).__name__}"
-                        )
-                        print(
-                            f"Rollback details: {rollback_error}"
-                        )
-
-                print()
-                print(
-                    "Image download SUCCEEDED but database registration "
-                    "FAILED. The downloaded file remains cached locally "
-                    f"for recovery: {local_path}"
+                page_url = str(
+                    source["source_url"]
                 )
 
-                raise
+                try:
+                    attempt_download_for_reference(
+                        repository=repository,
+                        candidate=candidate,
+                        reference=reference,
+                        source=source,
+                        context=context,
+                        page_url=page_url,
+                    )
 
-            print()
-            print("=" * 78)
-            print("PRODUCT IMAGE REGISTERED")
-            print("=" * 78)
-            print(
-                f"Image ID: {inserted.get('image_id')}"
-            )
-            print(
-                f"Image status: {inserted.get('image_status')}"
-            )
-            print(
-                "Is selected main image: "
-                f"{inserted.get('is_selected_main_image')}"
-            )
-            print(
-                "Is publish eligible: "
-                f"{inserted.get('is_publish_eligible')}"
-            )
-            print(
-                f"Storage path: {inserted.get('storage_path')}"
-            )
-            print(
-                f"Local cache copy: {local_path}"
-            )
-            print()
-            print(
-                "Next step: run review_product_images.py to review and "
-                "potentially select this as the validated main image."
-            )
+                except ImageSourceUnusableError as error:
+                    tried_reference_ids.add(
+                        str(reference["reference_id"])
+                    )
+                    last_unusable_reason = str(error)
+
+                    print()
+                    print(
+                        f"Reference {reference.get('reference_id')} "
+                        f"({reference.get('source_type')}) image "
+                        f"unusable: {error}"
+                    )
+                    print(
+                        "Marking this source unusable for image "
+                        "retrieval and trying the next eligible "
+                        "reference, if any. Identity/match_decision are "
+                        "not affected."
+                    )
+                    continue
+
+                break
 
         finally:
             context.close()

@@ -850,42 +850,86 @@ def verify_wordpress_media(
     return response.status_code == 200
 
 
+def _matches_jpeg_signature(image_bytes: bytes) -> bool:
+    return image_bytes.startswith(b"\xff\xd8\xff")
+
+
+def _matches_png_signature(image_bytes: bytes) -> bool:
+    return image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def _matches_webp_signature(image_bytes: bytes) -> bool:
+    return (
+        len(image_bytes) >= 12
+        and image_bytes[0:4] == b"RIFF"
+        and image_bytes[8:12] == b"WEBP"
+    )
+
+
+# Checked in this order so a RIFF/WEBP container is never mistaken for a
+# JPEG/PNG (their signatures are mutually exclusive prefixes, so order
+# does not actually matter for correctness -- kept alongside
+# SUPPORTED_IMAGE_TYPES' own key order for readability only).
+_IMAGE_SIGNATURE_CHECKS = (
+    ("image/jpeg", _matches_jpeg_signature),
+    ("image/png", _matches_png_signature),
+    ("image/webp", _matches_webp_signature),
+)
+
+
+def sniff_image_content_type(image_bytes: bytes) -> str | None:
+    """
+    Detect a downloaded file's real image type from its magic bytes,
+    independent of any declared or extension-guessed Content-Type.
+
+    Returns None when the bytes match none of SUPPORTED_IMAGE_TYPES'
+    signatures -- an HTML error page, a truncated download, or any other
+    malformed/untrusted payload never matches and is never guessed at.
+    """
+    for mime_type, matches in _IMAGE_SIGNATURE_CHECKS:
+        if matches(image_bytes):
+            return mime_type
+
+    return None
+
+
 def validate_image_signature(
     image_bytes: bytes,
     content_type: str,
-) -> None:
-    """Perform a basic image file signature validation."""
-    if content_type == "image/jpeg":
-        is_valid = image_bytes.startswith(
-            b"\xff\xd8\xff"
-        )
+) -> str:
+    """
+    Validate one downloaded image's real byte signature and return the
+    authoritative content type to use for the WordPress media upload
+    (file extension, Content-Type header) from here on.
 
-    elif content_type == "image/png":
-        is_valid = image_bytes.startswith(
-            b"\x89PNG\r\n\x1a\n"
-        )
+    Content sniffing is authoritative over the declared/extension-guessed
+    `content_type`: a source server or CDN can mislabel a genuinely valid
+    image (e.g. serving real JPEG bytes behind a proxy that always
+    declares "image/webp") -- rejecting a real, decodable cover image
+    solely because of a header/extension mismatch would incorrectly
+    block a usable source. This never trusts `content_type` blindly and
+    never accepts anything short of an exact, supported image signature
+    match: an HTML error page or other malformed/untrusted payload is
+    still rejected outright, regardless of what Content-Type it claims,
+    exactly as strictly as the original declared-type-only check did.
+    """
+    sniffed_type = sniff_image_content_type(image_bytes)
 
-    elif content_type == "image/webp":
-        is_valid = (
-            len(image_bytes) >= 12
-            and image_bytes[0:4] == b"RIFF"
-            and image_bytes[8:12] == b"WEBP"
-        )
-
-    else:
-        is_valid = False
-
-    if not is_valid:
+    if sniffed_type is None:
         raise WordPressMediaError(
             error_code="INVALID_IMAGE_SIGNATURE",
             error_message=(
-                "The downloaded file does not match its image MIME type."
+                "The downloaded file does not match any supported image "
+                "signature (JPEG/PNG/WEBP magic bytes) -- rejecting as "
+                "an invalid or untrusted payload."
             ),
             response_payload={
-                "content_type": content_type,
+                "declared_content_type": content_type,
                 "first_bytes": image_bytes[:20].hex(),
             },
         )
+
+    return sniffed_type
 
 
 def download_source_image_from_supabase(
@@ -1015,18 +1059,32 @@ def download_source_image_from_supabase(
             },
         )
 
-    validate_image_signature(
+    # sniff_image_content_type()'s result is authoritative from here on --
+    # never the declared/guessed content_type computed above, which a
+    # source server can mislabel (see validate_image_signature's own
+    # docstring). This is what makes an accepted-but-mislabeled image
+    # (e.g. real JPEG bytes served as "image/webp") get the *correct*
+    # extension and WordPress Content-Type header, not the wrong one.
+    authoritative_content_type = validate_image_signature(
         image_bytes=image_bytes,
         content_type=content_type,
     )
 
+    if authoritative_content_type != content_type:
+        print(
+            "Declared/guessed Content-Type "
+            f"({content_type!r}) did not match the file's real "
+            f"signature -- using sniffed type {authoritative_content_type!r} "
+            "instead."
+        )
+
     print(
-        f"Validated MIME type: {content_type}"
+        f"Validated MIME type: {authoritative_content_type}"
     )
 
     return (
         image_bytes,
-        content_type,
+        authoritative_content_type,
     )
 
 
