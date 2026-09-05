@@ -35,12 +35,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from create_internal_product import is_historical_candidate_code  # noqa: E402
+from prepare_product_content import (  # noqa: E402
+    build_safe_draft,
+    is_generic_safe_draft,
+)
 from src.domain.content_status import InternalProductContentStatus
 from src.domain.decisions import DecisionResult, Outcome
 from src.domain.identity_status import IdentityStatus, MatchDecision
 from src.domain.image_status import InternalProductImageStatus
 from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
-from src.domain.rules import image_rules, readiness_rules
+from src.domain.rules import content_rules, image_rules, readiness_rules
 from src.domain.woocommerce_status import WooCommerceStatus, WooCommerceSyncStatus
 from src.repositories.supabase_repository import SupabaseRepository  # noqa: E402
 from src.services.historical_image_extraction import (  # noqa: E402
@@ -95,6 +99,7 @@ DERIVED_STATES = {
     "IMAGE_REFERENCE_FALLBACK_PENDING_HISTORICAL",
     "IMAGE_CAPABILITY_UNAVAILABLE",
     "IMAGE_GROUP_OWNERSHIP_AMBIGUOUS",
+    "CONTENT_REVISE_PENDING_HISTORICAL",
     "IMAGE_VALIDATED",
     "READY_FOR_DRAFT",
     "READY_FOR_DRAFT_HISTORICAL",
@@ -772,6 +777,48 @@ def _derive_image_content_state(
     # DRAFTED, REVIEW_REQUIRED, APPROVED) -- kept as a defensive literal
     # rather than invented as a domain constant that would not exist.
     if content_status in (InternalProductContentStatus.REVIEW_REQUIRED, "REJECTED"):
+        # Historical-migration draft-safe content auto-enrichment
+        # (CLAUDE.md 6.2/15): when the sole reason content is stuck at
+        # REVIEW_REQUIRED is that it is still the generic metadata-only
+        # safe draft (never a boilerplate/other content_rules failure --
+        # is_generic_safe_draft() recomputes the exact same comparison
+        # prepare_product_content.py's own APPROVE path already used to
+        # decline it), and a draft-safe reference description exists,
+        # this is automatable -- no human judgment is needed to notice
+        # that verified source material is available and unused.
+        vi_content = next(
+            (
+                content
+                for content in bundle["contents"]
+                if content.get("content_language") == "vi"
+            ),
+            None,
+        )
+
+        if (
+            is_historical_candidate_code(candidate_code)
+            and vi_content is not None
+            and content_status == InternalProductContentStatus.REVIEW_REQUIRED
+        ):
+            generated = build_safe_draft(internal_product)
+
+            if is_generic_safe_draft(content=vi_content, generated=generated):
+                content_selection = (
+                    content_rules.select_historical_draft_safe_content_reference(
+                        candidate=candidate,
+                        references=bundle["references"],
+                    )
+                )
+
+                if content_selection.outcome == Outcome.AUTO_PASS:
+                    return CandidateState(
+                        candidate_code=candidate_code,
+                        candidate_id=candidate_id,
+                        product_code=product_code,
+                        derived_state="CONTENT_REVISE_PENDING_HISTORICAL",
+                        warnings=warnings,
+                    )
+
         review_notes = _vietnamese_content_review_notes(bundle["contents"])
 
         return CandidateState(

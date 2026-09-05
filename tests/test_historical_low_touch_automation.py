@@ -5,9 +5,9 @@ this change:
           len(images) == 1).
   Part 2: FB-HIST-only draft-safe image-reference fallback, decoupled from
           match_decision == MATCH.
-  Part 4: pipeline_state.py/run_batch.py dispatch reachability for the
-          image-side gaps above (the content-side gap, Part 3, is covered
-          separately once its own commit lands).
+  Part 3: FB-HIST-only generic-content auto-revision/approval.
+  Part 4: pipeline_state.py/run_batch.py dispatch reachability for all of
+          the above.
 
 No live Supabase/filesystem/Playwright dependency anywhere in this file --
 FakeSupabaseRepository backs every read/write, and
@@ -21,13 +21,16 @@ from typing import Any
 import pytest
 
 import pipeline_state
+import prepare_product_content
 from pipeline_state import derive_candidate_state, load_candidate_bundle
+from prepare_product_content import build_safe_draft, run_auto_revise_action
 from src.domain.decisions import Outcome
-from src.domain.rules import image_rules
+from src.domain.rules import content_rules, image_rules
 from src.domain.rules.image_rules import (
     is_historical_reference_image_draft_safe,
     select_historical_draft_safe_image_reference,
 )
+from src.domain.rules.content_rules import select_historical_draft_safe_content_reference
 
 from support.fake_supabase import FakeSupabaseRepository
 
@@ -405,3 +408,228 @@ def test_ambiguous_group_image_stays_human_gate_when_no_fallback_available(
     assert state.human_gate is True
     assert "reference-image fallback was also attempted" in state.human_gate_reason
 
+
+# ===========================================================================
+# Part 3: FB-HIST-only generic-content auto-revision (tests 9-14)
+# ===========================================================================
+
+
+def _generic_content_row(product: dict[str, Any]) -> dict[str, Any]:
+    generated = build_safe_draft(product)
+    return {
+        "product_content_id": "content-lowtouch-1",
+        "internal_product_id": product["internal_product_id"],
+        "content_language": "vi",
+        **generated,
+        "content_status": "REVIEW_REQUIRED",
+        "review_required": True,
+        "review_notes": (
+            "Automatic approval declined: Content is still the generic "
+            "metadata-only safe draft."
+        ),
+        "generation_method": "RULE_BASED",
+    }
+
+
+def test_generic_historical_content_dispatches_auto_revise():
+    """(9) Generic historical content: auto-REVISE dispatched. When a
+    draft-safe reference description is available, the state is
+    CONTENT_REVISE_PENDING_HISTORICAL (automatable), not the human-gated
+    CONTENT_REVIEW_REQUIRED."""
+    candidate = _historical_candidate()
+    internal_product = _internal_product(
+        content_status="REVIEW_REQUIRED", image_status="APPROVED"
+    )
+    content = _generic_content_row(internal_product)
+    reference = _reference()
+    repository = _repository(
+        candidate,
+        internal_product,
+        contents=[content],
+        references=[reference],
+    )
+
+    bundle = load_candidate_bundle(repository, HIST_CANDIDATE_CODE)
+    state = derive_candidate_state(bundle)
+
+    assert state.derived_state == "CONTENT_REVISE_PENDING_HISTORICAL"
+    assert state.human_gate is False
+
+
+def test_auto_revise_action_approves_valid_enrichment():
+    """(10) Revised valid content: auto-APPROVED. run_auto_revise_action()
+    builds enriched content from the reference description and it passes
+    the exact same deterministic APPROVE validation a human would."""
+    candidate = _historical_candidate()
+    internal_product = _internal_product(
+        content_status="REVIEW_REQUIRED", image_status="APPROVED"
+    )
+    content = _generic_content_row(internal_product)
+    reference = _reference()
+    repository = _repository(
+        candidate,
+        internal_product,
+        contents=[content],
+        references=[reference],
+    )
+
+    result = run_auto_revise_action(
+        repository=repository,
+        product_code=internal_product["product_code"],
+        non_interactive=True,
+        confirm_revise=True,
+    )
+
+    assert result["content_status"] == "APPROVED"
+    assert result["review_required"] is False
+    assert "Đắc Nhân Tâm là cuốn sách kinh điển" in result["long_description"]
+
+    # Only ever one product_contents row for this product -- REVISE/
+    # AUTO_REVISE update in place, never insert a second row.
+    assert len(repository.client.tables["product_contents"]) == 1
+
+    internal_row = repository.client.tables["internal_products"][0]
+    assert internal_row["content_status"] == "APPROVED"
+
+
+def test_conflicting_content_reference_remains_human_review():
+    """(11) Conflicting/unsupported content: remains human review. A
+    reference with a conflicting ISBN can never enrich the draft
+    automatically -- the candidate stays at the human-gated
+    CONTENT_REVIEW_REQUIRED, and run_auto_revise_action() itself refuses."""
+    candidate = _historical_candidate(verified_isbn="9786041234567")
+    internal_product = _internal_product(
+        content_status="REVIEW_REQUIRED", image_status="APPROVED"
+    )
+    content = _generic_content_row(internal_product)
+    reference = _reference(reference_isbn="9781234567897")
+    repository = _repository(
+        candidate,
+        internal_product,
+        contents=[content],
+        references=[reference],
+    )
+
+    bundle = load_candidate_bundle(repository, HIST_CANDIDATE_CODE)
+    state = derive_candidate_state(bundle)
+
+    assert state.derived_state == "CONTENT_REVIEW_REQUIRED"
+    assert state.human_gate is True
+
+    selection = select_historical_draft_safe_content_reference(candidate, [reference])
+    assert selection.outcome == Outcome.BLOCKED
+
+    with pytest.raises(RuntimeError, match="No draft-safe reference"):
+        run_auto_revise_action(
+            repository=repository,
+            product_code=internal_product["product_code"],
+            non_interactive=True,
+            confirm_revise=True,
+        )
+
+
+def test_auto_revise_rerun_produces_no_duplicate_content_row():
+    """(12) Rerun: no duplicate image/content rows. Running AUTO_REVISE
+    again after content is already APPROVED must refuse (REVISE never
+    touches APPROVED content) rather than insert a second row or
+    silently redo the write."""
+    candidate = _historical_candidate()
+    internal_product = _internal_product(
+        content_status="REVIEW_REQUIRED", image_status="APPROVED"
+    )
+    content = _generic_content_row(internal_product)
+    reference = _reference()
+    repository = _repository(
+        candidate,
+        internal_product,
+        contents=[content],
+        references=[reference],
+    )
+
+    run_auto_revise_action(
+        repository=repository,
+        product_code=internal_product["product_code"],
+        non_interactive=True,
+        confirm_revise=True,
+    )
+    assert len(repository.client.tables["product_contents"]) == 1
+
+    with pytest.raises(RuntimeError, match="REVISE refuses to modify APPROVED content"):
+        run_auto_revise_action(
+            repository=repository,
+            product_code=internal_product["product_code"],
+            non_interactive=True,
+            confirm_revise=True,
+        )
+
+    # Still exactly one content row, and it is still APPROVED -- the
+    # rerun changed nothing.
+    assert len(repository.client.tables["product_contents"]) == 1
+    assert repository.client.tables["product_contents"][0]["content_status"] == "APPROVED"
+
+
+def test_auto_revise_never_regresses_approved_content():
+    """(13) No status regression: AUTO_REVISE must never be reachable
+    against an already-APPROVED content row, mirroring REVISE's own
+    APPROVED-content protection (CLAUDE.md section 2.7)."""
+    candidate = _historical_candidate()
+    internal_product = _internal_product(content_status="APPROVED")
+    content = _generic_content_row(internal_product)
+    content["content_status"] = "APPROVED"
+    content["review_required"] = False
+    reference = _reference()
+    repository = _repository(
+        candidate,
+        internal_product,
+        contents=[content],
+        references=[reference],
+    )
+
+    with pytest.raises(RuntimeError, match="REVISE refuses to modify APPROVED content"):
+        run_auto_revise_action(
+            repository=repository,
+            product_code=internal_product["product_code"],
+            non_interactive=True,
+            confirm_revise=True,
+        )
+
+    assert repository.client.tables["product_contents"][0]["content_status"] == "APPROVED"
+
+
+def test_live_candidate_content_never_auto_revised():
+    """(14) No change to FB-2026-* behavior. A live candidate's generic
+    REVIEW_REQUIRED content must never derive as CONTENT_REVISE_PENDING_
+    HISTORICAL, and --action AUTO_REVISE must refuse it outright."""
+    candidate = _historical_candidate(
+        candidate_id=LIVE_CANDIDATE_ID,
+        candidate_code=LIVE_CANDIDATE_CODE,
+        source_evidence={},
+    )
+    internal_product = _internal_product(
+        candidate_id=LIVE_CANDIDATE_ID,
+        product_code="TSYC-" + LIVE_CANDIDATE_CODE,
+        content_status="REVIEW_REQUIRED",
+        image_status="APPROVED",
+    )
+    content = _generic_content_row(internal_product)
+    reference = _reference(candidate_id=LIVE_CANDIDATE_ID)
+    repository = _repository(
+        candidate,
+        internal_product,
+        contents=[content],
+        references=[reference],
+    )
+
+    bundle = load_candidate_bundle(repository, LIVE_CANDIDATE_CODE)
+    state = derive_candidate_state(bundle)
+
+    assert state.derived_state == "CONTENT_REVIEW_REQUIRED"
+    assert state.human_gate is True
+
+    with pytest.raises(RuntimeError, match="only available for FB-HIST"):
+        run_auto_revise_action(
+            repository=repository,
+            product_code=internal_product["product_code"],
+            non_interactive=True,
+            confirm_revise=True,
+        )

@@ -10,8 +10,10 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from create_internal_product import is_historical_candidate_code
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.content_status import ContentStatus
+from src.domain.decisions import Outcome
 from src.domain.rules import content_rules
 from src.repositories.supabase_repository import SupabaseRepository
 
@@ -19,8 +21,14 @@ configure_utf8_console()
 
 
 GENERATOR_NAME = "internal_product_content_generator"
-GENERATOR_VERSION = "1.4.0"
-VALID_ACTIONS = {"PREVIEW", "SAVE", "APPROVE", "REVISE", "SKIP"}
+GENERATOR_VERSION = "1.5.0"
+VALID_ACTIONS = {"PREVIEW", "SAVE", "APPROVE", "REVISE", "AUTO_REVISE", "SKIP"}
+
+# Minimum length of an excerpt used as short_description/seo_description
+# when auto-enriching from a reference description -- short enough to stay
+# a summary, long enough to be meaningfully distinct from the generic
+# safe-draft placeholder text.
+_AUTO_ENRICH_EXCERPT_LENGTH = 200
 
 # Customer-facing product_contents fields a human reviewer is allowed to
 # revise through --action REVISE. product_name and author_summary are
@@ -91,7 +99,7 @@ def parse_arguments() -> argparse.Namespace:
         "--action",
         choices=sorted(VALID_ACTIONS),
         type=str.upper,
-        help="PREVIEW, SAVE, APPROVE, REVISE, or SKIP.",
+        help="PREVIEW, SAVE, APPROVE, REVISE, AUTO_REVISE, or SKIP.",
     )
     parser.add_argument(
         "--non-interactive",
@@ -820,8 +828,12 @@ def validate_revise_target(
     """
     Enforce the REVISE safety gates on the existing content row.
 
-    REVISE only ever updates an existing DRAFTED row. It never creates a
-    second content row, and it never touches APPROVED or REJECTED content.
+    REVISE only ever updates an existing DRAFTED or REVIEW_REQUIRED row
+    (CLAUDE.md section 15.2: "refuse APPROVED/REJECTED rows" -- REVIEW_
+    REQUIRED is explicitly not in that refuse list, since REVISE is the
+    normal way a reviewer's edit resolves a REVIEW_REQUIRED content row).
+    It never creates a second content row, and it never touches APPROVED
+    or REJECTED content.
     """
     if existing is None:
         raise RuntimeError(
@@ -843,9 +855,10 @@ def validate_revise_target(
             "REVISE refuses to modify REJECTED content."
         )
 
-    if status != ContentStatus.DRAFTED:
+    if status not in (ContentStatus.DRAFTED, ContentStatus.REVIEW_REQUIRED):
         raise RuntimeError(
-            f"REVISE requires content_status=DRAFTED, got {status!r}."
+            "REVISE requires content_status=DRAFTED or REVIEW_REQUIRED, "
+            f"got {status!r}."
         )
 
     return existing
@@ -1073,6 +1086,270 @@ def run_revise_action(
     return result
 
 
+def get_candidate_for_product(
+    repository: SupabaseRepository,
+    candidate_id: str,
+) -> dict[str, Any]:
+    """Return the exact product_candidates row linked to one internal product."""
+    response = (
+        repository.client
+        .table("product_candidates")
+        .select(
+            "candidate_id,"
+            "candidate_code,"
+            "candidate_type,"
+            "extracted_title,"
+            "verified_title,"
+            "verified_isbn,"
+            "possible_isbn,"
+            "verified_author,"
+            "verified_publisher,"
+            "identity_status"
+        )
+        .eq("candidate_id", candidate_id)
+        .limit(2)
+        .execute()
+    )
+
+    rows = response.data or []
+
+    if len(rows) != 1:
+        raise RuntimeError(
+            "candidate_id did not resolve to exactly one product_candidates "
+            f"row: {candidate_id}"
+        )
+
+    return rows[0]
+
+
+def get_references_for_candidate(
+    repository: SupabaseRepository,
+    candidate_id: str,
+) -> list[dict[str, Any]]:
+    """Return every product_references row for one candidate."""
+    response = (
+        repository.client
+        .table("product_references")
+        .select(
+            "reference_id,"
+            "candidate_id,"
+            "source_type,"
+            "source_url_id,"
+            "match_decision,"
+            "reference_title,"
+            "reference_isbn,"
+            "reference_author,"
+            "reference_publisher,"
+            "reference_description"
+        )
+        .eq("candidate_id", candidate_id)
+        .execute()
+    )
+
+    return response.data or []
+
+
+def excerpt(text: str, max_length: int) -> str:
+    """Trim `text` to at most max_length characters, at a word boundary."""
+    cleaned = clean_text(text) or ""
+
+    if len(cleaned) <= max_length:
+        return cleaned
+
+    truncated = cleaned[:max_length].rsplit(" ", 1)[0].strip()
+    return f"{truncated}…" if truncated else cleaned[:max_length]
+
+
+def build_historical_enrichment_content(
+    generated: dict[str, Any],
+    product: dict[str, Any],
+    reference_description: str,
+    reference_source_type: str,
+) -> dict[str, Any]:
+    """
+    Build enriched short/long/SEO description fields for an FB-HIST
+    candidate's generic draft, from an already-verified, non-conflicting
+    reference description (content_rules.select_historical_draft_safe_
+    content_reference already confirmed eligibility -- this function only
+    formats the text, it never re-decides eligibility).
+
+    Reuses the exact reference_description text collected by collect_
+    reference_metadata.py from an approved source -- never invents new
+    prose. product_name, author_summary, and product_details are carried
+    over unchanged from the existing safe draft (verified-metadata-only
+    fields; enrichment only ever touches the descriptive/SEO fields).
+    """
+    title = clean_text(product.get("title")) or ""
+    author = clean_text(product.get("author"))
+    author_phrase = f" của {author}" if author else ""
+    description_text = clean_text(reference_description) or ""
+
+    enriched = dict(generated)
+    enriched["short_description"] = (
+        f"“{title}”{author_phrase} là ấn phẩm đang có tại Tiệm Sách Yêu Con. "
+        + excerpt(description_text, _AUTO_ENRICH_EXCERPT_LENGTH)
+    )
+    enriched["long_description"] = (
+        f"“{title}”{author_phrase} hiện có tại Tiệm Sách Yêu Con.\n\n"
+        f"{description_text}\n\n"
+        f"(Mô tả tham khảo từ nguồn {reference_source_type} đã được xác minh.)"
+    )
+    enriched["seo_description"] = (
+        f"{title}"
+        + (f" của {author}" if author else "")
+        + " – "
+        + excerpt(description_text, 120)
+    )
+    return enriched
+
+
+def run_auto_revise_action(
+    repository: SupabaseRepository,
+    product_code: str | None,
+    non_interactive: bool,
+    confirm_revise: bool,
+) -> dict[str, Any] | None:
+    """
+    Run --action AUTO_REVISE end to end: for an FB-HIST candidate whose
+    content is still the generic metadata-only safe draft, deterministically
+    enrich it from an already-verified, non-conflicting reference
+    description, then run the exact same deterministic APPROVE validation
+    as a human-triggered --action APPROVE would (attempt_content_approval)
+    -- APPROVED if it passes, REVIEW_REQUIRED (never a crash) if it does
+    not. Live (non-historical) candidates are refused outright.
+
+    This never invents content: the enrichment source is always an
+    existing reference_description already collected from an approved
+    source (CLAUDE.md 2.2/15.1), and every validation APPROVE already
+    enforces (generic-draft check, internal-boilerplate check) still runs
+    before anything is marked APPROVED.
+    """
+    if not product_code:
+        raise RuntimeError(
+            "--action AUTO_REVISE requires --product-code (exact "
+            "targeting only)."
+        )
+
+    if non_interactive and not confirm_revise:
+        raise RuntimeError(
+            "--non-interactive --action AUTO_REVISE requires "
+            "--confirm-revise."
+        )
+
+    product, existing = get_content_for_exact_product(
+        repository=repository,
+        product_code=product_code,
+    )
+    candidate = get_candidate_for_product(
+        repository=repository,
+        candidate_id=product["candidate_id"],
+    )
+
+    if not is_historical_candidate_code(candidate.get("candidate_code")):
+        raise RuntimeError(
+            "--action AUTO_REVISE is only available for FB-HIST "
+            "candidates under the historical draft-safe policy. "
+            f"{candidate.get('candidate_code')!r} is a live-pipeline "
+            "candidate -- use --action REVISE with a human-reviewed "
+            "--content-file instead."
+        )
+
+    existing = validate_revise_target(existing)
+
+    generated = build_safe_draft(product)
+
+    if not is_generic_safe_draft(content=existing, generated=generated):
+        raise RuntimeError(
+            "AUTO_REVISE only applies when content is still the generic "
+            "metadata-only safe draft. This content has already been "
+            "edited -- use --action APPROVE, or --action REVISE with a "
+            "human-reviewed --content-file, instead."
+        )
+
+    references = get_references_for_candidate(
+        repository=repository,
+        candidate_id=product["candidate_id"],
+    )
+    selection = content_rules.select_historical_draft_safe_content_reference(
+        candidate=candidate,
+        references=references,
+    )
+
+    if selection.outcome != Outcome.AUTO_PASS:
+        raise RuntimeError(
+            f"[{selection.rule_code}] No draft-safe reference description "
+            f"is available for auto-enrichment: {selection.reason}"
+        )
+
+    enriched_content = build_historical_enrichment_content(
+        generated=generated,
+        product=product,
+        reference_description=selection.evidence["reference_description"],
+        reference_source_type=selection.evidence["source_type"],
+    )
+
+    print()
+    print("=" * 78)
+    print("AUTO-REVISE PREVIEW (historical draft-safe enrichment)")
+    print("=" * 78)
+    print(f"Product code: {product.get('product_code')}")
+    print(f"Source reference: {selection.evidence['reference_id']}")
+    print(f"Source type: {selection.evidence['source_type']}")
+
+    result, declined_reason = attempt_content_approval(
+        repository=repository,
+        product=product,
+        existing=existing,
+        content=enriched_content,
+        generated=generated,
+        non_interactive=True,
+    )
+
+    try:
+        repository.write_process_log(
+            message=(
+                "Historical draft-safe auto-enrichment applied to "
+                f"{product.get('product_code')} from reference "
+                f"{selection.evidence['reference_id']} "
+                f"(source_type={selection.evidence['source_type']})."
+            ),
+            process_name="prepare_product_content",
+            candidate_id=product.get("candidate_id"),
+            process_step="AUTO_REVISE",
+            log_level="INFO",
+            status=(
+                "APPROVED" if declined_reason is None else "REVIEW_REQUIRED"
+            ),
+        )
+    except Exception as error:
+        print()
+        print(
+            "Warning: auto-revision was saved, but writing the "
+            "process_logs audit entry failed."
+        )
+        print(f"Audit log error type: {type(error).__name__}")
+        print(f"Audit log error details: {error}")
+
+    print()
+    print("=" * 78)
+    print("PRODUCT CONTENT RESULT")
+    print("=" * 78)
+    print(f"Content ID: {result.get('product_content_id')}")
+    print(f"Content status: {result.get('content_status')}")
+    print(f"Review required: {result.get('review_required')}")
+
+    if declined_reason is not None:
+        print(
+            "Automatic content approval was declined "
+            f"({declined_reason}); routed to REVIEW_REQUIRED for human "
+            "review."
+        )
+    else:
+        print("Historical draft-safe auto-enrichment approved.")
+
+    return result
+
+
 def resolve_action(
     args: argparse.Namespace,
 ) -> str:
@@ -1088,7 +1365,7 @@ def resolve_action(
         return normalize_confirmation(args.action)
 
     value = input(
-        "Type PREVIEW, SAVE, APPROVE, REVISE, or SKIP: "
+        "Type PREVIEW, SAVE, APPROVE, REVISE, AUTO_REVISE, or SKIP: "
     )
     return normalize_confirmation(value)
 
@@ -1109,7 +1386,8 @@ def main() -> None:
 
     if action not in VALID_ACTIONS:
         print(
-            "Invalid action. Use PREVIEW, SAVE, APPROVE, REVISE, or SKIP."
+            "Invalid action. Use PREVIEW, SAVE, APPROVE, REVISE, "
+            "AUTO_REVISE, or SKIP."
         )
         return
 
@@ -1118,6 +1396,15 @@ def main() -> None:
             repository=repository,
             product_code=args.product_code,
             content_file=args.content_file,
+            non_interactive=args.non_interactive,
+            confirm_revise=args.confirm_revise,
+        )
+        return
+
+    if action == "AUTO_REVISE":
+        run_auto_revise_action(
+            repository=repository,
+            product_code=args.product_code,
             non_interactive=args.non_interactive,
             confirm_revise=args.confirm_revise,
         )

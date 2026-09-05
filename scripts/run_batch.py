@@ -246,6 +246,32 @@ AUTOMATABLE_DISPATCH: dict[str, DispatchEntry] = {
             "failing the stage or stopping any other candidate."
         ),
     ),
+    # Historical-migration draft-safe content auto-enrichment (CLAUDE.md
+    # section 6.2/15). pipeline_state.py only reaches this state when the
+    # sole reason content is stuck at REVIEW_REQUIRED is the generic-
+    # draft-only decline AND content_rules.select_historical_draft_safe_
+    # content_reference() already found exactly one draft-safe reference
+    # description -- prepare_product_content.py --action AUTO_REVISE
+    # re-resolves and re-validates the same selection itself, then runs
+    # the exact same deterministic APPROVE checks a human --action
+    # APPROVE would (never a silent auto-approval of unsupported content).
+    "CONTENT_REVISE_PENDING_HISTORICAL": DispatchEntry(
+        script="prepare_product_content.py",
+        build_args=lambda state: [
+            "--product-code",
+            state.product_code,
+            "--action",
+            "AUTO_REVISE",
+            "--non-interactive",
+            "--confirm-revise",
+        ],
+        description=(
+            "Auto-enrich this historical candidate's generic content "
+            "draft from a draft-safe reference description, then attempt "
+            "automatic approval under the same deterministic validation "
+            "as a human APPROVE."
+        ),
+    ),
     "IMAGE_VALIDATED": DispatchEntry(
         script="check_draft_readiness.py",
         build_args=lambda state: [

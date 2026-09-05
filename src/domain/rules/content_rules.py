@@ -21,9 +21,13 @@ See docs/TSYC_DECISION_MATRIX.md for the full specification.
 from __future__ import annotations
 
 import re
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from src.domain.decisions import DecisionResult, Outcome
+from src.domain.identity_status import MatchDecision
+from src.domain.reference_sources import REFERENCE_SOURCE_PRIORITY
+from src.domain.rules.identity_rules import reference_business_conflict_reason
 
 # --- rule codes ----------------------------------------------------
 
@@ -33,6 +37,30 @@ CONTENT_INTERNAL_BOILERPLATE = "CONTENT_INTERNAL_BOILERPLATE"
 CONTENT_UNSUPPORTED_CLAIM = "CONTENT_UNSUPPORTED_CLAIM"
 CONTENT_REFERENCE_CONFLICT = "CONTENT_REFERENCE_CONFLICT"
 CONTENT_SAFE_APPROVAL = "CONTENT_SAFE_APPROVAL"
+# Historical-migration draft-safe content auto-enrichment (CLAUDE.md
+# section 6.2/15) -- see select_historical_draft_safe_content_reference().
+CONTENT_REFERENCE_DRAFT_SAFE_SELECTED = "CONTENT_REFERENCE_DRAFT_SAFE_SELECTED"
+CONTENT_REFERENCE_NONE_DRAFT_SAFE = "CONTENT_REFERENCE_NONE_DRAFT_SAFE"
+
+# A reference description shorter than this is treated as too thin to
+# meaningfully identify the product -- CLAUDE.md 15.3 "description cannot
+# identify the product meaningfully" is a human-review reason, not
+# something this function silently accepts.
+_MIN_USABLE_DESCRIPTION_LENGTH = 40
+
+_DRAFT_SAFE_MATCH_DECISIONS = (
+    MatchDecision.MATCH,
+    MatchDecision.POSSIBLE_MATCH,
+    MatchDecision.MANUAL_REVIEW,
+)
+
+_MATCH_DECISION_RANK = MappingProxyType(
+    {
+        MatchDecision.MATCH: 0,
+        MatchDecision.POSSIBLE_MATCH: 1,
+        MatchDecision.MANUAL_REVIEW: 2,
+    }
+)
 
 # CLAUDE.md section 15.1's exact forbidden examples, plus close variants.
 # Deliberately conservative substring/regex matching -- a false positive
@@ -258,4 +286,110 @@ def evaluate_safe_approval(
         "approved automatically.",
         warnings=all_warnings,
         evidence={"passed_rule_codes": tuple(c.rule_code for c in checks)},
+    )
+
+
+# --- historical draft-safe content auto-enrichment (CLAUDE.md 6.2/15) ------
+#
+# For an FB-HIST candidate whose content is still the generic metadata-
+# only safe draft (prepare_product_content.py's is_generic_safe_draft()),
+# normal enrichment should not require human review when a reference
+# already carries verified, non-conflicting descriptive text -- CLAUDE.md
+# section 2.2/15.1: content must be based only on verified data, never
+# invented. This never applies to a live (non-historical) candidate; no
+# caller in this codebase reaches it for one.
+
+
+def select_historical_draft_safe_content_reference(
+    candidate: dict[str, Any],
+    references: Sequence[dict[str, Any]],
+) -> DecisionResult:
+    """
+    FB-HIST-only: deterministically pick one reference whose
+    reference_description can safely enrich this candidate's generic
+    content draft, without requiring match_decision==MATCH.
+
+    A reference is eligible only when all of these hold:
+      - match_decision is MATCH, POSSIBLE_MATCH, or MANUAL_REVIEW
+      - source_type is a recognized reference source
+        (REFERENCE_SOURCE_PRIORITY)
+      - reference_description exists and is at least
+        _MIN_USABLE_DESCRIPTION_LENGTH characters (not too thin to
+        meaningfully identify the product)
+      - no ISBN/title/publisher/author/sellable-unit conflict with the
+        candidate (identity_rules.reference_business_conflict_reason) --
+        the same shared check image_rules.
+        is_historical_reference_image_draft_safe uses, so "source
+        evidence conflicts" and "wrong sellable unit" are refused
+        identically for images and content.
+
+    Ranking mirrors image_rules.select_historical_draft_safe_image_
+    reference(): canonical source priority first, then a same-priority
+    tie prefers a real MATCH over POSSIBLE_MATCH/MANUAL_REVIEW.
+
+    Never invents a description -- evidence["reference_description"] is
+    always the exact, unmodified text already collected and stored by
+    collect_reference_metadata.py from an approved source. Never decides
+    match_decision or identity_status.
+    """
+    candidates_for_selection = [
+        reference
+        for reference in references
+        if reference.get("match_decision") in _DRAFT_SAFE_MATCH_DECISIONS
+        and reference.get("source_type") in REFERENCE_SOURCE_PRIORITY
+        and len(str(reference.get("reference_description") or "").strip())
+        >= _MIN_USABLE_DESCRIPTION_LENGTH
+    ]
+
+    passing: list[tuple[dict[str, Any], str | None]] = []
+
+    for reference in candidates_for_selection:
+        conflict_reason = reference_business_conflict_reason(candidate, reference)
+
+        if conflict_reason is None:
+            passing.append((reference, None))
+
+    if not passing:
+        return DecisionResult(
+            outcome=Outcome.BLOCKED,
+            rule_code=CONTENT_REFERENCE_NONE_DRAFT_SAFE,
+            reason=(
+                "No reference has a usable, non-conflicting description "
+                f"for auto-enrichment (checked {len(candidates_for_selection)} "
+                "candidate reference(s) with a description)."
+            ),
+            evidence={"checked_count": len(candidates_for_selection)},
+        )
+
+    best_priority = min(
+        REFERENCE_SOURCE_PRIORITY[reference["source_type"]]
+        for reference, _ in passing
+    )
+    top_tier = [
+        (reference, _)
+        for reference, _ in passing
+        if REFERENCE_SOURCE_PRIORITY[reference["source_type"]] == best_priority
+    ]
+    top_tier.sort(
+        key=lambda pair: _MATCH_DECISION_RANK.get(pair[0].get("match_decision"), 3)
+    )
+
+    selected_reference = top_tier[0][0]
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=CONTENT_REFERENCE_DRAFT_SAFE_SELECTED,
+        reason=(
+            "Reference is draft-safe for content enrichment: recognized "
+            "source, usable description, no identity/sellable-unit "
+            "conflict."
+        ),
+        evidence={
+            "reference_id": selected_reference.get("reference_id"),
+            "source_type": selected_reference.get("source_type"),
+            "reference_description": selected_reference.get(
+                "reference_description"
+            ),
+            "match_decision": selected_reference.get("match_decision"),
+        },
     )
