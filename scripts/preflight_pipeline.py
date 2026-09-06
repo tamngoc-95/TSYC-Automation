@@ -66,6 +66,7 @@ from src.domain.woocommerce_status import (  # noqa: E402
     ALL_WOOCOMMERCE_STATUSES,
     ALL_WOOCOMMERCE_SYNC_STATUSES,
 )
+from pipeline_state import derive_sync_recovery_state  # noqa: E402
 
 configure_utf8_console()
 
@@ -524,8 +525,21 @@ def check_recovery_health(
     Candidate-specific recovery (a handful of products stuck pending
     reconciliation) is reported as a non-blocking warning -- each
     recovery candidate already stops individually in run_batch.py. Being
-    unable to even read the sync table is treated as a systemic problem
-    and blocks.
+    unable to even read the sync/product tables is treated as a systemic
+    problem and blocks.
+
+    Reuses pipeline_state.derive_sync_recovery_state() -- the exact same
+    canonical recovery check derive_candidate_state() applies to one
+    candidate's full bundle -- rather than a second, narrower copy of
+    the recovery rule. The old copy here only counted
+    response_payload.recovery_required==True and
+    internal_products.woocommerce_status=="FAILED"; it missed a sync row
+    that is itself FAILED/IN_PROGRESS-with-no-remote-id while the linked
+    internal_products row still shows an earlier, unrelated
+    woocommerce_status (e.g. READY_FOR_DRAFT) -- see the historical
+    reconciliation finding for FB-HIST-2026-AUTOIMPORT-CAN-0016. Every
+    sync row is now checked against its own product, matching
+    pipeline_state.py exactly.
     """
     if not configuration_ok:
         return PreflightCheck(
@@ -539,16 +553,18 @@ def check_recovery_health(
 
         syncs = (
             active_repository.client.table("woocommerce_product_syncs")
-            .select("sync_id, internal_product_id, woocommerce_status, response_payload")
+            .select(
+                "sync_id, internal_product_id, woocommerce_status, "
+                "woocommerce_product_id, response_payload"
+            )
             .execute()
             .data
             or []
         )
 
-        failed_products = (
+        internal_products = (
             active_repository.client.table("internal_products")
             .select("internal_product_id, product_code, woocommerce_status")
-            .eq("woocommerce_status", "FAILED")
             .execute()
             .data
             or []
@@ -561,20 +577,51 @@ def check_recovery_health(
             message=f"Could not read recovery state: {type(error).__name__}: {error}",
         )
 
-    recovery_sync_count = sum(
-        1
-        for sync in syncs
-        if isinstance(sync.get("response_payload"), dict)
-        and sync["response_payload"].get("recovery_required") is True
-    )
-    total_candidate_specific = recovery_sync_count + len(failed_products)
+    products_by_id = {
+        str(product["internal_product_id"]): product
+        for product in internal_products
+        if product.get("internal_product_id")
+    }
 
-    if total_candidate_specific:
+    syncs_by_product: dict[str, list[dict[str, Any]]] = {}
+
+    for sync in syncs:
+        product_id = sync.get("internal_product_id")
+
+        if product_id:
+            syncs_by_product.setdefault(str(product_id), []).append(sync)
+
+    # Union of every product_id that appears in either table: a sync row
+    # can reference an internal_product_id this read did not also see as
+    # an internal_products row (e.g. a narrowly-scoped test fixture, or a
+    # product deleted after its sync record was written) -- such a sync
+    # must still be checked on its own, exactly as it was before this
+    # fix (recovery_sync_count counted every matching sync regardless of
+    # whether a product row existed).
+    all_product_ids = set(products_by_id) | set(syncs_by_product)
+
+    recovery_product_count = 0
+
+    for product_id in all_product_ids:
+        product = products_by_id.get(product_id)
+        # A product with no sync row at all still needs one recovery
+        # check (internal_products.woocommerce_status == FAILED with no
+        # sync history yet) -- pass sync=None, exactly as
+        # derive_sync_recovery_state() expects.
+        product_syncs = syncs_by_product.get(product_id) or [None]
+
+        if any(
+            derive_sync_recovery_state(sync, product) is not None
+            for sync in product_syncs
+        ):
+            recovery_product_count += 1
+
+    if recovery_product_count:
         return PreflightCheck(
             code="RECOVERY_HEALTH",
             status=CheckStatus.WARNING,
             message=(
-                f"{total_candidate_specific} candidate(s) require recovery "
+                f"{recovery_product_count} candidate(s) require recovery "
                 "review. Each stops individually in run_batch.py; this "
                 "does not block other candidates or this preflight."
             ),

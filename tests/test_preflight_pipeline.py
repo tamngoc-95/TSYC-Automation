@@ -315,6 +315,171 @@ def test_recovery_read_failure_is_a_blocker():
 
 
 # ---------------------------------------------------------------------
+# 7b. Recovery-health gap regression (FB-HIST-2026-AUTOIMPORT-CAN-0016)
+#
+# The old check only counted response_payload.recovery_required==True
+# and internal_products.woocommerce_status=="FAILED". A sync row that is
+# itself FAILED/IN_PROGRESS-with-no-remote-id, while its linked
+# internal_products row still shows an earlier, unrelated
+# woocommerce_status, slipped through as PASS. These tests pin the fix:
+# scripts/preflight_pipeline.py now reuses
+# pipeline_state.derive_sync_recovery_state() per (sync, product) pair,
+# the same canonical check derive_candidate_state() already applies.
+# ---------------------------------------------------------------------
+
+
+def test_failed_sync_with_unrelated_product_status_is_not_pass():
+    """Regression for FB-HIST-2026-AUTOIMPORT-CAN-0016: a FAILED sync
+    (no remote product created, no media uploaded) must be caught even
+    though internal_products.woocommerce_status is still READY_FOR_DRAFT,
+    not FAILED."""
+    repository = make_repository(
+        internal_products=[
+            {
+                "internal_product_id": "prod-16",
+                "product_code": "TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0016",
+                "woocommerce_status": "READY_FOR_DRAFT",
+            }
+        ],
+        woocommerce_product_syncs=[
+            {
+                "sync_id": "sync-16",
+                "internal_product_id": "prod-16",
+                "woocommerce_status": "FAILED",
+                "woocommerce_product_id": None,
+                "response_payload": {
+                    "error": {"content_type": "image/webp"},
+                    "uploaded_media": [],
+                    "media_upload_completed": False,
+                },
+            }
+        ],
+    )
+
+    result = run_all_pass(repository=repository)
+
+    recovery_check = result.get("RECOVERY_HEALTH")
+    assert recovery_check.status != pf.CheckStatus.PASS
+    assert recovery_check.status == pf.CheckStatus.WARNING
+    assert "1 candidate" in recovery_check.message
+
+
+def test_explicit_recovery_required_is_not_pass():
+    """A sync row explicitly flagged recovery_required=True must never
+    report PASS, regardless of the linked product's own status."""
+    repository = make_repository(
+        internal_products=[
+            {
+                "internal_product_id": "prod-1",
+                "product_code": "TSYC-FB-2026-001-CAN-0001",
+                "woocommerce_status": "NOT_CREATED",
+            }
+        ],
+        woocommerce_product_syncs=[
+            {
+                "sync_id": "sync-1",
+                "internal_product_id": "prod-1",
+                "woocommerce_status": "IN_PROGRESS",
+                "woocommerce_product_id": None,
+                "response_payload": {"recovery_required": True},
+            }
+        ],
+    )
+
+    result = run_all_pass(repository=repository)
+
+    recovery_check = result.get("RECOVERY_HEALTH")
+    assert recovery_check.status != pf.CheckStatus.PASS
+    assert recovery_check.status == pf.CheckStatus.WARNING
+
+
+def test_healthy_sync_is_pass():
+    """A normal, successful sync with no recovery signal must PASS."""
+    repository = make_repository(
+        internal_products=[
+            {
+                "internal_product_id": "prod-2",
+                "product_code": "TSYC-FB-2026-001-CAN-0002",
+                "woocommerce_status": "DRAFT_CREATED",
+            }
+        ],
+        woocommerce_product_syncs=[
+            {
+                "sync_id": "sync-2",
+                "internal_product_id": "prod-2",
+                "woocommerce_status": "DRAFT_CREATED",
+                "woocommerce_product_id": 1234,
+                "response_payload": {"creator_name": "woocommerce_draft_creator"},
+            }
+        ],
+    )
+
+    result = run_all_pass(repository=repository)
+
+    assert result.get("RECOVERY_HEALTH").status == pf.CheckStatus.PASS
+
+
+def test_reconciled_product_with_remote_id_is_pass():
+    """A product that finished the pipeline and was reconciled to an
+    existing remote product (woocommerce_status advanced past
+    DRAFT_CREATED, sync carries the confirmed remote id, no recovery
+    flag) must PASS -- reconciliation itself is not a recovery
+    condition."""
+    repository = make_repository(
+        internal_products=[
+            {
+                "internal_product_id": "prod-3",
+                "product_code": "TSYC-FB-2026-001-CAN-0003",
+                "woocommerce_status": "READY_TO_PUBLISH",
+            }
+        ],
+        woocommerce_product_syncs=[
+            {
+                "sync_id": "sync-3",
+                "internal_product_id": "prod-3",
+                "woocommerce_status": "DRAFT_CREATED",
+                "woocommerce_product_id": 5678,
+                "response_payload": {},
+            }
+        ],
+    )
+
+    result = run_all_pass(repository=repository)
+
+    assert result.get("RECOVERY_HEALTH").status == pf.CheckStatus.PASS
+
+
+def test_completed_draft_created_batch_has_no_false_positive():
+    """A batch of several legitimately DRAFT_CREATED products (each with
+    a matching successful sync and a confirmed remote id) must not be
+    flagged -- no false positives from the wider per-sync scan."""
+    repository = make_repository(
+        internal_products=[
+            {
+                "internal_product_id": f"prod-{i}",
+                "product_code": f"TSYC-FB-HIST-2026-AUTOIMPORT-CAN-{i:04d}",
+                "woocommerce_status": "DRAFT_CREATED",
+            }
+            for i in range(1, 6)
+        ],
+        woocommerce_product_syncs=[
+            {
+                "sync_id": f"sync-{i}",
+                "internal_product_id": f"prod-{i}",
+                "woocommerce_status": "DRAFT_CREATED",
+                "woocommerce_product_id": 1000 + i,
+                "response_payload": {},
+            }
+            for i in range(1, 6)
+        ],
+    )
+
+    result = run_all_pass(repository=repository)
+
+    assert result.get("RECOVERY_HEALTH").status == pf.CheckStatus.PASS
+
+
+# ---------------------------------------------------------------------
 # 8. Decision-engine import/rule failure
 # ---------------------------------------------------------------------
 

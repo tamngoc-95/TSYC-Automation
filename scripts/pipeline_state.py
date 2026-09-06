@@ -379,20 +379,29 @@ def _vietnamese_content_review_notes(
     return None
 
 
-def _derive_recovery_state(
-    bundle: dict[str, Any],
+def derive_sync_recovery_state(
+    sync: dict[str, Any] | None,
+    internal_product: dict[str, Any] | None,
 ) -> tuple[str, str] | None:
     """
-    Return (derived_state, recovery_state) if the candidate is in a
-    recovery condition, else None.
+    Canonical, reusable recovery-condition check over one
+    woocommerce_product_syncs row and its internal_products row.
 
-    Every check here mirrors a field create_woocommerce_draft.py or
-    sync_woocommerce_product_status.py already writes -- this function
+    Returns (derived_state, recovery_state) when a recovery condition is
+    active, else None. Pure function, no I/O -- every check here mirrors
+    a field create_woocommerce_draft.py or
+    sync_woocommerce_product_status.py already writes; this function
     reads those fields, it does not decide their meaning independently.
-    """
-    internal_product = bundle["internal_product"]
-    sync = bundle["sync"]
 
+    This is the single source of truth for "is this product in a Woo
+    recovery condition" (CLAUDE.md section 2.6/18: never blindly retry
+    an uncertain remote Woo operation) -- both derive_candidate_state()
+    (via _derive_recovery_state, below, over one candidate's full
+    bundle) and scripts/preflight_pipeline.py's recovery-health check
+    (over every product, sync-row-only) call this exact function so the
+    two can never silently disagree about what counts as "needs
+    recovery review."
+    """
     if sync:
         response_payload = sync.get("response_payload")
 
@@ -422,6 +431,16 @@ def _derive_recovery_state(
         return ("RECOVERY_REVIEW_REQUIRED", "RECONCILIATION_REQUIRED")
 
     return None
+
+
+def _derive_recovery_state(
+    bundle: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Return (derived_state, recovery_state) if the candidate is in a
+    recovery condition, else None. Thin wrapper over
+    derive_sync_recovery_state() -- see that function's docstring for
+    why this must stay a wrapper, not a second copy."""
+    return derive_sync_recovery_state(bundle["sync"], bundle["internal_product"])
 
 
 def _historical_reference_image_fallback_hint(bundle: dict[str, Any]) -> str | None:
