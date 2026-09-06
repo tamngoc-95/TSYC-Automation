@@ -33,6 +33,7 @@ from src.domain.image_status import ImageStatus, InternalProductImageStatus
 from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
 from src.domain.woocommerce_status import WooCommerceStatus
 from src.repositories.supabase_repository import SupabaseRepository
+from sync_woocommerce_product_status import LOCAL_STATUSES_VALID_WITH_REMOTE_ID
 
 configure_utf8_console()
 
@@ -880,7 +881,7 @@ def audit_woocommerce(
 
         if syncs_with_remote_id and product.get(
             "woocommerce_status"
-        ) != WooCommerceStatus.DRAFT_CREATED:
+        ) not in LOCAL_STATUSES_VALID_WITH_REMOTE_ID:
             add_issue(
                 issues,
                 "ERROR",
@@ -888,7 +889,9 @@ def audit_woocommerce(
                 "REMOTE_WOO_ID_WITH_LOCAL_STATUS_MISMATCH",
                 (
                     "A WooCommerce product ID exists locally but internal "
-                    f"product status is {product.get('woocommerce_status')}."
+                    f"product status is {product.get('woocommerce_status')}, "
+                    "not one of the canonical synced statuses "
+                    f"({sorted(LOCAL_STATUSES_VALID_WITH_REMOTE_ID)})."
                 ),
             )
 

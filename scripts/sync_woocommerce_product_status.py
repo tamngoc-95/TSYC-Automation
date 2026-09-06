@@ -316,6 +316,19 @@ SUPPORTED_REMOTE_STATUS_MAPPING = {
     ),
 }
 
+# The exact set of internal_products.woocommerce_status values this
+# module's own map_remote_status() can legitimately produce once a
+# WooCommerce product id already exists locally (derived from
+# SUPPORTED_REMOTE_STATUS_MAPPING above, never hand-duplicated).
+# scripts/audit_pipeline_state.py imports this constant for its
+# REMOTE_WOO_ID_WITH_LOCAL_STATUS_MISMATCH check instead of keeping a
+# second, independently-maintained copy of "which statuses are valid
+# once a remote id is recorded" -- the two must never silently diverge.
+LOCAL_STATUSES_VALID_WITH_REMOTE_ID = frozenset(
+    internal_status
+    for _, internal_status in SUPPORTED_REMOTE_STATUS_MAPPING.values()
+)
+
 
 class RemoteStatusMapping:
     """The result of map_remote_status(): either a confirmed, canonical
