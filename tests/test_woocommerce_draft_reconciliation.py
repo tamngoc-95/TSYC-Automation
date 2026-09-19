@@ -368,3 +368,57 @@ def test_reuses_already_recorded_uploaded_media():
 
     sync_row = get_sync_row(repository)
     assert sync_row["response_payload"]["uploaded_media"] == UPLOADED_MEDIA
+
+
+def test_mark_sync_failed_preserves_prior_response_payload_evidence():
+    """mark_sync_failed() must merge onto whatever response_payload
+    already existed, never replace it wholesale -- otherwise a prior
+    recovery tool's additive evidence record (e.g.
+    recover_woocommerce_remote_loss.py's "remote_loss_confirmed", or
+    clear_woocommerce_sync_recovery.py's "recovery_cleared") is silently
+    erased the moment a fresh create attempt fails again."""
+    sync_id = "sync-evidence-1"
+    repository = FakeSupabaseRepository(
+        tables={
+            "woocommerce_product_syncs": [
+                {
+                    "sync_id": sync_id,
+                    "internal_product_id": INTERNAL_PRODUCT_ID,
+                    "woocommerce_status": WooCommerceSyncStatus.PENDING,
+                    "woocommerce_product_id": None,
+                    "response_payload": {
+                        "remote_loss_confirmed": {
+                            "previous_woocommerce_product_id": 3746,
+                            "reason": "confirmed remote loss",
+                        },
+                        "latest_status_check": {"checked_at": "2026-09-05T07:02:39+00:00"},
+                    },
+                }
+            ]
+        }
+    )
+
+    existing_sync = repository.client.table("woocommerce_product_syncs").select("*").eq(
+        "sync_id", sync_id
+    ).execute().data[0]
+
+    woo.mark_sync_failed(
+        repository=repository,
+        sync_id=sync_id,
+        error_code="woocommerce_rest_product_not_created",
+        error_message="SKU already in lookup table",
+        uploaded_media=[],
+        error_payload={"code": "woocommerce_rest_product_not_created"},
+        existing_response_payload=existing_sync.get("response_payload"),
+    )
+
+    updated = repository.client.table("woocommerce_product_syncs").select("*").eq(
+        "sync_id", sync_id
+    ).execute().data[0]
+
+    # Prior evidence must survive.
+    assert updated["response_payload"]["remote_loss_confirmed"]["previous_woocommerce_product_id"] == 3746
+    assert updated["response_payload"]["latest_status_check"] == {"checked_at": "2026-09-05T07:02:39+00:00"}
+    # This attempt's own failure evidence must also be present.
+    assert updated["response_payload"]["error"]["code"] == "woocommerce_rest_product_not_created"
+    assert updated["woocommerce_status"] == WooCommerceSyncStatus.FAILED

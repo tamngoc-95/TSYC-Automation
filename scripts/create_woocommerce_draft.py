@@ -1759,8 +1759,19 @@ def mark_sync_failed(
     error_message: str,
     uploaded_media: list[dict[str, Any]],
     error_payload: Any,
+    existing_response_payload: Any = None,
 ) -> None:
-    """Save a failed synchronization without losing media IDs."""
+    """Save a failed synchronization without losing media IDs -- or any
+    other prior evidence already recorded on this sync row (e.g. a
+    recovery tool's own additive evidence record such as
+    recover_woocommerce_remote_loss.py's "remote_loss_confirmed", or
+    clear_woocommerce_sync_recovery.py's "recovery_cleared"). This must
+    only ever add/replace this attempt's own keys (uploaded_media,
+    media_upload_completed, error, failed_at) onto whatever
+    response_payload already existed -- never discard the rest of the
+    row's history, mirroring the additive-merge pattern already used by
+    build_cleared_response_payload() in clear_woocommerce_sync_recovery.py.
+    """
     if isinstance(
         error_payload,
         dict,
@@ -1774,14 +1785,22 @@ def mark_sync_failed(
             )[:5000],
         }
 
-    response_payload = {
-        "uploaded_media": uploaded_media,
-        "media_upload_completed": bool(
-            uploaded_media
-        ),
-        "error": normalized_error_payload,
-        "failed_at": utc_now(),
-    }
+    response_payload = (
+        dict(existing_response_payload)
+        if isinstance(existing_response_payload, dict)
+        else {}
+    )
+
+    response_payload.update(
+        {
+            "uploaded_media": uploaded_media,
+            "media_upload_completed": bool(
+                uploaded_media
+            ),
+            "error": normalized_error_payload,
+            "failed_at": utc_now(),
+        }
+    )
 
     (
         repository.client
@@ -2414,6 +2433,7 @@ def main() -> None:
             error_message=error.error_message,
             uploaded_media=uploaded_media,
             error_payload=error.response_payload,
+            existing_response_payload=sync.get("response_payload"),
         )
 
         raise
@@ -2428,6 +2448,7 @@ def main() -> None:
             error_message=error.error_message,
             uploaded_media=uploaded_media,
             error_payload=error.response_payload,
+            existing_response_payload=sync.get("response_payload"),
         )
 
         raise
@@ -2449,6 +2470,7 @@ def main() -> None:
                     error
                 ),
             },
+            existing_response_payload=sync.get("response_payload"),
         )
 
         raise
