@@ -858,6 +858,7 @@ def test_no_publish_or_price_action_in_dispatch_table():
         product_code=PRODUCT_CODE,
         auto_main_image_id="image-1",
         auto_rights_status="STORE_OWNED",
+        auto_gallery_images=(("image-2", "STORE_OWNED"),),
     )
 
     all_entries = list(run_batch.AUTOMATABLE_DISPATCH.values()) + [

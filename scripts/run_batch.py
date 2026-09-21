@@ -165,13 +165,14 @@ AUTOMATABLE_DISPATCH: dict[str, DispatchEntry] = {
         ),
     ),
     # Historical-migration draft-safe image automation, continued:
-    # pipeline_state.py only sets auto_main_image_id/auto_rights_status
-    # (and this derived state) when exactly one image exists and its
-    # rights are deterministically STORE_OWNED (own Facebook export) or
-    # already publishable -- CLAUDE.md 14.5 "exactly one eligible image
-    # exists" plus 14.7. More than one image never reaches this state;
-    # it stays at the existing IMAGE_REVIEW_REQUIRED/RIGHTS_REVIEW_
-    # REQUIRED human gate, unchanged.
+    # pipeline_state.py sets auto_main_image_id/auto_rights_status (and
+    # this derived state) whenever at least one image's rights are
+    # deterministically STORE_OWNED (own Facebook export) or already
+    # publishable -- CLAUDE.md 14.5/14.7. image_rules.select_primary_
+    # candidate_image() decides the single PRIMARY deterministically;
+    # any remaining eligible images (auto_gallery_images) are approved
+    # alongside it as GALLERY images, never a human gate merely because
+    # several images all belong to this one candidate.
     "IMAGE_APPROVAL_PENDING_HISTORICAL": DispatchEntry(
         script="review_product_images.py",
         build_args=lambda state: [
@@ -184,10 +185,21 @@ AUTOMATABLE_DISPATCH: dict[str, DispatchEntry] = {
             state.auto_main_image_id,
             "--rights-status",
             state.auto_rights_status,
+            *[
+                arg
+                for image_id, rights_status in state.auto_gallery_images
+                for arg in (
+                    "--gallery-image-id",
+                    image_id,
+                    "--gallery-rights-status",
+                    rights_status,
+                )
+            ],
         ],
         description=(
-            "Validate and approve the single unambiguous historical "
-            "image as the main image, at its deterministically "
+            "Validate and approve the deterministically selected "
+            "primary historical image (plus any remaining eligible "
+            "images as gallery images), at each one's deterministically "
             "authorized usage-rights status."
         ),
     ),

@@ -372,8 +372,19 @@ def find_existing_database_record(
     repository: SupabaseRepository,
     raw_page_id: str,
     image_hash: str,
+    candidate_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Find an existing image record for the same post and hash."""
+    """Find an existing image record for the same post and hash.
+
+    When candidate_id is given and more than one record exists for this
+    (raw_page_id, image_hash) pair -- the legitimate multi-product case,
+    CLAUDE.md section 11 -- prefers the record already belonging to this
+    exact candidate, so a sibling candidate's own row is never mistaken
+    for this candidate's own already-uploaded row. Falls back to any
+    matching record only when this candidate has none of its own; that
+    fallback is what lets a caller detect a genuine cross-candidate
+    collision.
+    """
     response = (
         repository.client
         .table("product_images")
@@ -394,7 +405,6 @@ def find_existing_database_record(
             "image_hash",
             image_hash,
         )
-        .limit(1)
         .execute()
     )
 
@@ -402,6 +412,19 @@ def find_existing_database_record(
 
     if not records:
         return None
+
+    if candidate_id:
+        own_record = next(
+            (
+                record
+                for record in records
+                if str(record.get("candidate_id")) == str(candidate_id)
+            ),
+            None,
+        )
+
+        if own_record is not None:
+            return own_record
 
     return records[0]
 
@@ -596,8 +619,19 @@ def upload_one_image(
     metadata_path: Path,
     candidate_id: str,
     batch_code: str = BATCH_CODE,
+    allow_cross_candidate_share: bool = False,
 ) -> str:
-    """Upload one image and create its database record."""
+    """Upload one image and create its database record.
+
+    allow_cross_candidate_share is only ever True when the caller has
+    already confirmed (via filter_items_to_candidate_provenance) that
+    this exact item's local media path is explicitly, persistently named
+    in this candidate's own source_evidence.local_media_paths, even
+    though the raw page is shared with a sibling candidate that already
+    has its own product_images row for the identical image bytes --
+    CLAUDE.md section 11's legitimate multi-product-photo case. It never
+    widens what counts as "this candidate's own image" by itself.
+    """
     metadata = load_json(
         metadata_path
     )
@@ -653,6 +687,7 @@ def upload_one_image(
             repository=repository,
             raw_page_id=raw_page_id,
             image_hash=image_hash,
+            candidate_id=candidate_id,
         )
     )
 
@@ -661,36 +696,51 @@ def upload_one_image(
             "candidate_id"
         )
 
-        if (
+        is_cross_candidate = bool(
             existing_candidate_id
             and str(existing_candidate_id) != str(candidate_id)
-        ):
+        )
+
+        if is_cross_candidate and not allow_cross_candidate_share:
             raise RuntimeError(
                 "The same raw-page image hash is already linked to "
                 "a different candidate."
             )
 
-        print(
-            "Result: DUPLICATE_DATABASE"
-        )
-        print(
-            "Existing image ID: "
-            f"{existing_record.get('image_id')}"
-        )
-        print(
-            "Existing candidate ID: "
-            f"{existing_candidate_id or '[not linked]'}"
-        )
-        print(
-            "Existing image status: "
-            f"{existing_record.get('image_status')}"
-        )
-        print(
-            "Existing Storage path: "
-            f"{existing_record.get('storage_path')}"
-        )
+        if not is_cross_candidate:
+            print(
+                "Result: DUPLICATE_DATABASE"
+            )
+            print(
+                "Existing image ID: "
+                f"{existing_record.get('image_id')}"
+            )
+            print(
+                "Existing candidate ID: "
+                f"{existing_candidate_id or '[not linked]'}"
+            )
+            print(
+                "Existing image status: "
+                f"{existing_record.get('image_status')}"
+            )
+            print(
+                "Existing Storage path: "
+                f"{existing_record.get('storage_path')}"
+            )
 
-        return "DUPLICATE_DATABASE"
+            return "DUPLICATE_DATABASE"
+
+        # is_cross_candidate and allow_cross_candidate_share: a
+        # legitimate multi-product image already has a sibling
+        # candidate's own row -- fall through to create a SEPARATE
+        # product_images row for this candidate, reusing the same
+        # already-uploaded Storage bytes below (storage_file_exists is
+        # keyed on storage_path, independent of candidate).
+        print(
+            "Existing image belongs to a different candidate under "
+            "confirmed multi-product provenance -- creating a separate "
+            "product_images row for this candidate."
+        )
 
     already_in_storage = storage_file_exists(
         repository=repository,
@@ -929,6 +979,95 @@ def get_candidate_for_raw_page(
     return records[0]
 
 
+def get_candidate_by_selector(
+    repository: SupabaseRepository,
+    candidate_code: str | None = None,
+    candidate_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Look up one exact candidate by its own code/id.
+
+    Deliberately never `get_candidate_for_raw_page` (which returns
+    "whichever candidate happens to be newest for a raw page") -- that
+    is wrong for any raw page shared by more than one candidate. An
+    explicit --candidate-code/--candidate-id selector must always
+    resolve to that exact candidate, never a sibling.
+    """
+    query = (
+        repository.client
+        .table("product_candidates")
+        .select(
+            "candidate_id, "
+            "candidate_code, "
+            "extracted_title, "
+            "workflow_status, "
+            "raw_page_id, "
+            "source_evidence"
+        )
+    )
+
+    if candidate_code:
+        query = query.eq("candidate_code", candidate_code)
+    elif candidate_id:
+        query = query.eq("candidate_id", candidate_id)
+    else:
+        return None
+
+    records = query.limit(1).execute().data or []
+
+    return records[0] if records else None
+
+
+def count_raw_page_candidates(
+    repository: SupabaseRepository,
+    raw_page_id: str,
+) -> int:
+    """Total number of candidates (including this one) linked to a raw
+    page -- used only to decide whether provenance-based filtering is
+    even needed (a raw page with exactly one candidate keeps every local
+    item, unfiltered, exactly as before this change)."""
+    rows = (
+        repository.client
+        .table("product_candidates")
+        .select("candidate_id")
+        .eq("raw_page_id", raw_page_id)
+        .execute()
+        .data
+        or []
+    )
+
+    return len(rows)
+
+
+def filter_items_to_candidate_provenance(
+    items: list[dict[str, Any]],
+    candidate: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Narrow a raw page's local image metadata items down to the ones
+    this exact candidate's own persisted source_evidence.local_media_
+    paths names.
+
+    Only ever called when the raw page is shared by more than one
+    candidate (CLAUDE.md section 11) -- a single-candidate post is never
+    filtered at all. Matches each item's
+    historical_source_relative_path (written by extract_historical_
+    facebook_images.py's sidecar metadata) against this candidate's own
+    local_media_paths -- never against a sibling's, and never by
+    position/order in the shared local cache directory.
+    """
+    own_paths = set(
+        (candidate.get("source_evidence") or {}).get("local_media_paths") or []
+    )
+
+    if not own_paths:
+        return []
+
+    return [
+        item
+        for item in items
+        if item["metadata"].get("historical_source_relative_path") in own_paths
+    ]
+
+
 def get_raw_page_summary(
     repository: SupabaseRepository,
     raw_page_id: str,
@@ -982,6 +1121,53 @@ def select_raw_page_group(
             "No valid image metadata groups were found."
         )
 
+    if candidate_code or candidate_id:
+        # An explicit candidate selector always resolves to that exact
+        # candidate directly -- never "whichever candidate happens to be
+        # newest for this raw page" (get_candidate_for_raw_page), which
+        # is wrong the moment a raw page is shared by more than one
+        # candidate (CLAUDE.md section 11).
+        candidate = get_candidate_by_selector(
+            repository=repository,
+            candidate_code=candidate_code,
+            candidate_id=candidate_id,
+        )
+
+        if candidate is None:
+            raise RuntimeError(
+                "No local Facebook image group matched the supplied selector."
+            )
+
+        candidate_raw_page_id = candidate.get("raw_page_id")
+
+        if (
+            (raw_page_id and candidate_raw_page_id != raw_page_id)
+            or candidate_raw_page_id not in groups
+        ):
+            raise RuntimeError(
+                "No local Facebook image group matched the supplied selector."
+            )
+
+        items = groups[candidate_raw_page_id]
+        total_candidates = count_raw_page_candidates(
+            repository=repository,
+            raw_page_id=candidate_raw_page_id,
+        )
+
+        if total_candidates > 1:
+            items = filter_items_to_candidate_provenance(items, candidate)
+
+            if not items:
+                raise RuntimeError(
+                    "This raw page is shared by more than one candidate, "
+                    "and none of the local image metadata matches this "
+                    "exact candidate's own persisted source_evidence."
+                    "local_media_paths -- refusing to guess which images "
+                    "belong to it."
+                )
+
+        return candidate_raw_page_id, items, candidate
+
     group_entries: list[
         tuple[
             str,
@@ -1001,14 +1187,6 @@ def select_raw_page_group(
         if raw_page_id and current_raw_page_id != raw_page_id:
             continue
 
-        if candidate_code:
-            if not candidate or candidate.get("candidate_code") != candidate_code:
-                continue
-
-        if candidate_id:
-            if not candidate or candidate.get("candidate_id") != candidate_id:
-                continue
-
         group_entries.append(
             (
                 current_raw_page_id,
@@ -1017,7 +1195,7 @@ def select_raw_page_group(
             )
         )
 
-    if raw_page_id or candidate_code or candidate_id:
+    if raw_page_id:
         if not group_entries:
             raise RuntimeError(
                 "No local Facebook image group matched the supplied selector."
@@ -1139,11 +1317,21 @@ def filter_database_duplicates(
     repository: SupabaseRepository,
     items: list[dict[str, Any]],
     candidate_id: str,
+    allow_cross_candidate_share: bool = False,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
 ]:
-    """Split local metadata into uploadable and existing database images."""
+    """Split local metadata into uploadable and existing database images.
+
+    allow_cross_candidate_share: see upload_one_image()'s docstring --
+    only ever True for items already confirmed (by
+    filter_items_to_candidate_provenance) to be this exact candidate's
+    own persisted image, even when a sibling candidate already has its
+    own row for the identical image bytes. Such an item is treated as
+    uploadable (a new row for this candidate), never as this candidate's
+    own duplicate and never as an error.
+    """
     uploadable: list[
         dict[str, Any]
     ] = []
@@ -1162,6 +1350,7 @@ def filter_database_duplicates(
                 image_hash=item[
                     "image_hash"
                 ],
+                candidate_id=candidate_id,
             )
         )
 
@@ -1175,14 +1364,23 @@ def filter_database_duplicates(
                 "candidate_id"
             )
 
-            if (
+            is_cross_candidate = bool(
                 existing_candidate_id
                 and str(existing_candidate_id) != str(candidate_id)
-            ):
+            )
+
+            if is_cross_candidate and not allow_cross_candidate_share:
                 raise RuntimeError(
                     "An existing image from the selected raw page is already "
                     "linked to a different candidate."
                 )
+
+            if is_cross_candidate:
+                uploadable.append(
+                    item
+                )
+
+                continue
 
             duplicate_item = dict(
                 item
@@ -1588,6 +1786,20 @@ def main() -> None:
         selected_candidate["candidate_id"]
     )
 
+    # More than one candidate on this raw page means
+    # select_raw_page_group() already narrowed selected_group_items down
+    # to exactly this candidate's own persisted local_media_paths (see
+    # filter_items_to_candidate_provenance) -- so an item that also has
+    # a sibling's existing product_images row is a confirmed, not
+    # accidental, multi-product share (CLAUDE.md section 11).
+    allow_cross_candidate_share = (
+        count_raw_page_candidates(
+            repository=repository,
+            raw_page_id=selected_raw_page_id,
+        )
+        > 1
+    )
+
     (
         uploadable_items,
         duplicate_items,
@@ -1595,6 +1807,7 @@ def main() -> None:
         repository=repository,
         items=selected_group_items,
         candidate_id=selected_candidate_id,
+        allow_cross_candidate_share=allow_cross_candidate_share,
     )
 
     print_existing_duplicates(
@@ -1679,6 +1892,7 @@ def main() -> None:
                 metadata_path=metadata_path,
                 candidate_id=selected_candidate_id,
                 batch_code=args.batch_code,
+                allow_cross_candidate_share=allow_cross_candidate_share,
             )
 
             results[status] += 1

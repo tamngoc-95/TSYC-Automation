@@ -196,6 +196,86 @@ def test_historical_candidate_ambiguous_when_sibling_shares_raw_page(
     assert SIBLING_CANDIDATE_CODE in state.human_gate_reason
 
 
+def test_ambiguous_ownership_resolved_by_image_derived_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Historical multi-image ownership resolver: a sibling shares the
+    raw page, but this candidate's own image-derived (MANUAL_VISUAL_
+    REVIEW) provenance already, explicitly pins it to its own exact
+    image path (distinct from the sibling's) -- CLAUDE.md section 11's
+    "explicit candidate mapping" is already persisted, so this is
+    automatable, not a human gate."""
+    _patch_capability(
+        monkeypatch,
+        CapabilityStatus(available=True, reason="Facebook export archive found."),
+    )
+
+    candidate = _historical_candidate(
+        source_evidence={
+            "extraction_source": "MANUAL_VISUAL_REVIEW",
+            "local_media_paths": ["your_facebook_activity/posts/media/x/1.jpg"],
+            "evidence_text": "5,99EUR visible, NXB Kim Dong",
+        }
+    )
+    sibling = {
+        "candidate_id": SIBLING_CANDIDATE_ID,
+        "candidate_code": SIBLING_CANDIDATE_CODE,
+        "raw_page_id": RAW_PAGE_ID,
+        "identity_status": "IDENTITY_PENDING",
+        "source_evidence": {
+            "extraction_source": "MANUAL_VISUAL_REVIEW",
+            "local_media_paths": ["your_facebook_activity/posts/media/x/2.jpg"],
+            "evidence_text": "6,99EUR visible, series B",
+        },
+    }
+    repository = _repository(candidate, _internal_product(), siblings=[sibling])
+    bundle = load_candidate_bundle(repository, HISTORICAL_CANDIDATE_CODE)
+    state = derive_candidate_state(bundle)
+
+    assert state.derived_state == "IMAGE_INGEST_PENDING_HISTORICAL"
+    assert state.human_gate is False
+    assert state.outcome == Outcome.AUTO_PASS
+
+
+def test_sibling_shares_exact_path_without_image_derived_provenance_stays_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """This candidate's own provenance is image-derived, but a sibling
+    nominally names the exact same image path through the older CLAUDE_
+    SEMANTIC pathway (no distinguishing evidence_text) -- the resolver
+    must never treat that as a resolved multi-product photo. Keeps
+    exactly today's human gate."""
+    _patch_capability(
+        monkeypatch,
+        CapabilityStatus(available=True, reason="Facebook export archive found."),
+    )
+
+    shared_path = "your_facebook_activity/posts/media/x/1.jpg"
+    candidate = _historical_candidate(
+        source_evidence={
+            "extraction_source": "MANUAL_VISUAL_REVIEW",
+            "local_media_paths": [shared_path],
+            "evidence_text": "5,99EUR visible, NXB Kim Dong",
+        }
+    )
+    sibling = {
+        "candidate_id": SIBLING_CANDIDATE_ID,
+        "candidate_code": SIBLING_CANDIDATE_CODE,
+        "raw_page_id": RAW_PAGE_ID,
+        "identity_status": "IDENTITY_PENDING",
+        "source_evidence": {
+            "extraction_source": "CLAUDE_SEMANTIC",
+            "local_media_paths": [shared_path],
+        },
+    }
+    repository = _repository(candidate, _internal_product(), siblings=[sibling])
+    bundle = load_candidate_bundle(repository, HISTORICAL_CANDIDATE_CODE)
+    state = derive_candidate_state(bundle)
+
+    assert state.derived_state == "IMAGE_GROUP_OWNERSHIP_AMBIGUOUS"
+    assert state.human_gate is True
+
+
 def test_ambiguity_takes_priority_over_capability_check(
     monkeypatch: pytest.MonkeyPatch,
 ):

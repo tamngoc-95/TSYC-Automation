@@ -125,15 +125,19 @@ def get_candidate(
     return rows[0]
 
 
-def get_sibling_candidate_codes(
+def get_sibling_candidates(
     repository: SupabaseRepository,
     raw_page_id: str,
     candidate_id: str,
-) -> list[str]:
+) -> list[dict[str, Any]]:
+    """Every other candidate sharing this raw_page_id, with just the
+    fields evaluate_historical_image_ownership()/resolve_historical_
+    candidate_images() need (candidate_code for the human-facing
+    message, source_evidence for the deterministic provenance check)."""
     rows = (
         repository.client
         .table("product_candidates")
-        .select("candidate_id, candidate_code")
+        .select("candidate_id, candidate_code, source_evidence")
         .eq("raw_page_id", raw_page_id)
         .execute()
         .data
@@ -141,7 +145,7 @@ def get_sibling_candidate_codes(
     )
 
     return [
-        row["candidate_code"]
+        row
         for row in rows
         if row.get("candidate_id") != candidate_id and row.get("candidate_code")
     ]
@@ -189,13 +193,34 @@ def main() -> int:
         print("Error: candidate has no raw_page_id -- cannot check post ownership.")
         return 1
 
-    sibling_codes = get_sibling_candidate_codes(
+    siblings = get_sibling_candidates(
         repository, raw_page_id, candidate["candidate_id"]
     )
+    sibling_codes = [sibling["candidate_code"] for sibling in siblings]
     ownership = image_rules.evaluate_historical_image_ownership(sibling_codes)
 
     print()
     print(f"Ownership check [{ownership.rule_code}]: {ownership.reason}")
+
+    if ownership.outcome != Outcome.AUTO_PASS:
+        # Second-step deterministic resolver: a shared source post is
+        # not itself proof of ambiguity when this candidate's own
+        # image-derived (MANUAL_VISUAL_REVIEW) provenance already,
+        # explicitly pins it to exact image path(s) -- see
+        # resolve_historical_candidate_images()'s own docstring.
+        provenance = image_rules.resolve_historical_candidate_images(
+            candidate_source_evidence=source_evidence,
+            sibling_source_evidence=[
+                sibling.get("source_evidence") or {} for sibling in siblings
+            ],
+        )
+
+        print(
+            f"Provenance resolver [{provenance.rule_code}]: {provenance.reason}"
+        )
+
+        if provenance.outcome == Outcome.AUTO_PASS:
+            ownership = provenance
 
     if ownership.outcome != Outcome.AUTO_PASS:
         print()

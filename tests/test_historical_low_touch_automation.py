@@ -158,10 +158,13 @@ def _repository(
 def test_multiple_own_facebook_images_each_classified_store_owned():
     """(1) FB-HIST with multiple own Facebook images: per-image STORE_OWNED
     classification works. Rights are no longer "unknown" just because more
-    than one image exists -- but main-image selection among several
-    equally-rights-eligible images still requires a human pick, so the
-    state is IMAGE_REVIEW_REQUIRED (not the old, misleading
-    RIGHTS_REVIEW_REQUIRED)."""
+    than one image exists, and -- historical multi-image ownership resolver
+    -- several images already confirmed to belong to the same candidate no
+    longer require a human pick either: image_rules.select_primary_
+    candidate_image() deterministically selects one PRIMARY and the rest
+    become GALLERY images, so the state is the automatable
+    IMAGE_APPROVAL_PENDING_HISTORICAL (never a human gate merely because
+    several correct images exist for one candidate)."""
     candidate = _historical_candidate()
     internal_product = _internal_product(image_status="PENDING")
     images = [
@@ -174,9 +177,17 @@ def test_multiple_own_facebook_images_each_classified_store_owned():
     bundle = load_candidate_bundle(repository, HIST_CANDIDATE_CODE)
     state = derive_candidate_state(bundle)
 
-    assert state.derived_state == "IMAGE_REVIEW_REQUIRED"
-    assert state.human_gate is True
-    assert "3 images are auto-classified with publishable rights" in state.human_gate_reason
+    assert state.derived_state == "IMAGE_APPROVAL_PENDING_HISTORICAL"
+    assert state.human_gate is False
+    assert state.outcome == Outcome.AUTO_PASS
+    # Deterministic order (no image_role/created_at to break the tie):
+    # image_id ascending -- img-a is PRIMARY, img-b/img-c are GALLERY.
+    assert state.auto_main_image_id == "img-a"
+    assert state.auto_rights_status == "STORE_OWNED"
+    assert state.auto_gallery_images == (
+        ("img-b", "STORE_OWNED"),
+        ("img-c", "STORE_OWNED"),
+    )
 
     # Confirm each image independently classifies STORE_OWNED, regardless
     # of how many images exist -- the actual Part 1 rights decision.

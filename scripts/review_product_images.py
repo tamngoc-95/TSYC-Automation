@@ -109,6 +109,30 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--gallery-image-id",
+        action="append",
+        default=[],
+        dest="gallery_image_id",
+        help=(
+            "Exact image_id to approve as a GALLERY image alongside the "
+            "main image (never the main image itself). Repeatable, "
+            "paired positionally with --gallery-rights-status."
+        ),
+    )
+
+    parser.add_argument(
+        "--gallery-rights-status",
+        action="append",
+        default=[],
+        choices=sorted(ALL_RIGHTS_STATUSES),
+        dest="gallery_rights_status",
+        help=(
+            "Usage-rights status for the gallery image at the same "
+            "position as the paired --gallery-image-id."
+        ),
+    )
+
+    parser.add_argument(
         "--reject-image-id",
         action="append",
         default=[],
@@ -438,6 +462,66 @@ def validate_approval_request(
     )
 
 
+def validate_gallery_request(
+    images: list[dict[str, Any]],
+    main_image_id: str,
+    gallery_image_ids: list[str],
+    gallery_rights_statuses: list[str],
+) -> list[tuple[str, str]]:
+    """Validate --gallery-image-id/--gallery-rights-status pairs and
+    return them as (image_id, rights_status) pairs, in the given order.
+
+    Each gallery image must exist among this candidate's own images
+    (find_image already refuses an unknown/foreign image_id), must not
+    duplicate the main image or another gallery entry, and its paired
+    rights status must independently pass the same rights-classification
+    check the main image itself is held to -- a gallery image is never
+    published under an unestablished rights basis just because the main
+    image already cleared one.
+    """
+    if len(gallery_image_ids) != len(gallery_rights_statuses):
+        raise RuntimeError(
+            "--gallery-image-id and --gallery-rights-status must be "
+            "supplied the same number of times, in matching order "
+            f"({len(gallery_image_ids)} vs {len(gallery_rights_statuses)})."
+        )
+
+    pairs: list[tuple[str, str]] = []
+    seen_ids = {main_image_id}
+
+    for gallery_image_id, rights_status in zip(
+        gallery_image_ids, gallery_rights_statuses
+    ):
+        if gallery_image_id in seen_ids:
+            raise RuntimeError(
+                "Each --gallery-image-id must be distinct from the main "
+                f"image and from every other gallery image: {gallery_image_id!r} "
+                "repeated."
+            )
+
+        seen_ids.add(gallery_image_id)
+
+        find_image(
+            images=images,
+            image_id=gallery_image_id,
+        )
+
+        rights_decision = image_rules.evaluate_rights_classification(
+            rights_status=rights_status,
+            policy_established=True,
+        )
+
+        if rights_decision.outcome != Outcome.AUTO_PASS:
+            raise RuntimeError(
+                f"[{rights_decision.rule_code}] {rights_decision.reason} "
+                f"(gallery image {gallery_image_id!r})"
+            )
+
+        pairs.append((gallery_image_id, rights_status))
+
+    return pairs
+
+
 def reject_images(
     repository: SupabaseRepository,
     images: list[dict[str, Any]],
@@ -543,6 +627,139 @@ def approve_main_image(
         raise RuntimeError(
             "Main image update did not affect exactly one image."
         )
+
+
+def approve_main_and_gallery_images(
+    repository: SupabaseRepository,
+    candidate_id: str,
+    images: list[dict[str, Any]],
+    main_image_id: str,
+    main_role: str,
+    rights_status: str,
+    gallery_images: list[tuple[str, str]],
+) -> None:
+    """Validate one main image plus zero or more gallery images, and
+    demote every other image belonging to this candidate.
+
+    Generalizes approve_main_image(): with an empty gallery_images list
+    this has the exact same effect (kept as a separate function, rather
+    than folded into approve_main_image(), so every existing caller of
+    approve_main_image() is completely unaffected by this addition).
+    `images` is this candidate's already-fetched image list (as returned
+    by get_candidate_images()) -- used only to know which of this
+    candidate's own images fall outside the main/gallery selection, so
+    they can be explicitly demoted one at a time (no reliance on a
+    not-in filter the offline fake Supabase client does not implement).
+
+    A gallery image is marked image_status=VALIDATED and
+    is_publish_eligible=True (so scripts/create_woocommerce_draft.py's
+    get_publishable_images() already includes it, sorted after the
+    primary -- CLAUDE.md section 17.1's identifier contract and the Woo
+    payload builder require no change), but is_selected_main_image stays
+    False and is_main_image_candidate is not set -- exactly one selected
+    main image remains the invariant CLAUDE.md 14.5/16 requires.
+    """
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    owned_ids = {main_image_id} | {image_id for image_id, _ in gallery_images}
+
+    # Demote every image belonging to this candidate that is not part of
+    # this exact approval -- an image left out of both the main slot and
+    # the gallery list is never left publish-eligible from a stale prior
+    # run.
+    for image in images:
+        image_id = str(image.get("image_id"))
+
+        if image_id in owned_ids:
+            continue
+
+        (
+            repository.client
+            .table("product_images")
+            .update(
+                {
+                    "is_selected_main_image": False,
+                    "is_publish_eligible": False,
+                    "updated_at": now,
+                }
+            )
+            .eq(
+                "candidate_id",
+                candidate_id,
+            )
+            .eq(
+                "image_id",
+                image_id,
+            )
+            .execute()
+        )
+
+    response = (
+        repository.client
+        .table("product_images")
+        .update(
+            {
+                "image_role": main_role,
+                "usage_rights_status": rights_status,
+                "image_status": ImageStatus.VALIDATED,
+                "is_main_image_candidate": True,
+                "is_selected_main_image": True,
+                "is_publish_eligible": True,
+                "updated_at": now,
+            }
+        )
+        .eq(
+            "candidate_id",
+            candidate_id,
+        )
+        .eq(
+            "image_id",
+            main_image_id,
+        )
+        .execute()
+    )
+
+    rows = response.data or []
+
+    if len(rows) != 1:
+        raise RuntimeError(
+            "Main image update did not affect exactly one image."
+        )
+
+    for gallery_image_id, gallery_rights_status in gallery_images:
+        gallery_response = (
+            repository.client
+            .table("product_images")
+            .update(
+                {
+                    "usage_rights_status": gallery_rights_status,
+                    "image_status": ImageStatus.VALIDATED,
+                    "is_main_image_candidate": False,
+                    "is_selected_main_image": False,
+                    "is_publish_eligible": True,
+                    "updated_at": now,
+                }
+            )
+            .eq(
+                "candidate_id",
+                candidate_id,
+            )
+            .eq(
+                "image_id",
+                gallery_image_id,
+            )
+            .execute()
+        )
+
+        gallery_rows = gallery_response.data or []
+
+        if len(gallery_rows) != 1:
+            raise RuntimeError(
+                "Gallery image update did not affect exactly one image: "
+                f"{gallery_image_id}"
+            )
 
 
 def synchronize_internal_product_image_status(
@@ -722,6 +939,13 @@ def main() -> None:
             rights_status=args.rights_status,
         )
 
+        gallery_pairs = validate_gallery_request(
+            images=images,
+            main_image_id=str(selected_image["image_id"]),
+            gallery_image_ids=args.gallery_image_id,
+            gallery_rights_statuses=args.gallery_rights_status,
+        )
+
         print()
         print(
             "Selected main image ID: "
@@ -735,6 +959,15 @@ def main() -> None:
             "Usage rights: "
             f"{args.rights_status}"
         )
+
+        if gallery_pairs:
+            print(
+                "Gallery images: "
+                + ", ".join(
+                    f"{image_id} ({rights_status})"
+                    for image_id, rights_status in gallery_pairs
+                )
+            )
 
         if args.confirm_approve:
             confirmation = "APPROVE"
@@ -760,9 +993,10 @@ def main() -> None:
                 "Image approval cancelled."
             )
         else:
-            approve_main_image(
+            approve_main_and_gallery_images(
                 repository=repository,
                 candidate_id=candidate_id,
+                images=images,
                 main_image_id=str(
                     selected_image["image_id"]
                 ),
@@ -770,6 +1004,7 @@ def main() -> None:
                 rights_status=str(
                     args.rights_status
                 ),
+                gallery_images=gallery_pairs,
             )
 
             synchronize_internal_product_image_status(

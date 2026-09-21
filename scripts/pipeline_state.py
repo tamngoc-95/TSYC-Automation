@@ -151,6 +151,14 @@ class CandidateState:
     # "pure derivation layer" contract.
     auto_main_image_id: str | None = None
     auto_rights_status: str | None = None
+    # Populated alongside auto_main_image_id/auto_rights_status when more
+    # than one eligible image belongs to this same candidate --
+    # image_rules.select_primary_candidate_image()'s "gallery" evidence,
+    # each entry (image_id, rights_status). scripts/run_batch.py's
+    # dispatch passes these through to review_product_images.py's
+    # --gallery-image-id/--gallery-rights-status. Empty when only the
+    # one primary image exists (the common case).
+    auto_gallery_images: tuple[tuple[str, str], ...] = ()
     # Populated only for derived_state=="IMAGE_REFERENCE_FALLBACK_PENDING_
     # HISTORICAL" -- the exact single draft-safe reference_id
     # scripts/run_batch.py's dispatch passes through to
@@ -280,6 +288,7 @@ def load_candidate_bundle(
     historical_capability_available: bool | None = None
     historical_capability_reason: str | None = None
     sibling_candidate_codes: list[str] = []
+    sibling_source_evidence: list[dict[str, Any]] = []
 
     if local_media_paths and not images:
         capability = check_historical_image_capability(PROJECT_ROOT)
@@ -292,7 +301,7 @@ def load_candidate_bundle(
             sibling_rows = (
                 repository.client
                 .table("product_candidates")
-                .select("candidate_id, candidate_code")
+                .select("candidate_id, candidate_code, source_evidence")
                 .eq("raw_page_id", raw_page_id)
                 .execute()
                 .data
@@ -303,6 +312,16 @@ def load_candidate_bundle(
                 for sibling in sibling_rows
                 if sibling.get("candidate_id") != candidate_id
                 and sibling.get("candidate_code")
+            ]
+            # Only used by resolve_historical_candidate_images() below,
+            # as a second-step check after evaluate_historical_image_
+            # ownership() itself reports ambiguity. Never used to widen
+            # sibling_candidate_codes itself, which stays the exact same
+            # post-membership list every other caller already relies on.
+            sibling_source_evidence = [
+                sibling.get("source_evidence") or {}
+                for sibling in sibling_rows
+                if sibling.get("candidate_id") != candidate_id
             ]
 
     contents: list[dict[str, Any]] = []
@@ -346,6 +365,7 @@ def load_candidate_bundle(
         "historical_capability_available": historical_capability_available,
         "historical_capability_reason": historical_capability_reason,
         "sibling_candidate_codes": sibling_candidate_codes,
+        "sibling_source_evidence": sibling_source_evidence,
     }
 
 
@@ -520,6 +540,30 @@ def _derive_image_content_state(
                 )
 
                 if ownership_decision.outcome != Outcome.AUTO_PASS:
+                    # Second-step deterministic resolver (see
+                    # resolve_historical_candidate_images's own
+                    # docstring): a shared source post is not itself
+                    # proof of ambiguity when this candidate's own
+                    # image-derived (MANUAL_VISUAL_REVIEW) provenance
+                    # already, explicitly pins it to exact image
+                    # path(s) -- CLAUDE.md section 11's "explicit
+                    # candidate mapping" may already be persisted, not
+                    # merely inferred from post membership.
+                    provenance_decision = (
+                        image_rules.resolve_historical_candidate_images(
+                            candidate_source_evidence=(
+                                candidate.get("source_evidence") or {}
+                            ),
+                            sibling_source_evidence=(
+                                bundle.get("sibling_source_evidence") or []
+                            ),
+                        )
+                    )
+
+                    if provenance_decision.outcome == Outcome.AUTO_PASS:
+                        ownership_decision = provenance_decision
+
+                if ownership_decision.outcome != Outcome.AUTO_PASS:
                     # Historical-migration draft-safe policy (CLAUDE.md
                     # section 6.2/8.1): before stopping at the ownership-
                     # ambiguous human gate, try a deterministic reference-
@@ -628,10 +672,14 @@ def _derive_image_content_state(
         # never gated on how many images the candidate carries --
         # classify_historical_image_rights() decides each image's
         # provenance-based rights independently. Main-image *selection*
-        # (CLAUDE.md 14.5: "exactly one eligible image") stays a
-        # completely separate decision: only when exactly one image ends
-        # up rights-eligible can it be auto-selected here; two or more
-        # rights-eligible images still require a human pick.
+        # (CLAUDE.md 14.5: "exactly one eligible image") is the separate
+        # question of which single rights-eligible image is PRIMARY --
+        # image_rules.select_primary_candidate_image() decides that
+        # deterministically for any number of eligible images already
+        # confirmed to belong to this one candidate; the remaining
+        # eligible images become GALLERY images (never demoted to
+        # non-publishable), never a human gate merely because several
+        # images all belong to the same candidate.
         eligible_images: list[tuple[dict[str, Any], str]] = []
 
         if is_historical:
@@ -652,16 +700,28 @@ def _derive_image_content_state(
                         (image, rights_decision.evidence["rights_status"])
                     )
 
-            if len(eligible_images) == 1:
-                only_image, auto_rights_status = eligible_images[0]
+            if eligible_images:
+                primary_decision = image_rules.select_primary_candidate_image(
+                    eligible_images
+                )
 
                 return CandidateState(
                     candidate_code=candidate_code,
                     candidate_id=candidate_id,
                     product_code=product_code,
                     derived_state="IMAGE_APPROVAL_PENDING_HISTORICAL",
-                    auto_main_image_id=str(only_image["image_id"]),
-                    auto_rights_status=auto_rights_status,
+                    auto_main_image_id=str(
+                        primary_decision.evidence["primary_image_id"]
+                    ),
+                    auto_rights_status=primary_decision.evidence[
+                        "primary_rights_status"
+                    ],
+                    auto_gallery_images=tuple(
+                        (str(image_id), rights_status)
+                        for image_id, rights_status in primary_decision.evidence[
+                            "gallery"
+                        ]
+                    ),
                     warnings=warnings,
                 )
 
@@ -730,21 +790,16 @@ def _derive_image_content_state(
                 warnings=warnings,
             )
 
+        # Note: for a historical candidate, eligible_images is always
+        # empty by this point -- any non-empty eligible_images already
+        # returned above via select_primary_candidate_image(). This
+        # branch is reached only for a live candidate with publishable-
+        # rights images but no single approved selection yet.
         reason = (
             "Images with usable rights exist, but no single validated, "
             "selected, publish-eligible main image has been approved. "
             "Run review_product_images.py to select and approve one."
         )
-
-        if is_historical and len(eligible_images) > 1:
-            reason = (
-                f"{len(eligible_images)} images are auto-classified with "
-                "publishable rights under the historical policy, but "
-                "CLAUDE.md 14.5 requires subjective judgment to select "
-                "exactly one main image among several equally eligible "
-                "images. Run review_product_images.py to select and "
-                "approve one."
-            )
 
         if historical_fallback_hint:
             reason += f" {historical_fallback_hint}"
