@@ -1060,10 +1060,25 @@ def _derive_pre_product_state(
                 ),
             )
 
+        # Only a discovery still in discovery_status=="SELECTED" is
+        # actually collectible: collect_reference_metadata.py's own
+        # select_next_reference_queue_item() requires exactly that status
+        # (plus the joined source_urls.crawl_status=="PENDING") and raises
+        # RuntimeError("No selected PENDING reference URL matched the
+        # supplied selector.") for anything else. A discovery whose crawl
+        # already permanently failed (discovery_status=="FAILED", e.g. no
+        # metadata parser for that domain) still has
+        # is_selected_for_crawl==True forever, so checking that flag alone
+        # falsely reports REFERENCE_REGISTERED as "safe to auto-invoke" --
+        # run_batch.py would then redispatch collect_reference_metadata.py
+        # every run and fail the same way indefinitely, never surfacing
+        # for review. Matching the collector's own status check here
+        # keeps the two in sync instead of duplicating separate criteria.
         selected_sources = [
             source
             for source in discovery_sources
             if source.get("is_selected_for_crawl") is True
+            and source.get("discovery_status") == "SELECTED"
         ]
 
         if selected_sources:
@@ -1074,7 +1089,35 @@ def _derive_pre_product_state(
                 derived_state="REFERENCE_REGISTERED",
             )
 
+        failed_selected_sources = [
+            source
+            for source in discovery_sources
+            if source.get("is_selected_for_crawl") is True
+            and source.get("discovery_status") == "FAILED"
+        ]
+
         if is_historical:
+            if failed_selected_sources:
+                # A reference source was found and selected, but its
+                # crawl already permanently failed (see comment above) --
+                # not something to keep silently retrying. Under CLAUDE.md
+                # 6.2, an unavailable reference is enrichment, not a
+                # blocker, so this still proceeds draft-safe; it just no
+                # longer masquerades as REFERENCE_REGISTERED.
+                return CandidateState(
+                    candidate_code=candidate_code,
+                    candidate_id=candidate_id,
+                    product_code=None,
+                    derived_state="IDENTITY_PENDING_HISTORICAL_DRAFT_SAFE",
+                    warnings=[
+                        "The selected reference source failed to crawl "
+                        "and cannot be automatically retried. Proceeding "
+                        "under the historical draft-safe policy with "
+                        "unverified identity and no enrichment "
+                        "reference."
+                    ],
+                )
+
             # No reference source is selected/registered at all for this
             # historical candidate. Per the shop owner's business
             # authorization, this is enrichment that was not found -- not
@@ -1093,6 +1136,25 @@ def _derive_pre_product_state(
                     "historical draft-safe policy with unverified "
                     "identity and no enrichment reference."
                 ],
+            )
+
+        if failed_selected_sources:
+            return CandidateState(
+                candidate_code=candidate_code,
+                candidate_id=candidate_id,
+                product_code=None,
+                derived_state="EXTRACTED",
+                human_gate=True,
+                human_gate_reason=(
+                    "The selected reference source failed to crawl and "
+                    "cannot be automatically retried. Human decision "
+                    "required: select a different reference source "
+                    "(register_reference_source.py --select-for-crawl), "
+                    "using the CLAUDE.md reference identity priority: "
+                    "publisher > authorized supplier > reliable bookstore "
+                    "> Fahasa > Facebook, or resolve the crawl failure "
+                    "(see the source_urls row's last_error)."
+                ),
             )
 
         if discovery_sources:
