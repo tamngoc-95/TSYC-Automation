@@ -59,6 +59,14 @@ IMAGE_PRODUCT_MISMATCH = "IMAGE_PRODUCT_MISMATCH"
 IMAGE_GROUP_OWNERSHIP_UNAMBIGUOUS = "IMAGE_GROUP_OWNERSHIP_UNAMBIGUOUS"
 IMAGE_GROUP_OWNERSHIP_AMBIGUOUS = "IMAGE_GROUP_OWNERSHIP_AMBIGUOUS"
 IMAGE_CAPABILITY_UNAVAILABLE = "IMAGE_CAPABILITY_UNAVAILABLE"
+# Historical multi-image ownership resolver (image-derived FB-HIST
+# candidates only) -- see resolve_historical_candidate_images() and
+# select_primary_candidate_image() below.
+IMAGE_OWNERSHIP_RESOLVED_EXCLUSIVE = "IMAGE_OWNERSHIP_RESOLVED_EXCLUSIVE"
+IMAGE_OWNERSHIP_RESOLVED_MULTI_PRODUCT = "IMAGE_OWNERSHIP_RESOLVED_MULTI_PRODUCT"
+IMAGE_OWNERSHIP_PROVENANCE_MISSING = "IMAGE_OWNERSHIP_PROVENANCE_MISSING"
+IMAGE_OWNERSHIP_CONTRADICTORY = "IMAGE_OWNERSHIP_CONTRADICTORY"
+IMAGE_PRIMARY_SELECTED = "IMAGE_PRIMARY_SELECTED"
 IMAGE_REFERENCE_SELECTED = "IMAGE_REFERENCE_SELECTED"
 IMAGE_REFERENCE_TIE_BREAK_SELECTED = "IMAGE_REFERENCE_TIE_BREAK_SELECTED"
 IMAGE_REFERENCE_CONFLICT = "IMAGE_REFERENCE_CONFLICT"
@@ -442,6 +450,214 @@ def evaluate_historical_image_ownership(
             "unambiguously."
         ),
         evidence={"sibling_candidate_codes": ()},
+    )
+
+
+# --- historical multi-image ownership resolver --------------------------
+#
+# evaluate_historical_image_ownership() above stays completely unmodified
+# and remains the first check every caller runs -- a candidate with zero
+# siblings is unaffected by anything below. The functions in this section
+# are only ever consulted as a *second*, stricter step, for the case
+# evaluate_historical_image_ownership() itself cannot resolve (siblings
+# exist): they ask whether persisted, candidate-specific provenance can
+# resolve ownership anyway, instead of falling straight to a human gate.
+#
+# Image-derived historical batches (import_image_derived_historical_
+# candidates*.py) write each candidate's own exact source image path(s)
+# into that candidate's own source_evidence.local_media_paths at import
+# time (extraction_source="MANUAL_VISUAL_REVIEW"), with a persisted
+# evidence_text explaining the visual basis for that specific mapping
+# (e.g. "5,99EUR visible, NXB Kim Dong"). That is real, persisted,
+# candidate-specific evidence -- CLAUDE.md section 11 requires "explicit
+# candidate mapping", not "no candidate shares this post at all". A
+# candidate imported through any other pathway (the original CSV-based
+# historical import, extraction_source e.g. "CLAUDE_SEMANTIC") never
+# carries this per-candidate mapping and is never resolved here -- it
+# keeps exactly today's human gate.
+
+_IMAGE_DERIVED_EXTRACTION_SOURCE = "MANUAL_VISUAL_REVIEW"
+
+
+def resolve_historical_candidate_images(
+    candidate_source_evidence: Mapping[str, Any],
+    sibling_source_evidence: Sequence[Mapping[str, Any]],
+) -> DecisionResult:
+    """
+    Deterministically resolve whether this candidate's own persisted
+    source_evidence.local_media_paths can be safely associated to it,
+    even though at least one sibling candidate shares its source post.
+
+    Ownership is never inferred from post membership, position, filename
+    similarity, or guessing -- only from exact, persisted evidence:
+      - this candidate's own extraction_source is the image-derived
+        MANUAL_VISUAL_REVIEW pathway, and it carries at least one
+        persisted local_media_paths entry (its own exact image(s));
+      - for every sibling that also names one of those same exact
+        paths (a legitimate multi-product photo, CLAUDE.md section 11's
+        "explicit candidate mapping" case), that sibling was imported
+        through the same MANUAL_VISUAL_REVIEW pathway *and* both sides
+        carry their own non-empty evidence_text distinguishing the
+        sellable units. Anything less (a non-image-derived sibling
+        naming the same path, or either side missing its distinguishing
+        evidence_text) is treated as contradictory, never auto-resolved.
+
+    AUTO_PASS evidence carries "owned_local_media_paths" -- the exact
+    paths the caller may treat as this candidate's own for extraction/
+    upload. This function never decides image rights or main-image
+    selection; see classify_historical_image_rights and
+    select_primary_candidate_image for those separate decisions.
+    """
+    extraction_source = candidate_source_evidence.get("extraction_source")
+    own_paths = list(candidate_source_evidence.get("local_media_paths") or [])
+
+    if extraction_source != _IMAGE_DERIVED_EXTRACTION_SOURCE or not own_paths:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=IMAGE_OWNERSHIP_PROVENANCE_MISSING,
+            reason=(
+                "This candidate's own image provenance is not an "
+                "explicit image-derived (MANUAL_VISUAL_REVIEW) mapping "
+                "with at least one persisted local media path -- "
+                "ownership cannot be resolved from persisted evidence "
+                "alone while its source post is shared."
+            ),
+            evidence={
+                "extraction_source": extraction_source,
+                "own_path_count": len(own_paths),
+            },
+        )
+
+    own_evidence_text = candidate_source_evidence.get("evidence_text")
+    own_path_set = set(own_paths)
+    multi_product = False
+
+    for sibling_evidence in sibling_source_evidence:
+        sibling_paths = set(sibling_evidence.get("local_media_paths") or [])
+        overlap = own_path_set & sibling_paths
+
+        if not overlap:
+            # This sibling names none of this candidate's own exact
+            # paths -- it has no bearing on this candidate's ownership.
+            continue
+
+        sibling_source = sibling_evidence.get("extraction_source")
+        sibling_evidence_text = sibling_evidence.get("evidence_text")
+
+        if (
+            sibling_source != _IMAGE_DERIVED_EXTRACTION_SOURCE
+            or not sibling_evidence_text
+            or not own_evidence_text
+        ):
+            return DecisionResult(
+                outcome=Outcome.REVIEW_REQUIRED,
+                rule_code=IMAGE_OWNERSHIP_CONTRADICTORY,
+                reason=(
+                    "A sibling candidate from the same source post names "
+                    "an overlapping image path without matching "
+                    "image-derived provenance and persisted evidence "
+                    "text on both sides -- resolve manually."
+                ),
+                evidence={"overlapping_paths": tuple(sorted(overlap))},
+            )
+
+        # Both sides are image-derived and each carries its own
+        # persisted evidence_text distinguishing the sellable units --
+        # CLAUDE.md section 11's "explicit candidate mapping" for a
+        # legitimate multi-product photo.
+        multi_product = True
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=(
+            IMAGE_OWNERSHIP_RESOLVED_MULTI_PRODUCT
+            if multi_product
+            else IMAGE_OWNERSHIP_RESOLVED_EXCLUSIVE
+        ),
+        reason=(
+            "This candidate's own image-derived (MANUAL_VISUAL_REVIEW) "
+            "provenance persists exact, candidate-specific image "
+            "path(s); any sibling naming the same path also carries "
+            "matching image-derived provenance and distinguishing "
+            "evidence text."
+            if multi_product
+            else "This candidate's own image-derived (MANUAL_VISUAL_"
+            "REVIEW) provenance persists exact image path(s) that no "
+            "sibling sharing the source post also claims."
+        ),
+        evidence={"owned_local_media_paths": tuple(own_paths)},
+    )
+
+
+def select_primary_candidate_image(
+    eligible_images: Sequence[tuple[Mapping[str, Any], str]],
+) -> DecisionResult:
+    """
+    Deterministically choose exactly one PRIMARY image out of one or more
+    images already confirmed eligible (validated-or-validatable,
+    publishable rights) for the *same* candidate.
+
+    `eligible_images` entries are (image_row, rights_status) pairs, in
+    the exact shape scripts/pipeline_state.py already builds. This
+    function only decides which single image is PRIMARY when several are
+    already known to all belong to this one candidate -- it never
+    decides *whether* an image belongs to this candidate (see
+    resolve_historical_candidate_images for that separate question), and
+    it is never itself a source of REVIEW_REQUIRED when eligible_images
+    is non-empty: CLAUDE.md 14.5's "exactly one eligible image" is about
+    ownership ambiguity, not about which of several already-confirmed,
+    equally-owned images looks best as the cover.
+
+    Selection order:
+      1. an image already carrying image_role == "FRONT_COVER" (an
+         explicit persisted primary/cover marker);
+      2. otherwise, the earliest inserted image (created_at, then
+         image_id as a stable tie-break) -- deterministic inventory
+         order. No other per-image "confidence" or "shows candidate
+         alone" field is persisted anywhere in product_images today, so
+         this function only ever ranks by what is actually recorded.
+
+    All remaining images become the GALLERY, in the same deterministic
+    order, preserved in evidence["gallery"].
+    """
+    if not eligible_images:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=IMAGE_RIGHTS_UNKNOWN,
+            reason="No eligible image exists to select a primary from.",
+            evidence={"eligible_count": 0},
+        )
+
+    def _sort_key(pair: tuple[Mapping[str, Any], str]) -> tuple[int, str, str]:
+        image, _rights_status = pair
+        is_explicit_cover = image.get("image_role") == "FRONT_COVER"
+        return (
+            0 if is_explicit_cover else 1,
+            str(image.get("created_at") or ""),
+            str(image.get("image_id") or ""),
+        )
+
+    ordered = sorted(eligible_images, key=_sort_key)
+    primary_image, primary_rights_status = ordered[0]
+    gallery = ordered[1:]
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=IMAGE_PRIMARY_SELECTED,
+        reason=(
+            f"Selected one deterministic primary image out of "
+            f"{len(eligible_images)} eligible image(s) already "
+            "confirmed to belong to this candidate; the remaining "
+            f"{len(gallery)} become gallery image(s)."
+        ),
+        evidence={
+            "primary_image_id": primary_image.get("image_id"),
+            "primary_rights_status": primary_rights_status,
+            "gallery": tuple(
+                (image.get("image_id"), rights_status)
+                for image, rights_status in gallery
+            ),
+        },
     )
 
 
