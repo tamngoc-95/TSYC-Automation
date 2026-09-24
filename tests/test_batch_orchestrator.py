@@ -92,6 +92,21 @@ def make_sync(**overrides: Any) -> dict[str, Any]:
     return row
 
 
+def make_approved_translations() -> list[dict[str, Any]]:
+    """APPROVED 'en' + 'de' product_contents rows -- the multilingual
+    precondition run_batch.py requires before any Woo draft dispatch."""
+    return [
+        {
+            "product_content_id": f"content-{language}",
+            "internal_product_id": INTERNAL_PRODUCT_ID,
+            "content_language": language,
+            "content_status": "APPROVED",
+            "review_required": False,
+        }
+        for language in ("en", "de")
+    ]
+
+
 def make_repository(**tables: list[dict[str, Any]]) -> FakeSupabaseRepository:
     return FakeSupabaseRepository(tables=dict(tables))
 
@@ -497,16 +512,19 @@ def test_accepted_warnings_continue_past_audit_checkpoint():
 
     assert report.result != "AUDIT_FAILED"
     # Content approval is now automatic (CLAUDE.md 15.3): SAVE, then
-    # APPROVE, then straight through to the Woo draft human gate -- the
-    # batch was allowed to continue past every accepted warning without
-    # ever stopping for a human decision on the content itself.
+    # APPROVE, then straight through to READY_FOR_DRAFT -- the batch was
+    # allowed to continue past every accepted warning without ever
+    # stopping for a human decision on the content itself. With no
+    # APPROVED en/de content yet, it stops at the multilingual guard
+    # (candidate-specific, not a human gate) before any Woo writer.
     assert report.actions_executed == [
         "prepare_product_content.py",
         "prepare_product_content.py",
         "check_draft_readiness.py",
     ]
     assert report.final_state == "READY_FOR_DRAFT"
-    assert report.human_gate is True
+    assert report.result == run_batch.MULTILINGUAL_CONTENT_REQUIRED
+    assert report.human_gate is False
 
 
 def test_unaccepted_warning_stops_the_batch():
@@ -767,6 +785,7 @@ def test_ready_for_draft_without_authorization_stops():
         internal_products=[
             make_internal_product(woocommerce_status="READY_FOR_DRAFT"),
         ],
+        product_contents=make_approved_translations(),
     )
     runner, calls = recording_runner()
     args = make_args(allow_woo_draft=False)
@@ -793,6 +812,7 @@ def test_ready_for_draft_with_authorization_delegates_to_draft_creation():
         internal_products=[
             make_internal_product(woocommerce_status="READY_FOR_DRAFT"),
         ],
+        product_contents=make_approved_translations(),
     )
     runner, calls = recording_runner()
     args = make_args(allow_woo_draft=True)
@@ -807,6 +827,109 @@ def test_ready_for_draft_with_authorization_delegates_to_draft_creation():
     assert PRODUCT_CODE in calls[0]
     assert "--confirm-create" in calls[0]
     assert "--non-interactive" in calls[0]
+
+
+# --------------------------------------------------------------------------
+# 13b. Multilingual guard: READY_FOR_DRAFT without APPROVED en AND de never
+#      reaches the Woo writer, even with --allow-woo-draft
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        [],
+        [make_approved_translations()[0]],  # en only
+        [
+            {**row, "content_status": "DRAFTED", "review_required": True}
+            if row["content_language"] == "de"
+            else row
+            for row in make_approved_translations()
+        ],
+    ],
+    ids=["no_translations", "de_missing", "de_drafted"],
+)
+@pytest.mark.parametrize("allow_woo_draft", [True, False])
+def test_ready_for_draft_without_multilingual_content_does_not_call_woo_writer(
+    contents, allow_woo_draft
+):
+    repository = make_repository(
+        product_candidates=[make_candidate(identity_status="IDENTITY_VERIFIED")],
+        product_references=[make_reference()],
+        internal_products=[
+            make_internal_product(woocommerce_status="READY_FOR_DRAFT"),
+        ],
+        product_contents=[dict(row) for row in contents],
+    )
+    runner, calls = recording_runner()
+    args = make_args(allow_woo_draft=allow_woo_draft)
+
+    report = run_batch.process_one_candidate(
+        CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert calls == []
+    assert report.result == run_batch.MULTILINGUAL_CONTENT_REQUIRED
+    assert report.human_gate is False
+    assert (
+        run_batch.classify_report_group(report)
+        == run_batch.MULTILINGUAL_CONTENT_REQUIRED
+    )
+
+
+def test_multilingual_guard_in_dry_run_reports_required_not_invoke():
+    repository = make_repository(
+        product_candidates=[make_candidate(identity_status="IDENTITY_VERIFIED")],
+        product_references=[make_reference()],
+        internal_products=[
+            make_internal_product(woocommerce_status="READY_FOR_DRAFT"),
+        ],
+    )
+    runner, calls = recording_runner()
+    args = make_args(dry_run=True, allow_woo_draft=True)
+
+    report = run_batch.process_one_candidate(
+        CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert calls == []
+    assert report.next_action_kind == "multilingual_content_required"
+    assert report.result == run_batch.MULTILINGUAL_CONTENT_REQUIRED
+
+
+def test_multilingual_required_candidate_not_in_woo_authorization_request(capsys):
+    report = run_batch.CandidateReport(
+        candidate_code=CANDIDATE_CODE,
+        final_state="READY_FOR_DRAFT",
+        human_gate=True,
+        result=run_batch.MULTILINGUAL_CONTENT_REQUIRED,
+    )
+
+    run_batch.print_woo_approval_request([report], allow_woo_draft=False)
+
+    assert "READY_FOR_DRAFT:" not in capsys.readouterr().out
+
+
+def test_multilingual_guard_does_not_block_non_woo_stages():
+    # DRAFT_CREATED reconciliation is not a Woo create and must still run
+    # without translations.
+    repository = make_repository(
+        product_candidates=[make_candidate(identity_status="IDENTITY_VERIFIED")],
+        product_references=[make_reference()],
+        internal_products=[
+            make_internal_product(woocommerce_status="DRAFT_CREATED"),
+        ],
+        woocommerce_product_syncs=[make_sync()],
+    )
+    runner, calls = recording_runner()
+    args = make_args(allow_woo_draft=True)
+
+    run_batch.process_one_candidate(
+        CANDIDATE_CODE, args, repository, runner, always_confirm, None
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1].endswith("sync_woocommerce_product_status.py")
 
 
 # --------------------------------------------------------------------------

@@ -42,6 +42,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console  # noqa: E402
 from src.domain.decisions import Outcome  # noqa: E402
+from src.domain.rules import lane_rules  # noqa: E402
 from src.repositories.supabase_repository import SupabaseRepository  # noqa: E402
 
 import preflight_pipeline  # noqa: E402
@@ -638,6 +639,26 @@ def decide_action(
     )
 
 
+MULTILINGUAL_CONTENT_REQUIRED = "MULTILINGUAL_CONTENT_REQUIRED"
+
+
+def multilingual_content_missing(
+    state: CandidateState,
+    bundle: dict[str, Any],
+) -> bool:
+    """
+    CLAUDE_AUTOMATION.md section 5 (Priority 1/2): a READY_FOR_DRAFT(_
+    HISTORICAL) candidate may only reach the Woo writer once APPROVED 'en'
+    AND 'de' product_contents exist. When they do not, the candidate stops
+    here with MULTILINGUAL_CONTENT_REQUIRED -- candidate-specific, not a
+    human gate, not a global stop. This guard only ever removes a Woo
+    write; it never adds one.
+    """
+    return lane_rules.is_ready_for_draft_state(
+        state.derived_state
+    ) and not lane_rules.has_multilingual_content(bundle.get("contents") or [])
+
+
 def print_pre_block(
     candidate_code: str,
     state: CandidateState,
@@ -742,6 +763,15 @@ def process_one_candidate(
 
     for _ in range(MAX_STAGES_PER_CANDIDATE):
         kind, dispatch, description = decide_action(state, args.allow_woo_draft)
+
+        if multilingual_content_missing(state, bundle):
+            kind = "multilingual_content_required"
+            dispatch = None
+            description = (
+                "APPROVED 'en' and 'de' product content is required before "
+                "WooCommerce draft creation; the Woo writer was not invoked."
+            )
+
         report.next_action_kind = kind
         report.next_action_description = description
 
@@ -776,6 +806,19 @@ def process_one_candidate(
                 state.warnings,
                 None,
                 state.human_gate,
+                state.recovery_state,
+                verbose=verbose,
+            )
+            break
+
+        if kind == "multilingual_content_required":
+            report.result = MULTILINGUAL_CONTENT_REQUIRED
+            print_post_block(
+                "MULTILINGUAL CONTENT REQUIRED (Woo writer not invoked)",
+                state.derived_state,
+                state.warnings,
+                description,
+                False,
                 state.recovery_state,
                 verbose=verbose,
             )
@@ -854,6 +897,9 @@ def process_one_candidate(
 
         new_bundle = load_candidate_bundle(repository, candidate_code)
         new_state = derive_candidate_state(new_bundle) if new_bundle else state
+
+        if new_bundle is not None:
+            bundle = new_bundle
 
         if (
             new_state.derived_state == state.derived_state
@@ -943,6 +989,14 @@ def process_one_candidate(
     report.outcome = state.outcome
     report.outcome_reason = state.outcome_reason
 
+    if report.result == MULTILINGUAL_CONTENT_REQUIRED:
+        # Candidate-specific content work, not a human gate: the live
+        # READY_FOR_DRAFT Woo-authorization gate does not apply until the
+        # multilingual content exists.
+        report.human_gate = False
+        report.human_gate_reason = None
+        report.blocked_reason = report.next_action_description
+
     return report
 
 
@@ -1015,6 +1069,7 @@ def print_detailed_summary(reports: list[CandidateReport], requested: int) -> No
 # from the summary.
 GROUP_ORDER = (
     "READY_FOR_DRAFT",
+    MULTILINGUAL_CONTENT_REQUIRED,
     "REVIEW_REQUIRED",
     "BLOCKED",
     "AUTO_REJECTED",
@@ -1050,6 +1105,11 @@ def classify_report_group(report: CandidateReport) -> str:
 
     if report.recovery_state is not None:
         return "RECOVERY_REQUIRED"
+
+    # Checked before READY_FOR_DRAFT so a multilingual-incomplete candidate
+    # is never included in the Woo authorization request.
+    if report.result == MULTILINGUAL_CONTENT_REQUIRED:
+        return MULTILINGUAL_CONTENT_REQUIRED
 
     if report.final_state == "READY_FOR_DRAFT" and report.human_gate:
         return "READY_FOR_DRAFT"
@@ -1192,6 +1252,10 @@ def print_dry_run_plan(reports: list[CandidateReport], requested: int) -> None:
             expected_final_state = current_stage
         elif kind == "blocked":
             next_action = "none -- structural precondition unmet"
+            expected_final_state = current_stage
+        elif kind == "multilingual_content_required":
+            next_action = "none -- " + report.next_action_description
+            blocker = MULTILINGUAL_CONTENT_REQUIRED
             expected_final_state = current_stage
         else:  # "human_gate"
             next_action = "none -- requires human decision"

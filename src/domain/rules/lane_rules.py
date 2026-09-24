@@ -82,6 +82,11 @@ class _CandidateStateLike(Protocol):
     product_code: str | None
 
 
+def is_ready_for_draft_state(derived_state: str) -> bool:
+    """True for the derived states that would dispatch Woo draft creation."""
+    return derived_state in _READY_FOR_DRAFT_DERIVED_STATES
+
+
 def has_multilingual_content(contents: list[dict[str, Any]]) -> bool:
     """True once both an 'en' and a 'de' product_contents row exist with
     content_status == APPROVED. Reads only rows that already exist in the
@@ -110,7 +115,11 @@ def classify_lane(
     3. READY_FOR_DRAFT -- state.derived_state is
        READY_FOR_DRAFT(_HISTORICAL), regardless of state.human_gate (the
        Woo-draft human gate is the single required business approval,
-       CLAUDE.md section 6 -- it lands in this lane, not HUMAN_REVIEW).
+       CLAUDE.md section 6 -- it lands in this lane, not HUMAN_REVIEW) --
+       but only once multilingual content is ready (APPROVED en AND de,
+       CLAUDE_AUTOMATION.md section 5 Priority 1). A READY_FOR_DRAFT
+       state without it is MULTILINGUAL_CONTENT instead, never
+       READY_FOR_DRAFT.
     4. TERMINAL -- state.terminal, or a derived_state that needs no
        further Fast Track action (RECONCILED/DRAFT_CREATED/
        DUPLICATE_REJECTED).
@@ -130,6 +139,8 @@ def classify_lane(
         return CONFLICT
 
     if state.derived_state in _READY_FOR_DRAFT_DERIVED_STATES:
+        if not multilingual_ready:
+            return MULTILINGUAL_CONTENT
         return READY_FOR_DRAFT
 
     if state.terminal or state.derived_state in _TERMINAL_DERIVED_STATES:

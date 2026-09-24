@@ -105,6 +105,38 @@ def test_g_live_candidate_still_requires_explicit_allow_woo_draft_flag():
     assert dispatch is run_batch.WOO_DRAFT_DISPATCH
 
 
+def _approved_translations() -> list[dict]:
+    return [
+        {
+            "internal_product_id": INTERNAL_PRODUCT_ID,
+            "content_language": language,
+            "content_status": "APPROVED",
+            "review_required": False,
+        }
+        for language in ("en", "de")
+    ]
+
+
+def test_g_historical_ready_for_draft_requires_multilingual_content():
+    """The historical Woo auto-dispatch is still guarded by the
+    multilingual precondition (CLAUDE_AUTOMATION.md section 5)."""
+    bundle = _bundle(HISTORICAL_CANDIDATE_CODE)
+    state = derive_candidate_state(bundle)
+
+    assert run_batch.multilingual_content_missing(state, bundle) is True
+
+    bundle["contents"] = _approved_translations()
+
+    assert run_batch.multilingual_content_missing(state, bundle) is False
+
+
+def test_g_multilingual_guard_ignores_non_ready_states():
+    bundle = _bundle(HISTORICAL_CANDIDATE_CODE, woocommerce_status="DRAFT_CREATED")
+    state = derive_candidate_state(bundle)
+
+    assert run_batch.multilingual_content_missing(state, bundle) is False
+
+
 # --- K. rerun is idempotent -------------------------------------------------
 
 

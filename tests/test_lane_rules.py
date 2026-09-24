@@ -44,6 +44,40 @@ class TestClassifyLanePrecedence:
         state = _FakeCandidateState(derived_state="READY_FOR_DRAFT_HISTORICAL")
         assert lane_rules.classify_lane(state) == lane_rules.READY_FOR_DRAFT
 
+    def test_ready_for_draft_without_multilingual_is_multilingual_content(self):
+        state = _FakeCandidateState(
+            derived_state="READY_FOR_DRAFT", human_gate=True, product_code="PROD-1"
+        )
+        assert (
+            lane_rules.classify_lane(state, multilingual_ready=False)
+            == lane_rules.MULTILINGUAL_CONTENT
+        )
+
+    def test_ready_for_draft_historical_without_multilingual_is_multilingual_content(self):
+        state = _FakeCandidateState(
+            derived_state="READY_FOR_DRAFT_HISTORICAL", product_code="PROD-1"
+        )
+        assert (
+            lane_rules.classify_lane(state, multilingual_ready=False)
+            == lane_rules.MULTILINGUAL_CONTENT
+        )
+
+    def test_recovery_and_conflict_still_outrank_multilingual(self):
+        recovery = _FakeCandidateState(
+            derived_state="READY_FOR_DRAFT_HISTORICAL",
+            recovery_state="CREATE_RESULT_UNCERTAIN",
+            product_code="PROD-1",
+        )
+        assert (
+            lane_rules.classify_lane(recovery, multilingual_ready=False)
+            == lane_rules.RECOVERY_REVIEW
+        )
+
+    def test_is_ready_for_draft_state(self):
+        assert lane_rules.is_ready_for_draft_state("READY_FOR_DRAFT")
+        assert lane_rules.is_ready_for_draft_state("READY_FOR_DRAFT_HISTORICAL")
+        assert not lane_rules.is_ready_for_draft_state("DRAFT_CREATED")
+
     def test_reconciled_is_terminal(self):
         state = _FakeCandidateState(derived_state="RECONCILED", terminal=True)
         assert lane_rules.classify_lane(state) == lane_rules.TERMINAL
