@@ -14,7 +14,7 @@ from create_internal_product import is_historical_candidate_code
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.content_status import ContentStatus
 from src.domain.decisions import Outcome
-from src.domain.rules import content_rules
+from src.domain.rules import content_rules, translation_rules
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -22,7 +22,24 @@ configure_utf8_console()
 
 GENERATOR_NAME = "internal_product_content_generator"
 GENERATOR_VERSION = "1.5.0"
+TRANSLATION_GENERATOR_NAME = "internal_product_content_translation"
+TRANSLATION_GENERATOR_VERSION = "1.0.0"
 VALID_ACTIONS = {"PREVIEW", "SAVE", "APPROVE", "REVISE", "AUTO_REVISE", "SKIP"}
+
+# product_contents.content_language values (migrations/008 check
+# constraint). 'vi' is the canonical source; 'en'/'de' are localizations
+# of an already-APPROVED 'vi' row (CLAUDE_AUTOMATION.md section 9).
+VALID_CONTENT_LANGUAGES = ("vi", "en", "de")
+TRANSLATION_ACTIONS = {"PREVIEW", "SAVE", "APPROVE", "SKIP"}
+
+# Fields an en/de --content-file may carry: the translated text fields
+# plus section 9.2 provenance. Anything else is rejected, so a translation
+# file can never write an arbitrary column.
+TRANSLATION_PROVENANCE_FIELDS = {"content_source", "facts_used", "generation_method"}
+TRANSLATION_FILE_FIELDS = (
+    set(translation_rules.TRANSLATABLE_TEXT_FIELDS) | TRANSLATION_PROVENANCE_FIELDS
+)
+TRANSLATION_GENERATION_METHODS = {"MANUAL", "AI_ASSISTED", "HYBRID"}
 
 # Minimum length of an excerpt used as short_description/seo_description
 # when auto-enriching from a reference description -- short enough to stay
@@ -126,6 +143,18 @@ def parse_arguments() -> argparse.Namespace:
             "--non-interactive --action REVISE."
         ),
     )
+    parser.add_argument(
+        "--content-language",
+        choices=VALID_CONTENT_LANGUAGES,
+        default="vi",
+        type=str.lower,
+        help=(
+            "Content language (default vi; existing Vietnamese behavior "
+            "unchanged). en/de require an existing APPROVED vi row for "
+            "--product-code, accept content only via --content-file, and "
+            "support PREVIEW (validate, no write), SAVE, APPROVE, SKIP."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -185,14 +214,16 @@ def get_products(
 def get_existing_content(
     repository: SupabaseRepository,
     internal_product_id: str,
+    content_language: str = "vi",
 ) -> dict[str, Any] | None:
-    """Return existing Vietnamese content for one internal product."""
+    """Return existing content in one language (default Vietnamese) for
+    one internal product."""
     response = (
         repository.client
         .table("product_contents")
         .select("*")
         .eq("internal_product_id", internal_product_id)
-        .eq("content_language", "vi")
+        .eq("content_language", content_language)
         .limit(1)
         .execute()
     )
@@ -1350,6 +1381,387 @@ def run_auto_revise_action(
     return result
 
 
+def validate_translation_payload(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Validate an en/de --content-file payload against the translation
+    schema. Only TRANSLATION_FILE_FIELDS may be present; text fields must
+    be strings; facts_used must be a list of strings; generation_method
+    must be a product_contents-allowed non-RULE_BASED method.
+    """
+    unknown_fields = sorted(set(payload) - TRANSLATION_FILE_FIELDS)
+
+    if unknown_fields:
+        raise RuntimeError(
+            "Translation content file contains unsupported field(s): "
+            + ", ".join(unknown_fields)
+            + ". Allowed fields: "
+            + ", ".join(sorted(TRANSLATION_FILE_FIELDS))
+        )
+
+    validated: dict[str, Any] = {}
+
+    for field, value in payload.items():
+        if field == "facts_used":
+            if not isinstance(value, list) or not all(
+                isinstance(item, str) for item in value
+            ):
+                raise RuntimeError(
+                    "Translation content file field 'facts_used' must be a "
+                    "list of strings."
+                )
+            validated[field] = value
+            continue
+
+        if value is None:
+            continue
+
+        if not isinstance(value, str):
+            raise RuntimeError(
+                f"Translation content file field {field!r} must be a "
+                f"string, got {type(value).__name__}."
+            )
+
+        validated[field] = value
+
+    method = validated.get("generation_method")
+    if method is not None and method not in TRANSLATION_GENERATION_METHODS:
+        raise RuntimeError(
+            "Translation generation_method must be one of "
+            + ", ".join(sorted(TRANSLATION_GENERATION_METHODS))
+            + f", got {method!r}."
+        )
+
+    return validated
+
+
+def require_approved_vietnamese_content(
+    vi_content: dict[str, Any] | None,
+    product_code: str,
+) -> dict[str, Any]:
+    """en/de content is a localization of the APPROVED vi row -- refuse
+    when there is none (CLAUDE_AUTOMATION.md section 9.1)."""
+    if (
+        vi_content is None
+        or vi_content.get("content_status") != ContentStatus.APPROVED
+        or vi_content.get("review_required") is not False
+    ):
+        raise RuntimeError(
+            "Translation refused: product "
+            f"{product_code} has no APPROVED Vietnamese content "
+            "(content_status=APPROVED, review_required=false). Vietnamese "
+            "is the semantic source; approve it first."
+        )
+
+    return vi_content
+
+
+def validate_translation_target(
+    existing: dict[str, Any] | None,
+    language: str,
+    *,
+    allow_missing: bool,
+) -> dict[str, Any] | None:
+    """Never touch an APPROVED or REJECTED translation row."""
+    if existing is None:
+        if allow_missing:
+            return None
+        raise RuntimeError(
+            f"No {language!r} product_contents row exists. Run --action "
+            "SAVE with --content-file first."
+        )
+
+    status = existing.get("content_status")
+
+    if status == ContentStatus.APPROVED:
+        raise RuntimeError(
+            f"Refusing to modify APPROVED {language!r} content. Approved "
+            "content must never be silently overwritten."
+        )
+
+    if status == ContentStatus.REJECTED:
+        raise RuntimeError(f"Refusing to modify REJECTED {language!r} content.")
+
+    if status not in (ContentStatus.DRAFTED, ContentStatus.REVIEW_REQUIRED):
+        raise RuntimeError(
+            f"{language!r} content requires content_status=DRAFTED or "
+            f"REVIEW_REQUIRED, got {status!r}."
+        )
+
+    return existing
+
+
+def build_translation_provenance(
+    vi_content: dict[str, Any],
+    product: dict[str, Any],
+    validated_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """CLAUDE_AUTOMATION.md 9.2 content_source/facts_used. product_contents
+    has no dedicated columns, so this is serialized into review_notes."""
+    payload = validated_payload or {}
+    return {
+        "content_source": payload.get("content_source")
+        or f"product_contents:{vi_content.get('product_content_id')} (vi APPROVED)",
+        "facts_used": payload.get("facts_used")
+        or translation_rules.facts_used(vi_content, product),
+    }
+
+
+def evaluate_translation_for_product(
+    repository: SupabaseRepository,
+    product: dict[str, Any],
+    language: str,
+    translation: dict[str, Any],
+    vi_content: dict[str, Any],
+):
+    """Run translation_rules.evaluate_translation() with the candidate's
+    candidate_type (combo/individual distinction)."""
+    candidate_type = None
+    if product.get("candidate_id"):
+        candidate_type = get_candidate_for_product(
+            repository=repository,
+            candidate_id=product["candidate_id"],
+        ).get("candidate_type")
+
+    return translation_rules.evaluate_translation(
+        language=language,
+        translation=translation,
+        vi_content=vi_content,
+        product=product,
+        candidate_type=candidate_type,
+    )
+
+
+def save_translation_content(
+    repository: SupabaseRepository,
+    product: dict[str, Any],
+    language: str,
+    existing: dict[str, Any] | None,
+    content: dict[str, Any],
+    status: str,
+    review_notes: str,
+    generation_method: str,
+) -> dict[str, Any]:
+    """
+    Insert or update exactly one en/de product_contents row.
+
+    Unlike save_content(), this never writes internal_products:
+    internal_products.content_status mirrors the Vietnamese row
+    (audit_pipeline_state.py CONTENT_STATUS_MISMATCH), and a translation
+    must never move it. The (internal_product_id, content_language) unique
+    constraint is the final duplicate guard; the caller already resolved
+    `existing` for this exact language.
+    """
+    now = utc_now()
+    is_approved = status == ContentStatus.APPROVED
+
+    payload = {
+        **{
+            field: content.get(field)
+            for field in translation_rules.TRANSLATABLE_TEXT_FIELDS
+        },
+        "content_language": language,
+        "content_status": status,
+        "generation_method": generation_method,
+        "generator_name": TRANSLATION_GENERATOR_NAME,
+        "generator_version": TRANSLATION_GENERATOR_VERSION,
+        "review_required": not is_approved,
+        "review_notes": review_notes,
+        "approved_at": now if is_approved else None,
+        "updated_at": now,
+    }
+
+    table = repository.client.table("product_contents")
+
+    if existing:
+        response = (
+            table.update(payload)
+            .eq("product_content_id", existing["product_content_id"])
+            .eq("content_language", language)
+            .execute()
+        )
+    else:
+        payload["internal_product_id"] = product["internal_product_id"]
+        response = table.insert(payload).execute()
+
+    rows = response.data or []
+
+    if len(rows) != 1:
+        raise RuntimeError(
+            f"{language!r} product content write did not return exactly one row."
+        )
+
+    return rows[0]
+
+
+def run_translation_action(
+    repository: SupabaseRepository,
+    action: str,
+    language: str,
+    product_code: str | None,
+    content_file: str | None,
+    non_interactive: bool,
+) -> dict[str, Any] | None:
+    """
+    en/de content workflow (CLAUDE_AUTOMATION.md section 9).
+
+    PREVIEW  validate --content-file against the APPROVED vi row; no write.
+    SAVE     validate the file schema, then create (or update in place a
+             DRAFTED/REVIEW_REQUIRED) row for this language as DRAFTED.
+    APPROVE  run deterministic translation validation on the stored row:
+             APPROVED on pass; on failure REVIEW_REQUIRED for this
+             language only (never vi, never internal_products).
+    SKIP     no-op.
+
+    Always refuses without an APPROVED vi row, never touches an APPROVED
+    or REJECTED translation, never writes internal_products.
+    """
+    if language not in translation_rules.TRANSLATION_LANGUAGES:
+        raise RuntimeError(f"Unsupported translation language: {language!r}.")
+
+    if action not in TRANSLATION_ACTIONS:
+        raise RuntimeError(
+            f"--action {action} is not supported with --content-language "
+            f"{language}. Use PREVIEW, SAVE, APPROVE, or SKIP."
+        )
+
+    if not product_code:
+        raise RuntimeError(
+            f"--content-language {language} requires --product-code (exact "
+            "targeting only)."
+        )
+
+    if action in {"SAVE", "APPROVE"} and not non_interactive:
+        raise RuntimeError(
+            f"--content-language {language} --action {action} requires "
+            "--non-interactive."
+        )
+
+    if action in {"PREVIEW", "SAVE"} and not content_file:
+        raise RuntimeError(
+            f"--content-language {language} --action {action} requires "
+            "--content-file."
+        )
+
+    if action == "SKIP":
+        print("No database changes were made.")
+        return None
+
+    products = get_products(repository, product_code)
+
+    if not products:
+        raise RuntimeError(f"Internal product was not found: {product_code}")
+
+    product = products[0]
+    vi_content = require_approved_vietnamese_content(
+        get_existing_content(repository, product["internal_product_id"], "vi"),
+        product_code,
+    )
+    existing = get_existing_content(
+        repository, product["internal_product_id"], language
+    )
+
+    print()
+    print("=" * 78)
+    print(f"TRANSLATION {action} ({language})")
+    print("=" * 78)
+    print(f"Product code: {product_code}")
+    print(
+        "Existing content status: "
+        f"{existing.get('content_status') if existing else '[missing]'}"
+    )
+
+    if action in {"PREVIEW", "SAVE"}:
+        validated_payload = validate_translation_payload(
+            load_reviewer_content_file(Path(content_file))
+        )
+        translation = {
+            field: validated_payload.get(field)
+            for field in translation_rules.TRANSLATABLE_TEXT_FIELDS
+        }
+        decision = evaluate_translation_for_product(
+            repository, product, language, translation, vi_content
+        )
+        print(
+            "Deterministic validation: "
+            f"{'PASS' if decision.is_auto_pass else 'FAIL'} -- {decision.reason}"
+        )
+
+        if action == "PREVIEW":
+            print("No database changes were made.")
+            return None
+
+        existing = validate_translation_target(
+            existing, language, allow_missing=True
+        )
+        provenance = build_translation_provenance(
+            vi_content, product, validated_payload
+        )
+        result = save_translation_content(
+            repository=repository,
+            product=product,
+            language=language,
+            existing=existing,
+            content=translation,
+            status=ContentStatus.DRAFTED,
+            review_notes=(
+                "Translation draft saved from APPROVED vi content. "
+                "provenance=" + json.dumps(provenance, ensure_ascii=False)
+            ),
+            generation_method=validated_payload.get(
+                "generation_method", "AI_ASSISTED"
+            ),
+        )
+    else:  # APPROVE
+        existing = validate_translation_target(
+            existing, language, allow_missing=False
+        )
+        translation = {
+            field: existing.get(field)
+            for field in translation_rules.TRANSLATABLE_TEXT_FIELDS
+        }
+        decision = evaluate_translation_for_product(
+            repository, product, language, translation, vi_content
+        )
+        provenance = build_translation_provenance(vi_content, product)
+        provenance_note = "provenance=" + json.dumps(provenance, ensure_ascii=False)
+
+        if decision.is_auto_pass:
+            status = ContentStatus.APPROVED
+            review_notes = (
+                "Translation approved by deterministic validation. "
+                + provenance_note
+            )
+        else:
+            status = ContentStatus.REVIEW_REQUIRED
+            review_notes = (
+                f"CONTENT_REVIEW_REQUIRED ({language}): automatic approval "
+                f"declined: [{decision.rule_code}] {decision.reason} "
+                + provenance_note
+            )
+
+        result = save_translation_content(
+            repository=repository,
+            product=product,
+            language=language,
+            existing=existing,
+            content=translation,
+            status=status,
+            review_notes=review_notes,
+            generation_method=existing.get("generation_method") or "AI_ASSISTED",
+        )
+        print(
+            "Deterministic validation: "
+            f"{'PASS' if decision.is_auto_pass else 'FAIL'} -- {decision.reason}"
+        )
+
+    print(f"Content ID: {result.get('product_content_id')}")
+    print(f"Content status: {result.get('content_status')}")
+    print(f"Review required: {result.get('review_required')}")
+    return result
+
+
 def resolve_action(
     args: argparse.Namespace,
 ) -> str:
@@ -1388,6 +1800,19 @@ def main() -> None:
         print(
             "Invalid action. Use PREVIEW, SAVE, APPROVE, REVISE, "
             "AUTO_REVISE, or SKIP."
+        )
+        return
+
+    content_language = getattr(args, "content_language", "vi") or "vi"
+
+    if content_language != "vi":
+        run_translation_action(
+            repository=repository,
+            action=action,
+            language=content_language,
+            product_code=args.product_code,
+            content_file=args.content_file,
+            non_interactive=args.non_interactive,
         )
         return
 
