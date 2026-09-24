@@ -369,6 +369,172 @@ def load_candidate_bundle(
     }
 
 
+def load_all_candidate_bundles(
+    repository: SupabaseRepository,
+) -> dict[str, dict[str, Any]]:
+    """
+    Bulk equivalent of load_candidate_bundle(): reads each relevant table
+    exactly once (the same full-table-read pattern
+    scripts/audit_pipeline_state.py already uses for its own read-only
+    cross-table audit) and returns the same per-candidate bundle shape
+    load_candidate_bundle() returns, keyed by candidate_code, without a
+    per-candidate round trip. Intended for read-only aggregate reporting
+    over the whole backlog (scripts/export_historical_orchestration_
+    state.py); scripts/run_batch.py and check_draft_readiness.py keep
+    using load_candidate_bundle() for one bounded, explicitly-allowlisted
+    candidate at a time -- this function does not replace that contract.
+    """
+    candidates = (
+        repository.client.table("product_candidates").select("*").execute().data
+        or []
+    )
+    references = (
+        repository.client.table("product_references").select("*").execute().data
+        or []
+    )
+    discovery_sources = (
+        repository.client.table("candidate_reference_sources")
+        .select("*")
+        .execute()
+        .data
+        or []
+    )
+    images = (
+        repository.client.table("product_images").select("*").execute().data or []
+    )
+    internal_products = (
+        repository.client.table("internal_products").select("*").execute().data or []
+    )
+    contents = (
+        repository.client.table("product_contents").select("*").execute().data or []
+    )
+    syncs = (
+        repository.client.table("woocommerce_product_syncs")
+        .select("*")
+        .execute()
+        .data
+        or []
+    )
+
+    references_by_candidate: dict[str, list[dict[str, Any]]] = {}
+    for reference in references:
+        references_by_candidate.setdefault(
+            str(reference.get("candidate_id")), []
+        ).append(reference)
+
+    discovery_by_candidate: dict[str, list[dict[str, Any]]] = {}
+    for source in discovery_sources:
+        discovery_by_candidate.setdefault(
+            str(source.get("candidate_id")), []
+        ).append(source)
+
+    images_by_candidate: dict[str, list[dict[str, Any]]] = {}
+    for image in images:
+        images_by_candidate.setdefault(str(image.get("candidate_id")), []).append(
+            image
+        )
+
+    internal_product_by_candidate: dict[str, dict[str, Any]] = {
+        str(product.get("candidate_id")): product
+        for product in internal_products
+        if product.get("candidate_id")
+    }
+
+    contents_by_product: dict[str, list[dict[str, Any]]] = {}
+    for content in contents:
+        contents_by_product.setdefault(
+            str(content.get("internal_product_id")), []
+        ).append(content)
+
+    sync_by_product: dict[str, dict[str, Any]] = {
+        str(sync.get("internal_product_id")): sync
+        for sync in syncs
+        if sync.get("internal_product_id")
+    }
+
+    candidates_by_raw_page: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        raw_page_id = candidate.get("raw_page_id")
+        if raw_page_id:
+            candidates_by_raw_page.setdefault(str(raw_page_id), []).append(candidate)
+
+    # check_historical_image_capability() is a filesystem probe, not a DB
+    # call, and its result does not vary per candidate -- computed at
+    # most once and reused, instead of once per candidate.
+    capability_cache: dict[str, Any] = {}
+
+    def _capability() -> Any:
+        if "value" not in capability_cache:
+            capability_cache["value"] = check_historical_image_capability(
+                PROJECT_ROOT
+            )
+        return capability_cache["value"]
+
+    bundles: dict[str, dict[str, Any]] = {}
+
+    for candidate in candidates:
+        candidate_id = str(candidate.get("candidate_id"))
+        candidate_code = candidate.get("candidate_code")
+        candidate_images = images_by_candidate.get(candidate_id, [])
+
+        source_evidence = candidate.get("source_evidence") or {}
+        local_media_paths = filter_historical_image_paths(
+            source_evidence.get("local_media_paths") or []
+        )
+
+        historical_capability_available: bool | None = None
+        historical_capability_reason: str | None = None
+        sibling_candidate_codes: list[str] = []
+        sibling_source_evidence: list[dict[str, Any]] = []
+
+        if local_media_paths and not candidate_images:
+            capability = _capability()
+            historical_capability_available = capability.available
+            historical_capability_reason = capability.reason
+
+            raw_page_id = candidate.get("raw_page_id")
+
+            if raw_page_id:
+                siblings = candidates_by_raw_page.get(str(raw_page_id), [])
+                sibling_candidate_codes = [
+                    sibling["candidate_code"]
+                    for sibling in siblings
+                    if sibling.get("candidate_id") != candidate.get("candidate_id")
+                    and sibling.get("candidate_code")
+                ]
+                sibling_source_evidence = [
+                    sibling.get("source_evidence") or {}
+                    for sibling in siblings
+                    if sibling.get("candidate_id") != candidate.get("candidate_id")
+                ]
+
+        internal_product = internal_product_by_candidate.get(candidate_id)
+        candidate_contents: list[dict[str, Any]] = []
+        sync: dict[str, Any] | None = None
+
+        if internal_product:
+            internal_product_id = str(internal_product.get("internal_product_id"))
+            candidate_contents = contents_by_product.get(internal_product_id, [])
+            sync = sync_by_product.get(internal_product_id)
+
+        bundles[candidate_code] = {
+            "candidate": candidate,
+            "references": references_by_candidate.get(candidate_id, []),
+            "discovery_sources": discovery_by_candidate.get(candidate_id, []),
+            "images": candidate_images,
+            "internal_product": internal_product,
+            "contents": candidate_contents,
+            "sync": sync,
+            "historical_local_media_paths": local_media_paths,
+            "historical_capability_available": historical_capability_available,
+            "historical_capability_reason": historical_capability_reason,
+            "sibling_candidate_codes": sibling_candidate_codes,
+            "sibling_source_evidence": sibling_source_evidence,
+        }
+
+    return bundles
+
+
 def _warnings_for_internal_product(
     internal_product: dict[str, Any],
 ) -> list[str]:

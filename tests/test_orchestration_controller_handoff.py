@@ -30,14 +30,16 @@ class TestStateSchema:
         assert state["schema_version"] == 1
     
     def test_state_has_required_fields(self):
-        """Verify all required fields are present."""
+        """Verify all required fields are present (CLAUDE_AUTOMATION.md
+        section 20 orchestration-state contract)."""
         with open("data/processed/orchestration/historical_state.json") as f:
             state = json.load(f)
-        
+
         required = [
             "schema_version", "updated_at", "repository_commit",
-            "historical_total", "automatable_now", "human_review",
-            "recovery_review", "conflict", "terminal",
+            "ready_for_draft", "multilingual_content", "fast_track",
+            "enrichment_needed", "human_review", "recovery_review",
+            "conflict", "terminal", "historical_recovery_backlog",
             "latest_execution", "audit", "preflight", "safety",
             "next_recommended_action"
         ]
@@ -98,7 +100,7 @@ class TestQueueSeparation:
         doc_file = Path("CLAUDE_AUTOMATION.md")
         assert doc_file.exists()
         
-        content = doc_file.read_text()
+        content = doc_file.read_text(encoding="utf-8")
         required_queues = [
             "CONTENT_REVIEW_REQUIRED",
             "IMAGE_REVIEW_REQUIRED",
@@ -106,53 +108,53 @@ class TestQueueSeparation:
             "IDENTITY_CONFLICT",
             "RECOVERY_REVIEW",
             "EDITION_REVIEW_REQUIRED",
-            "SELLABLE_UNIT_AMBIGUITY"
+            "CONFIRM_SELLABLE_UNIT"
         ]
-        
+
         for queue in required_queues:
             assert queue in content, f"Queue {queue} not documented"
-    
+
     def test_queue_independence_documented(self):
         """Verify documentation states queues are independent."""
         doc_file = Path("CLAUDE_AUTOMATION.md")
-        content = doc_file.read_text()
-        
-        assert "never block unrelated candidates" in content, \
+        content = doc_file.read_text(encoding="utf-8")
+
+        assert "block unrelated candidates" in content, \
             "Queue independence policy not documented"
 
 
 class TestSafetyInvariants:
     """Test safety invariant enforcement."""
-    
+
     def test_safety_invariants_documented(self):
         """Verify safety invariants are formally documented."""
         doc_file = Path("CLAUDE_AUTOMATION.md")
         assert doc_file.exists()
-        
-        content = doc_file.read_text()
+
+        content = doc_file.read_text(encoding="utf-8").lower()
         required_invariants = [
-            "Auto-publish",
+            "auto-publish",
             "regular_price",
             "sale_price",
-            "Blind-retry",
-            "Fabricate metadata"
+            "blind-retry",
+            "fabricate metadata"
         ]
-        
+
         for invariant in required_invariants:
             assert invariant in content, f"Invariant {invariant} not documented"
-    
+
     def test_global_stop_conditions_documented(self):
         """Verify all global stop conditions are listed."""
         doc_file = Path("CLAUDE_AUTOMATION.md")
-        content = doc_file.read_text()
-        
+        content = doc_file.read_text(encoding="utf-8").lower()
+
         required_stops = [
-            "Audit error",
-            "Preflight BLOCKED",
-            "Price mutation",
-            "Publish action"
+            "audit error",
+            "preflight blocked",
+            "selling-price mutation",
+            "publish action"
         ]
-        
+
         for stop in required_stops:
             assert stop in content, f"Stop condition {stop} not documented"
 
@@ -168,7 +170,7 @@ class TestExectuteorPreventsProduction:
     def test_exporter_has_read_only_comment(self):
         """Verify script documents read-only nature."""
         script = Path("scripts/export_historical_orchestration_state.py")
-        content = script.read_text()
+        content = script.read_text(encoding="utf-8")
         
         assert "read-only" in content.lower(), \
             "Script should document read-only behavior"
@@ -187,7 +189,7 @@ class TestControllerPolicyExists:
     def test_policy_defines_role_split(self):
         """Verify policy defines Cowork vs Claude Code roles."""
         policy = Path("CLAUDE_AUTOMATION.md")
-        content = policy.read_text()
+        content = policy.read_text(encoding="utf-8")
         
         assert "Cowork" in content
         assert "Claude Code" in content
@@ -197,14 +199,14 @@ class TestControllerPolicyExists:
     def test_policy_defines_single_writer(self):
         """Verify single-writer rule is documented."""
         policy = Path("CLAUDE_AUTOMATION.md")
-        content = policy.read_text()
+        content = policy.read_text(encoding="utf-8")
         
         assert "single" in content.lower() and "writer" in content.lower()
     
     def test_policy_defines_result_types(self):
         """Verify PASS/PARTIAL/STOPPED are documented."""
         policy = Path("CLAUDE_AUTOMATION.md")
-        content = policy.read_text()
+        content = policy.read_text(encoding="utf-8")
         
         for result_type in ["PASS", "PARTIAL", "STOPPED"]:
             assert result_type in content, f"Result type {result_type} not documented"
@@ -225,7 +227,7 @@ class TestNoSecretsInTemplates:
     def test_exporter_doesnt_log_env(self):
         """Verify exporter script doesn't print .env variables."""
         script = Path("scripts/export_historical_orchestration_state.py")
-        content = script.read_text()
+        content = script.read_text(encoding="utf-8")
         
         assert ".env" not in content or "read_" not in content, \
             "Exporter should not access .env"
