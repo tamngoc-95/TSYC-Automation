@@ -479,6 +479,10 @@ PENDING
 ---
 15.1 Content drafting
 Content must be based only on verified data.
+Before generating, revising, translating, reviewing, or approving product descriptions, read:
+docs/content_style/TSYC_CONTENT_GUIDE.md
+and the relevant approved examples under:
+docs/content_style/examples/
 Do not invent missing facts.
 Default generated drafts must be customer-facing.
 Never put internal workflow text into storefront content.
@@ -516,6 +520,24 @@ customer-facing Vietnamese is structurally valid
 If validation fails or ambiguity remains:
 STOP for human review.
 Do not require human approval merely because the operation changes content_status to APPROVED.
+---
+15.4 Content Style Source of Truth
+The official reusable content-style references are:
+docs/content_style/TSYC_CONTENT_GUIDE.md
+docs/content_style/examples/
+Rules:
+Before generating, revising, translating, reviewing, or approving any VI/EN/DE product description, read the content guide and the relevant approved examples.
+Verified product data, approved references, and candidate-specific evidence remain the factual source of truth.
+The content guide controls tone, structure, wording, localization style, and presentation only.
+Approved examples are style references only. Never copy facts, numbers, ages, benefits, plot details, metadata, ISBN, author, publisher, dimensions, weight, edition, price, stock, shipping wording, or translated titles from one example into another product unless independently verified for that product.
+Vietnamese is the canonical semantic reference for multilingual content unless an explicit project rule states otherwise.
+English and German must be natural localizations, not literal machine-style translations.
+Official book, author, publisher, and series names must be preserved unless an independently verified official localized name exists.
+If style guidance conflicts with verified product facts, verified product facts win.
+If style guidance conflicts with CLAUDE.md safety/business rules, CLAUDE.md wins.
+Uncertainty, missing-data notes, validator reasons, and internal workflow messages belong in operator/review/log fields and must never be inserted into customer-facing storefront descriptions.
+Do not pad a description with invented detail merely to satisfy a target paragraph count or length.
+Approved example files may be expanded over time as the shop owner explicitly accepts new examples; unapproved drafts must remain outside the canonical examples set.
 ---
 16. Readiness
 READY_FOR_DRAFT requires:
@@ -708,6 +730,8 @@ image rights gating
 Minh Khai image extraction fallback
 content REVISE workflow
 APPROVED-content overwrite protection
+content-style source-of-truth references
+multilingual localization consistency
 Woo image identifier contract
 WordPress media reuse
 Woo draft-only payload
@@ -728,6 +752,7 @@ unless a test is explicitly categorized as a manual/integration check and exclud
 Normal production flow should be:
 Run preflight.
 Select explicit bounded candidate batch.
+Before any content-writing stage, read docs/content_style/TSYC_CONTENT_GUIDE.md and relevant approved examples under docs/content_style/examples/.
 Run orchestrator.
 Let deterministic stages auto-progress.
 Stop only if true ambiguity/recovery occurs.
