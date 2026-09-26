@@ -12,10 +12,17 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from create_internal_product import is_historical_candidate_code
 from src.cli_bootstrap import configure_utf8_console
+from src.domain.content_package import ContentPackage, build_content_package
 from src.domain.content_status import ContentStatus
 from src.domain.decisions import Outcome
-from src.domain.rules import content_rules, translation_rules
+from src.domain.rules import content_rules, multilingual_consistency, translation_rules
 from src.repositories.supabase_repository import SupabaseRepository
+from src.services.translation_provider import (
+    DEFAULT_PACKAGE_DIR,
+    TranslationProvider,
+    get_translation_provider,
+    package_file_path,
+)
 
 configure_utf8_console()
 
@@ -24,7 +31,17 @@ GENERATOR_NAME = "internal_product_content_generator"
 GENERATOR_VERSION = "1.5.0"
 TRANSLATION_GENERATOR_NAME = "internal_product_content_translation"
 TRANSLATION_GENERATOR_VERSION = "1.0.0"
-VALID_ACTIONS = {"PREVIEW", "SAVE", "APPROVE", "REVISE", "AUTO_REVISE", "SKIP"}
+VALID_ACTIONS = {
+    "PREVIEW",
+    "SAVE",
+    "APPROVE",
+    "REVISE",
+    "AUTO_REVISE",
+    "SKIP",
+    # Multilingual path (CLAUDE_AUTOMATION.md section 9): en+de together.
+    "TRANSLATE",
+    "EXPORT_PACKAGE",
+}
 
 # product_contents.content_language values (migrations/008 check
 # constraint). 'vi' is the canonical source; 'en'/'de' are localizations
@@ -116,7 +133,13 @@ def parse_arguments() -> argparse.Namespace:
         "--action",
         choices=sorted(VALID_ACTIONS),
         type=str.upper,
-        help="PREVIEW, SAVE, APPROVE, REVISE, AUTO_REVISE, or SKIP.",
+        help=(
+            "PREVIEW, SAVE, APPROVE, REVISE, AUTO_REVISE, or SKIP; "
+            "TRANSLATE (en+de from APPROVED vi via --translation-provider, "
+            "cross-language validation, existing translation save/approve "
+            "path) or EXPORT_PACKAGE (write the content package JSON, no "
+            "database write)."
+        ),
     )
     parser.add_argument(
         "--non-interactive",
@@ -153,6 +176,18 @@ def parse_arguments() -> argparse.Namespace:
             "unchanged). en/de require an existing APPROVED vi row for "
             "--product-code, accept content only via --content-file, and "
             "support PREVIEW (validate, no write), SAVE, APPROVE, SKIP."
+        ),
+    )
+    parser.add_argument(
+        "--translation-provider",
+        choices=("package-file", "claude"),
+        default="package-file",
+        help=(
+            "EN/DE source for --action TRANSLATE. package-file (default, "
+            "offline) reads data/processed/content_packages/"
+            "<candidate_code>.json (create it with --action "
+            "EXPORT_PACKAGE, then fill the en/de fields); claude calls the "
+            "Claude API (opt-in, requires ANTHROPIC_API_KEY)."
         ),
     )
     return parser.parse_args()
@@ -1595,6 +1630,83 @@ def save_translation_content(
     return rows[0]
 
 
+def save_translation_draft(
+    repository: SupabaseRepository,
+    product: dict[str, Any],
+    language: str,
+    vi_content: dict[str, Any],
+    existing: dict[str, Any] | None,
+    translation: dict[str, Any],
+    validated_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Translation SAVE: create, or update in place a DRAFTED/
+    REVIEW_REQUIRED, row for this language as DRAFTED. Never touches an
+    APPROVED/REJECTED row."""
+    existing = validate_translation_target(existing, language, allow_missing=True)
+    provenance = build_translation_provenance(vi_content, product, validated_payload)
+    return save_translation_content(
+        repository=repository,
+        product=product,
+        language=language,
+        existing=existing,
+        content=translation,
+        status=ContentStatus.DRAFTED,
+        review_notes=(
+            "Translation draft saved from APPROVED vi content. "
+            "provenance=" + json.dumps(provenance, ensure_ascii=False)
+        ),
+        generation_method=validated_payload.get("generation_method", "AI_ASSISTED"),
+    )
+
+
+def approve_translation(
+    repository: SupabaseRepository,
+    product: dict[str, Any],
+    language: str,
+    vi_content: dict[str, Any],
+    existing: dict[str, Any] | None,
+):
+    """Translation APPROVE: deterministic translation_rules validation of
+    the stored row -> APPROVED on pass, REVIEW_REQUIRED (this language
+    only) on failure. Returns (row, decision)."""
+    existing = validate_translation_target(existing, language, allow_missing=False)
+    translation = {
+        field: existing.get(field)
+        for field in translation_rules.TRANSLATABLE_TEXT_FIELDS
+    }
+    decision = evaluate_translation_for_product(
+        repository, product, language, translation, vi_content
+    )
+    provenance = build_translation_provenance(vi_content, product)
+    provenance_note = "provenance=" + json.dumps(provenance, ensure_ascii=False)
+
+    if decision.is_auto_pass:
+        status = ContentStatus.APPROVED
+        review_notes = (
+            "Translation approved by deterministic validation. "
+            + provenance_note
+        )
+    else:
+        status = ContentStatus.REVIEW_REQUIRED
+        review_notes = (
+            f"CONTENT_REVIEW_REQUIRED ({language}): automatic approval "
+            f"declined: [{decision.rule_code}] {decision.reason} "
+            + provenance_note
+        )
+
+    result = save_translation_content(
+        repository=repository,
+        product=product,
+        language=language,
+        existing=existing,
+        content=translation,
+        status=status,
+        review_notes=review_notes,
+        generation_method=existing.get("generation_method") or "AI_ASSISTED",
+    )
+    return result, decision
+
+
 def run_translation_action(
     repository: SupabaseRepository,
     action: str,
@@ -1692,64 +1804,22 @@ def run_translation_action(
             print("No database changes were made.")
             return None
 
-        existing = validate_translation_target(
-            existing, language, allow_missing=True
-        )
-        provenance = build_translation_provenance(
-            vi_content, product, validated_payload
-        )
-        result = save_translation_content(
+        result = save_translation_draft(
             repository=repository,
             product=product,
             language=language,
+            vi_content=vi_content,
             existing=existing,
-            content=translation,
-            status=ContentStatus.DRAFTED,
-            review_notes=(
-                "Translation draft saved from APPROVED vi content. "
-                "provenance=" + json.dumps(provenance, ensure_ascii=False)
-            ),
-            generation_method=validated_payload.get(
-                "generation_method", "AI_ASSISTED"
-            ),
+            translation=translation,
+            validated_payload=validated_payload,
         )
     else:  # APPROVE
-        existing = validate_translation_target(
-            existing, language, allow_missing=False
-        )
-        translation = {
-            field: existing.get(field)
-            for field in translation_rules.TRANSLATABLE_TEXT_FIELDS
-        }
-        decision = evaluate_translation_for_product(
-            repository, product, language, translation, vi_content
-        )
-        provenance = build_translation_provenance(vi_content, product)
-        provenance_note = "provenance=" + json.dumps(provenance, ensure_ascii=False)
-
-        if decision.is_auto_pass:
-            status = ContentStatus.APPROVED
-            review_notes = (
-                "Translation approved by deterministic validation. "
-                + provenance_note
-            )
-        else:
-            status = ContentStatus.REVIEW_REQUIRED
-            review_notes = (
-                f"CONTENT_REVIEW_REQUIRED ({language}): automatic approval "
-                f"declined: [{decision.rule_code}] {decision.reason} "
-                + provenance_note
-            )
-
-        result = save_translation_content(
+        result, decision = approve_translation(
             repository=repository,
             product=product,
             language=language,
+            vi_content=vi_content,
             existing=existing,
-            content=translation,
-            status=status,
-            review_notes=review_notes,
-            generation_method=existing.get("generation_method") or "AI_ASSISTED",
         )
         print(
             "Deterministic validation: "
@@ -1760,6 +1830,202 @@ def run_translation_action(
     print(f"Content status: {result.get('content_status')}")
     print(f"Review required: {result.get('review_required')}")
     return result
+
+
+def load_content_package(
+    repository: SupabaseRepository,
+    product_code: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]], ContentPackage]:
+    """Read-only: the product, all its product_contents rows, and its
+    CLAUDE_AUTOMATION.md 9.2 package. Raises ContentPackageRefused
+    (VI_CONTENT_NOT_APPROVED) for this candidate only."""
+    products = get_products(repository, product_code)
+
+    if not products:
+        raise RuntimeError(f"Internal product was not found: {product_code}")
+
+    product = products[0]
+    candidate = (
+        get_candidate_for_product(repository=repository, candidate_id=product["candidate_id"])
+        if product.get("candidate_id")
+        else {}
+    )
+    contents = (
+        repository.client.table("product_contents")
+        .select("*")
+        .eq("internal_product_id", product["internal_product_id"])
+        .execute()
+        .data
+        or []
+    )
+    package = build_content_package(candidate=candidate, product=product, contents=contents)
+    return product, contents, package
+
+
+def run_translate_action(
+    repository: SupabaseRepository,
+    product_code: str | None,
+    provider: TranslationProvider,
+    non_interactive: bool,
+) -> dict[str, Any]:
+    """
+    Multilingual generation path (CLAUDE_AUTOMATION.md section 9.1):
+    APPROVED vi package -> provider EN/DE -> deterministic cross-language
+    consistency (src.domain.rules.multilingual_consistency) -> existing
+    translation save path (DRAFTED) -> on consistency PASS, the existing
+    translation APPROVE path (translation_rules; APPROVED or
+    REVIEW_REQUIRED), on consistency FAIL, REVIEW_REQUIRED for that
+    language with the failure evidence in review_notes.
+
+    Never touches vi, internal_products, an APPROVED or a REJECTED row.
+    """
+    if not product_code:
+        raise RuntimeError("--action TRANSLATE requires --product-code (exact targeting only).")
+
+    if not non_interactive:
+        raise RuntimeError("--action TRANSLATE requires --non-interactive.")
+
+    product, contents, package = load_content_package(repository, product_code)
+    vi_content = require_approved_vietnamese_content(
+        next((c for c in contents if c.get("content_language") == "vi"), None),
+        product_code,
+    )
+
+    # Resolve write targets before any provider call: skip APPROVED rows
+    # (never overwritten), refuse REJECTED ones.
+    targets: dict[str, dict[str, Any] | None] = {}
+    for language in translation_rules.TRANSLATION_LANGUAGES:
+        existing = next((c for c in contents if c.get("content_language") == language), None)
+        if existing and existing.get("content_status") == ContentStatus.APPROVED:
+            continue
+        targets[language] = validate_translation_target(existing, language, allow_missing=True)
+
+    report: dict[str, Any] = {
+        "candidate_code": package.candidate_code,
+        "product_code": product_code,
+        "provider": None,
+        "consistency": None,
+        "reason_codes": [],
+        "statuses": {},
+    }
+
+    if not targets:
+        print("en and de content are already APPROVED. No database changes were made.")
+        report["statuses"] = {"en": ContentStatus.APPROVED, "de": ContentStatus.APPROVED}
+        return report
+
+    result = provider.translate(package)
+    translated = package
+    for language, fields in result.translations.items():
+        translated = translated.with_translation(
+            language,
+            product_title=fields.get("product_name"),
+            short_description=fields.get("short_description"),
+            description=fields.get("long_description"),
+        )
+
+    consistency = multilingual_consistency.evaluate_package(translated)
+    report["provider"] = result.provenance()
+    report["consistency"] = consistency.status
+    report["reason_codes"] = list(consistency.reason_codes)
+
+    print()
+    print("=" * 78)
+    print("MULTILINGUAL TRANSLATE (en, de)")
+    print("=" * 78)
+    print(f"Product code: {product_code}")
+    print(f"Provider: {result.provider}")
+    print(f"Cross-language consistency: {consistency.status}")
+    for failure in consistency.failures:
+        print(f"  - {failure}")
+
+    payload = {
+        "generation_method": result.generation_method,
+        "content_source": (
+            f"{package.content_source}; provider={result.provider}"
+            + (f"; model={result.model}" if result.model else "")
+        ),
+        "facts_used": list(package.facts_used),
+    }
+
+    for language, existing in targets.items():
+        translation = {
+            field: None for field in translation_rules.TRANSLATABLE_TEXT_FIELDS
+        }
+        translation.update(result.translations.get(language) or {})
+
+        row = save_translation_draft(
+            repository=repository,
+            product=product,
+            language=language,
+            vi_content=vi_content,
+            existing=existing,
+            translation=translation,
+            validated_payload=payload,
+        )
+
+        if consistency.language_passed(language):
+            row, decision = approve_translation(
+                repository=repository,
+                product=product,
+                language=language,
+                vi_content=vi_content,
+                existing=row,
+            )
+            print(
+                f"{language}: translation validation "
+                f"{'PASS' if decision.is_auto_pass else 'FAIL'} -- {decision.reason}"
+            )
+        else:
+            details = [f for f in consistency.failures if f.startswith(f"[{language}]")]
+            provenance = build_translation_provenance(vi_content, product, payload)
+            row = save_translation_content(
+                repository=repository,
+                product=product,
+                language=language,
+                existing=row,
+                content=translation,
+                status=ContentStatus.REVIEW_REQUIRED,
+                review_notes=(
+                    f"CONTENT_REVIEW_REQUIRED ({language}): cross-language "
+                    f"consistency failed: [{multilingual_consistency.RULE_CODE}] "
+                    + "; ".join(details)
+                    + " provenance="
+                    + json.dumps(provenance, ensure_ascii=False)
+                ),
+                generation_method=result.generation_method,
+            )
+
+        report["statuses"][language] = row.get("content_status")
+        print(f"{language}: content status {row.get('content_status')}")
+
+    return report
+
+
+def run_export_package_action(
+    repository: SupabaseRepository,
+    product_code: str | None,
+    directory: Path = DEFAULT_PACKAGE_DIR,
+) -> Path:
+    """Read-only against the database: write this candidate's package
+    (APPROVED vi side, current en/de side) to
+    data/processed/content_packages/<candidate_code>.json for the
+    package-file translation provider. Never overwrites an existing
+    package file."""
+    if not product_code:
+        raise RuntimeError("--action EXPORT_PACKAGE requires --product-code.")
+
+    _product, _contents, package = load_content_package(repository, product_code)
+    path = package_file_path(package.candidate_code, Path(directory))
+
+    if path.exists():
+        raise RuntimeError(f"Refusing to overwrite existing content package {path}.")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(package.to_json() + "\n", encoding="utf-8")
+    print(f"Content package written: {path}")
+    print("No database changes were made.")
+    return path
 
 
 def resolve_action(
@@ -1800,6 +2066,22 @@ def main() -> None:
         print(
             "Invalid action. Use PREVIEW, SAVE, APPROVE, REVISE, "
             "AUTO_REVISE, or SKIP."
+        )
+        return
+
+    if action == "TRANSLATE":
+        run_translate_action(
+            repository=repository,
+            product_code=args.product_code,
+            provider=get_translation_provider(args.translation_provider),
+            non_interactive=args.non_interactive,
+        )
+        return
+
+    if action == "EXPORT_PACKAGE":
+        run_export_package_action(
+            repository=repository,
+            product_code=args.product_code,
         )
         return
 
