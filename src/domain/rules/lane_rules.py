@@ -60,6 +60,26 @@ _READY_FOR_DRAFT_DERIVED_STATES = {"READY_FOR_DRAFT", "READY_FOR_DRAFT_HISTORICA
 # (CLAUDE.md pipeline stage list) and is likewise not Fast Track work.
 _TERMINAL_DERIVED_STATES = {"RECONCILED", "DRAFT_CREATED", "DUPLICATE_REJECTED"}
 
+# derived_state values scripts/pipeline_state.py only emits once the
+# Vietnamese content is already APPROVED (CLAUDE_AUTOMATION.md section 9:
+# vi approval precedes en/de localization). Source: pipeline_state.py
+# _derive_image_content_state() -- internal_products.content_status ==
+# APPROVED derives IMAGE_VALIDATED (next: readiness check); readiness then
+# derives READY_FOR_DRAFT(_HISTORICAL) in derive_candidate_state().
+# CONTENT_APPROVED is listed for completeness (DERIVED_STATES member) but
+# is only emitted with human_gate=True, so HUMAN_REVIEW always wins first.
+# Every IMAGE_* stage before IMAGE_VALIDATED, INTERNAL_PRODUCT_CREATED,
+# CONTENT_DRAFTED and CONTENT_REVISE_PENDING_HISTORICAL is deliberately
+# absent: those still need image or vi content work (FAST_TRACK).
+_POST_VI_APPROVAL_DERIVED_STATES = frozenset(
+    {
+        "CONTENT_APPROVED",
+        "IMAGE_VALIDATED",
+        "READY_FOR_DRAFT",
+        "READY_FOR_DRAFT_HISTORICAL",
+    }
+)
+
 # Matches src.domain.content_status.InternalProductContentStatus.APPROVED's
 # value without importing it, so this module stays dependency-free and
 # directly unit-testable with plain dicts (same design choice
@@ -100,10 +120,22 @@ def has_multilingual_content(contents: list[dict[str, Any]]) -> bool:
     return "en" in approved_languages and "de" in approved_languages
 
 
+def has_approved_vi_content(contents: list[dict[str, Any]]) -> bool:
+    """True once a 'vi' product_contents row exists with content_status ==
+    APPROVED -- the canonical source en/de are localized from
+    (CLAUDE_AUTOMATION.md section 9.1). Reads only existing rows."""
+    return any(
+        content.get("content_language") == "vi"
+        and content.get("content_status") == _CONTENT_APPROVED
+        for content in contents
+    )
+
+
 def classify_lane(
     state: _CandidateStateLike,
     *,
     multilingual_ready: bool = True,
+    vi_content_approved: bool = False,
 ) -> str:
     """
     Classify one already-derived candidate state into exactly one
@@ -128,7 +160,12 @@ def classify_lane(
     6. ENRICHMENT_NEEDED -- state.blocked (a structural/deterministic
        blocker, never a judgment call).
     7. MULTILINGUAL_CONTENT -- an internal product exists
-       (state.product_code) but multilingual_ready is False.
+       (state.product_code), the Vietnamese content is APPROVED
+       (vi_content_approved) and state.derived_state is at or past the
+       vi-approval stage (_POST_VI_APPROVAL_DERIVED_STATES), but
+       multilingual_ready is False. A candidate still in an image or vi
+       content stage is never MULTILINGUAL_CONTENT: its next work is
+       image/vi content, so it falls through to FAST_TRACK.
     8. FAST_TRACK -- none of the above: the candidate can advance through
        its next deterministic stage unattended.
     """
@@ -152,7 +189,12 @@ def classify_lane(
     if state.blocked:
         return ENRICHMENT_NEEDED
 
-    if state.product_code and not multilingual_ready:
+    if (
+        state.product_code
+        and vi_content_approved
+        and state.derived_state in _POST_VI_APPROVAL_DERIVED_STATES
+        and not multilingual_ready
+    ):
         return MULTILINGUAL_CONTENT
 
     return FAST_TRACK

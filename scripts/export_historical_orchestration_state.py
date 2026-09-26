@@ -142,7 +142,12 @@ def _classify_candidates(
     for candidate_code, bundle in bundles.items():
         state = derive_candidate_state(bundle)
         multilingual_ready = lane_rules.has_multilingual_content(bundle["contents"])
-        lane = lane_rules.classify_lane(state, multilingual_ready=multilingual_ready)
+        vi_content_approved = lane_rules.has_approved_vi_content(bundle["contents"])
+        lane = lane_rules.classify_lane(
+            state,
+            multilingual_ready=multilingual_ready,
+            vi_content_approved=vi_content_approved,
+        )
         field = _LANE_TO_SCHEMA_FIELD[lane]
         lane_counts[field] += 1
         lane_codes[field].append(candidate_code)
