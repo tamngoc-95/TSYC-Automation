@@ -27,6 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from create_internal_product import is_historical_candidate_code
 from src.cli_bootstrap import configure_utf8_console
+from src.domain import woo_remote_lifecycle
 from src.domain.content_status import ContentStatus, InternalProductContentStatus
 from src.domain.identity_status import IdentityStatus, MatchDecision
 from src.domain.image_status import ImageStatus, InternalProductImageStatus
@@ -879,7 +880,32 @@ def audit_woocommerce(
                     ),
                 )
 
-        if syncs_with_remote_id and product.get(
+        removal_states = {
+            woo_remote_lifecycle.confirmed_remote_removal(sync)
+            for sync in syncs_with_remote_id
+        }
+
+        if (
+            len(syncs_with_remote_id) == 1
+            and removal_states <= woo_remote_lifecycle.REMOTE_REMOVAL_STATES
+            and product.get("woocommerce_status") == WooCommerceStatus.FAILED
+        ):
+            # Confirmed, intentional remote deletion/trash (exact id + SKU
+            # evidence recorded by sync_woocommerce_product_status.py).
+            # Terminal and accepted: never recreated, historical Woo id kept.
+            add_issue(
+                issues,
+                "WARNING",
+                product_code,
+                "REMOTE_WOO_PRODUCT_REMOVED",
+                (
+                    "WooCommerce product "
+                    f"{syncs_with_remote_id[0].get('woocommerce_product_id')} was "
+                    f"{', '.join(sorted(removal_states))} remotely by the shop owner; "
+                    "recorded as an intentional terminal state (not recreated)."
+                ),
+            )
+        elif syncs_with_remote_id and product.get(
             "woocommerce_status"
         ) not in LOCAL_STATUSES_VALID_WITH_REMOTE_ID:
             add_issue(

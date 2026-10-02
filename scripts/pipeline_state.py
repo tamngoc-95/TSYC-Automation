@@ -39,6 +39,7 @@ from prepare_product_content import (  # noqa: E402
     build_safe_draft,
     is_generic_safe_draft,
 )
+from src.domain import woo_remote_lifecycle
 from src.domain.content_status import InternalProductContentStatus
 from src.domain.decisions import DecisionResult, Outcome
 from src.domain.identity_status import IdentityStatus, MatchDecision
@@ -76,6 +77,10 @@ ACCEPTED_WARNING_CODES = {
     # or none at all -- see audit_pipeline_state.py::audit_references().
     "PRIMARY_REFERENCE_MISSING_HISTORICAL",
     "PRIMARY_REFERENCE_NOT_MATCHED_HISTORICAL",
+    # The shop owner deleted/trashed the WooCommerce product; confirmed
+    # by exact id + SKU checks and recorded as an intentional terminal
+    # state (src.domain.woo_remote_lifecycle). Never recreated.
+    "REMOTE_WOO_PRODUCT_REMOVED",
 }
 
 # The full named state machine from the Phase C plan. run_batch.py's
@@ -106,6 +111,7 @@ DERIVED_STATES = {
     "DRAFT_CREATION_IN_PROGRESS",
     "DRAFT_CREATED",
     "RECONCILED",
+    "REMOTE_REMOVED",
 }
 
 RECOVERY_STATES = {
@@ -588,6 +594,11 @@ def derive_sync_recovery_state(
     two can never silently disagree about what counts as "needs
     recovery review."
     """
+    # A confirmed, intentional remote deletion/trash is a terminal state,
+    # not a recovery condition (src.domain.woo_remote_lifecycle).
+    if woo_remote_lifecycle.confirmed_remote_removal(sync) is not None:
+        return None
+
     if sync:
         response_payload = sync.get("response_payload")
 
@@ -1442,6 +1453,20 @@ def derive_candidate_state(
 
     product_code = internal_product.get("product_code")
     warnings = _warnings_for_internal_product(internal_product)
+
+    removal = woo_remote_lifecycle.confirmed_remote_removal(bundle["sync"])
+
+    if removal is not None:
+        # The shop owner deleted/trashed the WooCommerce product. Terminal:
+        # never recreated, never dispatched, no human gate.
+        return CandidateState(
+            candidate_code=candidate_code,
+            candidate_id=candidate_id,
+            product_code=product_code,
+            derived_state=woo_remote_lifecycle.DERIVED_STATE_REMOTE_REMOVED,
+            terminal=True,
+            warnings=warnings + ["REMOTE_WOO_PRODUCT_REMOVED"],
+        )
 
     recovery = _derive_recovery_state(bundle)
 

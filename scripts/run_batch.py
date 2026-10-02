@@ -66,7 +66,7 @@ PYTHON_EXE = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
 
 MAX_STAGES_PER_CANDIDATE = 10
 
-TERMINAL_DERIVED_STATES = {"RECONCILED", "DUPLICATE_REJECTED"}
+TERMINAL_DERIVED_STATES = {"RECONCILED", "DUPLICATE_REJECTED", "REMOTE_REMOVED"}
 
 _AUDIT_ISSUE_LINE = re.compile(r"^\[\d+\]\s+(ERROR|WARNING)\s+\|\s+(\S+)\s*$")
 
@@ -1120,7 +1120,9 @@ def classify_report_group(report: CandidateReport) -> str:
     if report.final_state == "DUPLICATE_REJECTED":
         return "AUTO_REJECTED"
 
-    if report.final_state == "RECONCILED":
+    # REMOTE_REMOVED: the shop owner deleted/trashed the Woo product --
+    # local state is reconciled with that confirmed remote state.
+    if report.final_state in ("RECONCILED", "REMOTE_REMOVED"):
         return "RECONCILED"
 
     if report.human_gate:

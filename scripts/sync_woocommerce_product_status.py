@@ -14,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
+from src.domain import woo_remote_lifecycle
 from src.domain.woocommerce_status import WooCommerceStatus, WooCommerceSyncStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
@@ -21,7 +22,7 @@ configure_utf8_console()
 
 
 SYNC_NAME = "woocommerce_product_status_sync"
-SYNC_VERSION = "1.1.0"
+SYNC_VERSION = "1.2.0"
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -281,6 +282,161 @@ def get_woocommerce_product(
         response.status_code,
         safe_json_response(response),
     )
+
+
+def search_remote_products_by_sku(
+    store_url: str,
+    api_version: str,
+    consumer_key: str,
+    consumer_secret: str,
+    timeout_seconds: int,
+    sku: str,
+    status: str,
+) -> list[dict[str, Any]] | None:
+    """READ-ONLY exact-SKU search under one status filter ("any" or
+    "trash"). None means the lookup was uncertain (error / non-200 /
+    unexpected body) -- never treated as "no product"."""
+    try:
+        response = requests.get(
+            build_api_url(store_url, api_version, "products"),
+            auth=HTTPBasicAuth(consumer_key, consumer_secret),
+            params={"sku": sku, "status": status, "per_page": 10},
+            headers={
+                "Accept": "application/json",
+                "User-Agent": f"{SYNC_NAME}/{SYNC_VERSION}",
+            },
+            timeout=timeout_seconds,
+        )
+    except requests.RequestException:
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    payload = safe_json_response(response)
+
+    if not isinstance(payload, list):
+        return None
+
+    # The REST "sku" filter is exact per WooCommerce docs; re-check anyway.
+    return [item for item in payload if str(item.get("sku") or "") == sku]
+
+
+def confirm_remote_removal(
+    sync_record: dict[str, Any],
+    expected_sku: str,
+    get_http_status: int,
+    get_body: Any,
+    lookup: dict[str, Any],
+) -> tuple[str | None, str]:
+    """Run the exact-SKU searches and evaluate_remote_removal()."""
+    sku_any = search_remote_products_by_sku(sku=expected_sku, status="any", **lookup)
+    sku_trash = (
+        search_remote_products_by_sku(sku=expected_sku, status="trash", **lookup)
+        if get_http_status == 404
+        else []
+    )
+    return woo_remote_lifecycle.evaluate_remote_removal(
+        woocommerce_product_id=sync_record["woocommerce_product_id"],
+        expected_sku=expected_sku,
+        get_http_status=get_http_status,
+        get_body=get_body if isinstance(get_body, dict) else None,
+        sku_any_matches=sku_any,
+        sku_trash_matches=sku_trash,
+    )
+
+
+# review_reason values this module (and its predecessors) wrote for a
+# Woo-reconciliation problem. A confirmed removal resolves exactly these;
+# any other review reason (content, image, identity) is left untouched.
+_WOO_RECONCILIATION_REVIEW_PREFIXES = (
+    "The linked WooCommerce product could not be found.",
+    "WooCommerce remote status ",
+)
+
+
+def mark_remote_removed(
+    repository: SupabaseRepository,
+    sync_record: dict[str, Any],
+    internal_product: dict[str, Any],
+    state: str,
+    reason: str,
+    remote_snapshot: dict[str, Any] | None,
+) -> None:
+    """
+    Record a CONFIRMED remote deletion/trash as an intentional, terminal
+    state (src.domain.woo_remote_lifecycle). The historical
+    woocommerce_product_id and every existing response_payload field are
+    preserved; nothing is recreated, restored or deleted remotely.
+    """
+    checked_at = utc_now()
+    marker = woo_remote_lifecycle.build_removal_marker(
+        state=state,
+        woocommerce_product_id=sync_record["woocommerce_product_id"],
+        sku=str(sync_record.get("product_sku") or internal_product.get("product_code") or ""),
+        reason=reason,
+        checked_at=checked_at,
+        checked_by=f"{SYNC_NAME}/{SYNC_VERSION}",
+        remote_snapshot=remote_snapshot,
+    )
+
+    existing_payload = sync_record.get("response_payload")
+    stored_payload = dict(existing_payload) if isinstance(existing_payload, dict) else {}
+    stored_payload[woo_remote_lifecycle.REMOVAL_MARKER_KEY] = marker
+    stored_payload["latest_status_check"] = {
+        "sync_name": SYNC_NAME,
+        "sync_version": SYNC_VERSION,
+        "checked_at": checked_at,
+        "remote_removal": state,
+        "woocommerce_product": remote_snapshot,
+    }
+
+    response = (
+        repository.client
+        .table("woocommerce_product_syncs")
+        .update(
+            {
+                "woocommerce_status": WooCommerceSyncStatus.FAILED,
+                "response_payload": stored_payload,
+                "error_code": woo_remote_lifecycle.REMOVAL_ERROR_CODES[state],
+                "error_message": reason,
+                "last_attempt_at": checked_at,
+                "updated_at": checked_at,
+            }
+        )
+        .eq("sync_id", sync_record["sync_id"])
+        .execute()
+    )
+
+    if not response.data:
+        raise RuntimeError("Remote-removal sync update returned no data.")
+
+    metadata = internal_product.get("product_metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    metadata[woo_remote_lifecycle.REMOVAL_MARKER_KEY] = marker
+
+    product_update: dict[str, Any] = {
+        "woocommerce_status": WooCommerceStatus.FAILED,
+        "product_metadata": metadata,
+        "updated_at": checked_at,
+    }
+
+    if str(internal_product.get("review_reason") or "").startswith(
+        _WOO_RECONCILIATION_REVIEW_PREFIXES
+    ):
+        product_update["review_required"] = False
+        product_update["review_reason"] = None
+
+    product_response = (
+        repository.client
+        .table("internal_products")
+        .update(product_update)
+        .eq("internal_product_id", internal_product["internal_product_id"])
+        .execute()
+    )
+
+    if not product_response.data:
+        raise RuntimeError("Remote-removal internal product update returned no data.")
 
 
 # Remote WooCommerce statuses this reconciliation workflow has a
@@ -922,7 +1078,45 @@ def synchronize_one_product(
         woocommerce_product_id=woocommerce_product_id,
     )
 
+    expected_sku = str(
+        sync_record.get("product_sku")
+        or internal_product.get("product_code")
+        or ""
+    ).strip()
+
+    lookup = {
+        "store_url": store_url,
+        "api_version": api_version,
+        "consumer_key": consumer_key,
+        "consumer_secret": consumer_secret,
+        "timeout_seconds": timeout_seconds,
+    }
+
     if http_status == 404:
+        removal_state, removal_reason = confirm_remote_removal(
+            sync_record=sync_record,
+            expected_sku=expected_sku,
+            get_http_status=http_status,
+            get_body=response_payload,
+            lookup=lookup,
+        )
+
+        if removal_state is not None:
+            mark_remote_removed(
+                repository=repository,
+                sync_record=sync_record,
+                internal_product=internal_product,
+                state=removal_state,
+                reason=removal_reason,
+                remote_snapshot=None,
+            )
+            print()
+            print(
+                f"WooCommerce product {woocommerce_product_id} confirmed "
+                f"{removal_state} (intentional remote state; not recreated)."
+            )
+            return False
+
         mark_product_missing(
             repository=repository,
             sync_record=sync_record,
@@ -990,12 +1184,6 @@ def synchronize_one_product(
         or ""
     ).strip()
 
-    expected_sku = str(
-        sync_record.get("product_sku")
-        or internal_product.get("product_code")
-        or ""
-    ).strip()
-
     if (
         remote_sku
         and expected_sku
@@ -1030,6 +1218,31 @@ def synchronize_one_product(
     )
 
     mapping = map_remote_status(remote_status)
+
+    if remote_status == "trash":
+        removal_state, removal_reason = confirm_remote_removal(
+            sync_record=sync_record,
+            expected_sku=expected_sku,
+            get_http_status=http_status,
+            get_body=response_payload,
+            lookup=lookup,
+        )
+
+        if removal_state is not None:
+            mark_remote_removed(
+                repository=repository,
+                sync_record=sync_record,
+                internal_product=internal_product,
+                state=removal_state,
+                reason=removal_reason,
+                remote_snapshot=response_payload,
+            )
+            print()
+            print(
+                f"WooCommerce product {woocommerce_product_id} confirmed "
+                f"{removal_state} (intentional remote state; not restored or recreated)."
+            )
+            return False
 
     if not mapping.supported:
         mark_reconciliation_anomaly(

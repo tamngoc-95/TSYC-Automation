@@ -185,6 +185,12 @@ def run_sync(
     monkeypatch.setattr(
         sync_mod, "get_woocommerce_product", fake_get_woocommerce_product
     )
+    # Exact-SKU searches are uncertain here, so the confirmed-removal path
+    # (tests/test_woo_remote_removal.py) never applies and these tests keep
+    # covering the pre-existing anomaly / missing-product behavior offline.
+    monkeypatch.setattr(
+        sync_mod, "search_remote_products_by_sku", lambda **kwargs: None
+    )
 
     return sync_mod.synchronize_one_product(
         repository=repository,

@@ -58,7 +58,7 @@ _READY_FOR_DRAFT_DERIVED_STATES = {"READY_FOR_DRAFT", "READY_FOR_DRAFT_HISTORICA
 # subset of them (RECONCILED, DUPLICATE_REJECTED) -- DRAFT_CREATED sits
 # between Woo draft creation and the separate reconciliation step
 # (CLAUDE.md pipeline stage list) and is likewise not Fast Track work.
-_TERMINAL_DERIVED_STATES = {"RECONCILED", "DRAFT_CREATED", "DUPLICATE_REJECTED"}
+_TERMINAL_DERIVED_STATES = {"RECONCILED", "DRAFT_CREATED", "DUPLICATE_REJECTED", "REMOTE_REMOVED"}
 
 # derived_state values scripts/pipeline_state.py only emits once the
 # Vietnamese content is already APPROVED (CLAUDE_AUTOMATION.md section 9:
