@@ -26,7 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.reference_sources import REFERENCE_SOURCE_PRIORITY, SourceType
-from src.domain.rules import storefront_text
+from src.domain.rules import author_rules, storefront_text
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -1032,7 +1032,24 @@ def extract_author(
     body_text: str,
     product_json_ld: dict[str, Any] | None,
 ) -> str | None:
-    """Extract the book author."""
+    """Extract the book author. A UI label captured from the author slot
+    (e.g. the publisher page's "Đọc thử" button) is never returned --
+    author_rules.is_invalid_author_value."""
+    author = _extract_author_value(
+        body_text=body_text,
+        product_json_ld=product_json_ld,
+    )
+
+    if author_rules.is_invalid_author_value(author):
+        return None
+
+    return author
+
+
+def _extract_author_value(
+    body_text: str,
+    product_json_ld: dict[str, Any] | None,
+) -> str | None:
     if product_json_ld:
         author_value = product_json_ld.get(
             "author"

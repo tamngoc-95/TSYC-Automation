@@ -1243,6 +1243,11 @@ def get_references_for_candidate(
     return response.data or []
 
 
+def _title_sentence(title: str, author: str | None) -> str:
+    """Minimal verified-metadata summary: “Title” – Author. (no prose)."""
+    return f"“{title}”" + (f" – {author}." if author else ".")
+
+
 def build_historical_enrichment_content(
     generated: dict[str, Any],
     product: dict[str, Any],
@@ -1272,7 +1277,7 @@ def build_historical_enrichment_content(
     """
     title = clean_text(product.get("title")) or ""
     author = clean_text(product.get("author"))
-    title_sentence = f"“{title}”" + (f" – {author}." if author else "")
+    title_sentence = _title_sentence(title, author)
     description_text = storefront_text.normalize_paragraphs(normalized_description)
 
     enriched = dict(generated)
@@ -1312,6 +1317,7 @@ REPAIR_CATEGORY_INTERNAL_NOTE_ONLY = "INTERNAL_NOTE_ONLY"
 REPAIR_CATEGORY_HTML_ENTITY = "HTML_ENTITY"
 REPAIR_CATEGORY_TRUNCATED_SOURCE = "TRUNCATED_SOURCE"
 REPAIR_CATEGORY_STOCK_OR_BOILERPLATE = "STOCK_OR_REFERENCE_BOILERPLATE"
+REPAIR_CATEGORY_QUOTED_EXCERPT = "QUOTED_BOOK_EXCERPT"
 REPAIR_CATEGORY_MULTIPLE = "MULTIPLE_DEFECTS"
 
 # Repair outcomes.
@@ -1343,6 +1349,8 @@ def classify_storefront_defects(findings: dict[str, list[str]]) -> str | None:
         storefront_text.SHIPPING_WORDING,
     }:
         groups.add(REPAIR_CATEGORY_STOCK_OR_BOILERPLATE)
+    if storefront_text.QUOTED_EXCERPT in codes:
+        groups.add(REPAIR_CATEGORY_QUOTED_EXCERPT)
 
     return groups.pop() if len(groups) == 1 else REPAIR_CATEGORY_MULTIPLE
 
@@ -1466,8 +1474,21 @@ def plan_storefront_repair(
     else:
         plan["strategy"] = "SENTENCE_REPAIR"
         repaired = dict(base)
-        for field in ("short_description", "long_description", "seo_description"):
-            repaired[field] = _clean_prose_field(existing.get(field))
+        long_description = existing.get("long_description")
+        if storefront_text.has_leading_quoted_excerpt(long_description):
+            # Drop a leading book passage only when real prose follows.
+            long_description = storefront_text.drop_leading_quoted_excerpts(long_description)
+        repaired["long_description"] = _clean_prose_field(long_description)
+        for field in ("short_description", "seo_description"):
+            # A summary that opens with a quoted book passage is rebuilt
+            # from the description below, never kept.
+            repaired[field] = (
+                None
+                if storefront_text.starts_with_quoted_excerpt(
+                    existing.get(field), titles=[existing.get("product_name"), title]
+                )
+                else _clean_prose_field(existing.get(field))
+            )
 
         if not repaired["long_description"]:
             plan["outcome"] = REPAIR_OUTCOME_HUMAN_REVIEW
@@ -1475,13 +1496,19 @@ def plan_storefront_repair(
             return plan
 
         if not repaired["short_description"]:
-            repaired["short_description"] = storefront_text.leading_sentences(
-                repaired["long_description"], _AUTO_ENRICH_SHORT_MAX_LENGTH
-            ) or None
+            repaired["short_description"] = (
+                storefront_text.leading_sentences(
+                    repaired["long_description"], _AUTO_ENRICH_SHORT_MAX_LENGTH
+                )
+                or storefront_text.leading_sentences(
+                    repaired["long_description"], _AUTO_ENRICH_SHORT_HARD_MAX_LENGTH
+                )
+                or _title_sentence(title, author)
+            )
         if not repaired["seo_description"]:
             repaired["seo_description"] = storefront_text.leading_sentences(
                 repaired["long_description"], _AUTO_ENRICH_SEO_MAX_LENGTH
-            ) or None
+            ) or _title_sentence(title, author)
 
         plan["content"] = repaired
 

@@ -39,6 +39,7 @@ INTERNAL_WORKFLOW = "INTERNAL_WORKFLOW"
 SOURCE_BOILERPLATE = "SOURCE_BOILERPLATE"
 STOCK_WORDING = "STOCK_WORDING"
 SHIPPING_WORDING = "SHIPPING_WORDING"
+QUOTED_EXCERPT = "QUOTED_EXCERPT"
 
 ALL_DEFECT_CODES = (
     HTML_ENTITY,
@@ -49,6 +50,7 @@ ALL_DEFECT_CODES = (
     SOURCE_BOILERPLATE,
     STOCK_WORDING,
     SHIPPING_WORDING,
+    QUOTED_EXCERPT,
 )
 
 # --- patterns -------------------------------------------------------
@@ -148,6 +150,80 @@ MIN_USABLE_SOURCE_DESCRIPTION_LENGTH = 80
 _MIN_KEPT_SENTENCE_WORDS = 6
 
 _SENTENCE_SPLIT_RE =re.compile(r"(?<=[.!?…])\s+(?=[\"“'(\[]?[A-ZÀ-ỸĐ0-9])")
+
+
+# --- quoted book excerpts -------------------------------------------
+#
+# Retailer pages often open with a verbatim passage from the book in
+# quotation marks (AUTOIMPORT-CAN-0044: an explicit novel passage became
+# the storefront short description). A passage is product content only as
+# an author/context/plot summary (TSYC_CONTENT_GUIDE.md section 7), never
+# as the summary itself. A quoted *title* ("“Gấu con đi ngủ” là ...") or a
+# short quoted line is not an excerpt: the closing quote must come within
+# _MAX_QUOTED_TITLE_LENGTH characters.
+
+_OPENING_QUOTES = "“\"«„‘'"
+_CLOSING_QUOTES = "”\"»“’'"
+_MAX_QUOTED_TITLE_LENGTH = 80
+# A leading quoted paragraph at least this long is an excerpt, not an
+# epigraph-like one-line quote (which a long description may keep).
+_MIN_LEADING_EXCERPT_PARAGRAPH_LENGTH = 200
+
+
+def starts_with_quoted_excerpt(
+    text: str | None,
+    titles: Sequence[str | None] = (),
+) -> bool:
+    """True when text opens with a quotation that is not closed within
+    _MAX_QUOTED_TITLE_LENGTH characters (a passage, not a title). A
+    quotation that opens with one of `titles` (the product's own name,
+    however long) is never an excerpt."""
+    if not text:
+        return False
+    stripped = str(text).lstrip()
+    if not stripped or stripped[0] not in _OPENING_QUOTES:
+        return False
+    quoted = stripped[1:].lower()
+    if any(
+        title and _normalize_paragraph(title) and quoted.startswith(_normalize_paragraph(title).lower())
+        for title in titles
+    ):
+        return False
+    window = stripped[1:_MAX_QUOTED_TITLE_LENGTH + 1]
+    return not any(ch in _CLOSING_QUOTES for ch in window)
+
+
+def _is_leading_excerpt_paragraph(paragraph: str) -> bool:
+    stripped = paragraph.strip()
+    return (
+        len(stripped) >= _MIN_LEADING_EXCERPT_PARAGRAPH_LENGTH
+        and starts_with_quoted_excerpt(stripped)
+        and stripped.rstrip(".!?… ")[-1:] in _CLOSING_QUOTES
+    )
+
+
+def drop_leading_quoted_excerpts(text: str | None) -> str:
+    """Remove leading paragraphs that are long quoted book passages; keep
+    every other paragraph verbatim."""
+    if not text:
+        return ""
+    paragraphs = normalize_paragraphs(text).split("\n\n")
+    while paragraphs and _is_leading_excerpt_paragraph(paragraphs[0]):
+        paragraphs.pop(0)
+    return "\n\n".join(paragraphs)
+
+
+def has_leading_quoted_excerpt(text: str | None) -> bool:
+    """True when the description opens with a long quoted book passage
+    that is followed by real description prose (so removing the passage
+    is deterministic). An excerpt-only description is not flagged here --
+    there is nothing to replace it with without inventing text; its
+    summary fields are still flagged (SUMMARY_FIELDS)."""
+    if not text:
+        return False
+    if not _is_leading_excerpt_paragraph(normalize_paragraphs(text).split("\n\n")[0]):
+        return False
+    return bool(drop_leading_quoted_excerpts(text).strip())
 
 
 # --- normalization --------------------------------------------------
@@ -376,6 +452,8 @@ def normalize_source_description(
             cleaned.append(paragraph)
 
     cleaned = _trim_trailing_chrome(cleaned)
+    # A leading verbatim book passage is not product description.
+    cleaned = [p for p in drop_leading_quoted_excerpts("\n\n".join(cleaned)).split("\n\n") if p]
 
     without_boilerplate = remove_defective_sentences(
         "\n\n".join(cleaned),
@@ -412,6 +490,9 @@ def find_text_defects(text: str | None) -> set[str]:
 # required to end with terminal punctuation.
 PROSE_FIELDS = ("short_description", "long_description")
 
+# Summary fields must never open with a quoted book passage.
+SUMMARY_FIELDS = ("short_description", "seo_description")
+
 _TERMINAL_CHARACTERS = ".!?…\"”’»)]:;"
 
 
@@ -436,6 +517,12 @@ def find_content_defects(
         defects = find_text_defects(value)  # type: ignore[arg-type]
         if field in PROSE_FIELDS and value and not ends_with_complete_sentence(str(value)):
             defects.add(TRUNCATED)
+        if field in SUMMARY_FIELDS and starts_with_quoted_excerpt(
+            value, titles=[content.get("product_name")]  # type: ignore[arg-type, list-item]
+        ):
+            defects.add(QUOTED_EXCERPT)
+        if field == "long_description" and has_leading_quoted_excerpt(value):  # type: ignore[arg-type]
+            defects.add(QUOTED_EXCERPT)
         if defects:
             findings[field] = sorted(defects)
     return findings
@@ -466,7 +553,12 @@ def leading_sentences(text: str, max_length: int) -> str:
     """
     paragraphs = normalize_paragraphs(text).split("\n\n") if text else []
     first_paragraph = next(
-        (paragraph for paragraph in paragraphs if ends_with_complete_sentence(paragraph)),
+        (
+            paragraph
+            for paragraph in paragraphs
+            if ends_with_complete_sentence(paragraph)
+            and not starts_with_quoted_excerpt(paragraph)
+        ),
         "",
     )
     selected: list[str] = []
