@@ -1,0 +1,484 @@
+"""Deterministic storefront-text normalization and defect detection.
+
+CLAUDE.md section 15.1 / TSYC_CONTENT_GUIDE.md sections 11-12: customer-facing
+product content must never contain internal workflow or provenance notes,
+stock/shipping/promotion wording, retailer SEO boilerplate, unresolved HTML
+entities, or text cut off by source extraction.
+
+This module is the single shared definition of those defects. It is used by:
+
+  - scripts/collect_reference_metadata.py  (normalize a collected source
+    description, and prefer a usable one over a truncated meta snippet)
+  - src.domain.rules.content_rules         (automatic-approval gate, and
+    draft-safe reference selection)
+  - scripts/prepare_product_content.py     (AUTO_REVISE formatting, the
+    authorized REPAIR action, and the vi -> en/de translation gate)
+  - scripts/update_woocommerce_draft_content.py (refuses to push failing
+    content to a WooCommerce draft)
+
+Pure functions only: no I/O, no project imports, directly unit-testable.
+
+Detection is deliberately conservative (a false positive costs one review
+cycle; a false negative ships a defect to a customer), but it never flags
+ordinary punctuation: an ellipsis is only treated as extraction truncation
+when it ends a field or a paragraph, never inside a sentence.
+"""
+from __future__ import annotations
+
+import html
+import re
+from typing import Iterable, Mapping, Sequence
+
+# --- defect codes ---------------------------------------------------
+
+HTML_ENTITY = "HTML_ENTITY"
+HTML_MARKUP = "HTML_MARKUP"
+TRUNCATED = "TRUNCATED"
+PROVENANCE_NOTE = "PROVENANCE_NOTE"
+INTERNAL_WORKFLOW = "INTERNAL_WORKFLOW"
+SOURCE_BOILERPLATE = "SOURCE_BOILERPLATE"
+STOCK_WORDING = "STOCK_WORDING"
+SHIPPING_WORDING = "SHIPPING_WORDING"
+
+ALL_DEFECT_CODES = (
+    HTML_ENTITY,
+    HTML_MARKUP,
+    TRUNCATED,
+    PROVENANCE_NOTE,
+    INTERNAL_WORKFLOW,
+    SOURCE_BOILERPLATE,
+    STOCK_WORDING,
+    SHIPPING_WORDING,
+)
+
+# --- patterns -------------------------------------------------------
+
+_HTML_ENTITY_RE = re.compile(r"&(?:[a-zA-Z][a-zA-Z0-9]{1,31}|#\d{1,7}|#[xX][0-9a-fA-F]{1,6});")
+_HTML_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^<>]*)?/?>")
+
+# An ellipsis (three dots or U+2026) at the very end of a field: the
+# signature of a source snippet cut by extraction. Ellipses inside the
+# text -- mid-sentence or closing a stylistic paragraph of a full
+# description -- are legitimate punctuation.
+_TRUNCATION_RE = re.compile(r"(?:\.{3}|…)\s*$")
+
+_PROVENANCE_PATTERNS = (
+    re.compile(r"mô tả tham khảo từ nguồn", re.IGNORECASE),
+    re.compile(r"nguồn\s+(?:FAHASA|BOOKSTORE|PUBLISHER|AUTHORIZED_SUPPLIER|FACEBOOK_POST|OTHER)\b", re.IGNORECASE),
+    re.compile(r"\bđã được xác minh\b", re.IGNORECASE),
+    re.compile(r"dữ liệu sản phẩm đã xác minh", re.IGNORECASE),
+    re.compile(r"\b(?:verified|reference) source\b", re.IGNORECASE),
+)
+
+_INTERNAL_WORKFLOW_PATTERNS = (
+    re.compile(r"manager (?:must|should) review", re.IGNORECASE),
+    re.compile(r"pending (?:manager|admin|staff) review", re.IGNORECASE),
+    re.compile(r"should be completed later", re.IGNORECASE),
+    re.compile(r"to be (?:filled|completed|updated) later", re.IGNORECASE),
+    re.compile(r"\bTODO\b"),
+    re.compile(r"\bFIXME\b"),
+    re.compile(r"placeholder text", re.IGNORECASE),
+    re.compile(r"người quản lý", re.IGNORECASE),
+    re.compile(r"sản phẩm nháp", re.IGNORECASE),
+    re.compile(r"(?:cần được|chờ|đang chờ)\s+(?:kiểm tra|duyệt|xét duyệt)", re.IGNORECASE),
+    re.compile(r"(?:sẽ|cần) (?:được )?bổ sung (?:sau|thêm)", re.IGNORECASE),
+    re.compile(r"trước khi (?:sản phẩm được )?xuất bản", re.IGNORECASE),
+)
+
+_SOURCE_BOILERPLATE_PATTERNS = (
+    re.compile(r"có bán tại", re.IGNORECASE),
+    re.compile(r"nhà sách online", re.IGNORECASE),
+    re.compile(r"\bnetabooks\b", re.IGNORECASE),
+    re.compile(r"\bfahasa\b", re.IGNORECASE),
+    re.compile(r"\btiki\b", re.IGNORECASE),
+    re.compile(r"\bshopee\b", re.IGNORECASE),
+    re.compile(r"gian hàng", re.IGNORECASE),
+    re.compile(r"mua ngay", re.IGNORECASE),
+    re.compile(r"giá tốt", re.IGNORECASE),
+    re.compile(r"ưu đãi", re.IGNORECASE),
+    re.compile(r"bao sách miễn phí", re.IGNORECASE),
+    re.compile(r"tặng (?:kèm )?bookmark", re.IGNORECASE),
+    re.compile(r"✔️|✔|✅"),
+    # Publisher-page button text that leaked into extracted metadata.
+    re.compile(r"\bĐọc thử\b"),
+)
+
+_STOCK_PATTERNS = (
+    re.compile(r"(?:hiện|đang|sẵn)\s+có\s+(?:bán\s+)?tại\s+Tiệm Sách Yêu Con", re.IGNORECASE),
+    re.compile(r"\bcó tại\s+Tiệm Sách Yêu Con", re.IGNORECASE),
+    re.compile(r"là ấn phẩm đang có tại", re.IGNORECASE),
+    re.compile(r"còn hàng", re.IGNORECASE),
+    re.compile(r"hết hàng", re.IGNORECASE),
+    re.compile(r"số lượng có hạn", re.IGNORECASE),
+    re.compile(r"\bin stock\b", re.IGNORECASE),
+    re.compile(r"\bauf lager\b", re.IGNORECASE),
+    re.compile(r"\bavailable (?:now )?at Tiệm Sách Yêu Con", re.IGNORECASE),
+    re.compile(r"bei Tiệm Sách Yêu Con\s+(?:jetzt\s+|ab sofort\s+)?erhältlich", re.IGNORECASE),
+)
+
+_SHIPPING_PATTERNS = (
+    re.compile(r"giao (?:hàng|nhanh)", re.IGNORECASE),
+    re.compile(r"free\s*ship", re.IGNORECASE),
+    re.compile(r"miễn phí vận chuyển", re.IGNORECASE),
+    re.compile(r"\bfree shipping\b", re.IGNORECASE),
+    re.compile(r"\bversandkostenfrei\b", re.IGNORECASE),
+)
+
+_PATTERN_GROUPS: tuple[tuple[str, Sequence[re.Pattern[str]]], ...] = (
+    (PROVENANCE_NOTE, _PROVENANCE_PATTERNS),
+    (INTERNAL_WORKFLOW, _INTERNAL_WORKFLOW_PATTERNS),
+    (SOURCE_BOILERPLATE, _SOURCE_BOILERPLATE_PATTERNS),
+    (STOCK_WORDING, _STOCK_PATTERNS),
+    (SHIPPING_WORDING, _SHIPPING_PATTERNS),
+)
+
+# Sentence-level codes a deterministic repair may remove outright (the
+# whole sentence carries no product fact). HTML_ENTITY/HTML_MARKUP are
+# fixed by decoding, never by deletion; TRUNCATED cannot be fixed by
+# deletion at all -- it needs the full source text.
+REMOVABLE_SENTENCE_CODES = frozenset(
+    {PROVENANCE_NOTE, INTERNAL_WORKFLOW, SOURCE_BOILERPLATE, STOCK_WORDING, SHIPPING_WORDING}
+)
+
+# A source description shorter than this, after normalization, is too
+# thin to stand as a product description on its own. Length is only a
+# floor -- truncation/boilerplate detection is the real defense.
+MIN_USABLE_SOURCE_DESCRIPTION_LENGTH = 80
+
+_MIN_KEPT_SENTENCE_WORDS = 6
+
+_SENTENCE_SPLIT_RE =re.compile(r"(?<=[.!?…])\s+(?=[\"“'(\[]?[A-ZÀ-ỸĐ0-9])")
+
+
+# --- normalization --------------------------------------------------
+
+
+def decode_html_entities(text: str) -> str:
+    """Decode HTML entities, including double-encoded ones (&amp;aacute;)."""
+    decoded = text
+    for _ in range(3):
+        next_value = html.unescape(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    return decoded
+
+
+def _normalize_paragraph(paragraph: str) -> str:
+    return " ".join(paragraph.replace("\xa0", " ").split()).strip()
+
+
+def normalize_paragraphs(text: str | None) -> str:
+    """Collapse whitespace inside paragraphs, keep blank-line breaks."""
+    if not text:
+        return ""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    paragraphs: list[str] = []
+    for line in lines:
+        cleaned = _normalize_paragraph(line)
+        if cleaned:
+            paragraphs.append(cleaned)
+    return "\n\n".join(paragraphs)
+
+
+def split_sentences(paragraph: str) -> list[str]:
+    """Split one paragraph into sentences at terminal punctuation."""
+    parts = _SENTENCE_SPLIT_RE.split(paragraph.strip())
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _strip_duplicated_title_prefix(paragraph: str, titles: Sequence[str]) -> str:
+    """
+    Fahasa JSON-LD descriptions start with "<page title>, <title> <text>"
+    (e.g. "Tư Duy Ngược, Tư Duy Ngược Chúng ta ..."). Remove that exact
+    comma-led repetition only. A title that is the natural subject of a
+    sentence ("Tư Duy Ngược là ...") is never touched.
+    """
+    stripped = paragraph.lstrip()
+    for first in titles:
+        first_norm = _normalize_paragraph(first)
+        if not first_norm or not stripped.lower().startswith(first_norm.lower() + ","):
+            continue
+        remainder = stripped[len(first_norm) + 1:].lstrip()
+        for second in titles:
+            second_norm = _normalize_paragraph(second)
+            if second_norm and remainder.lower().startswith(second_norm.lower() + " "):
+                after = remainder[len(second_norm):].lstrip()
+                if after[:1].isupper() or after[:1] in {"“", '"'}:
+                    return after
+        return remainder
+    return paragraph
+
+
+# Stock wording that appears as a trailing clause of an otherwise factual
+# sentence ("..., 228 trang - có tại Tiệm Sách Yêu Con."): remove the
+# clause only, keep the sentence.
+_STOCK_CLAUSE_RES = (
+    # "..., 228 trang - có tại Tiệm Sách Yêu Con." / "..., hiện có tại
+    # Tiệm Sách Yêu Con, gồm ..." -- delimiter-led clause, end or mid.
+    re.compile(r"\s*[-–—,]\s*(?:hiện\s+|đang\s+)?có\s+(?:bán\s+)?tại\s+Tiệm Sách Yêu Con(?=\s*(?:[.,!]|$))", re.IGNORECASE),
+    # "... 6 cuốn hiện có tại Tiệm Sách Yêu Con, gồm ..." -- bare clause.
+    re.compile(r"\s+(?:hiện|đang)\s+có\s+(?:bán\s+)?tại\s+Tiệm Sách Yêu Con(?=\s*(?:[.,!]|$))", re.IGNORECASE),
+)
+
+
+def strip_stock_clauses(sentence: str) -> str:
+    """Remove a trailing stock clause from one sentence (see above)."""
+    result = sentence
+    for pattern in _STOCK_CLAUSE_RES:
+        result = pattern.sub("", result)
+    if result != sentence:
+        result = result.rstrip(" ,-–—")
+        if result and result[-1] not in ".!?…\"”":
+            result += "."
+    return result
+
+
+def sentence_defects(sentence: str) -> set[str]:
+    """Defect codes (pattern-based only) present in one sentence."""
+    found: set[str] = set()
+    for code, patterns in _PATTERN_GROUPS:
+        if any(pattern.search(sentence) for pattern in patterns):
+            found.add(code)
+    return found
+
+
+def remove_defective_sentences(
+    text: str | None,
+    codes: Iterable[str] = REMOVABLE_SENTENCE_CODES,
+) -> str:
+    """Drop every sentence that carries one of `codes`; keep everything
+    else verbatim (paragraph structure preserved)."""
+    if not text:
+        return ""
+    removable = set(codes)
+    kept_paragraphs: list[str] = []
+    for paragraph in normalize_paragraphs(text).split("\n\n"):
+        kept: list[str] = []
+        for sentence in split_sentences(paragraph):
+            if not (sentence_defects(sentence) & removable):
+                kept.append(sentence)
+                continue
+            if STOCK_WORDING in removable:
+                # Keep the factual part of a sentence whose only defect
+                # is a trailing stock clause -- but never a stub.
+                trimmed = strip_stock_clauses(sentence)
+                if (
+                    trimmed != sentence
+                    and len(trimmed.split()) >= _MIN_KEPT_SENTENCE_WORDS
+                    and not (sentence_defects(trimmed) & removable)
+                ):
+                    kept.append(trimmed)
+        if kept:
+            kept_paragraphs.append(" ".join(kept))
+    return "\n\n".join(kept_paragraphs)
+
+
+def clean_source_text(text: str | None) -> str:
+    """Decode entities, drop HTML tags, normalize whitespace (paragraph
+    breaks kept). Removes nothing else -- this is what a collector stores
+    as the faithful, readable record of what the source said."""
+    if not text:
+        return ""
+    decoded = decode_html_entities(str(text))
+    decoded = re.sub(r"(?i)<\s*br\s*/?>|</\s*p\s*>", "\n", decoded)
+    decoded = _HTML_TAG_RE.sub(" ", decoded)
+    return normalize_paragraphs(decoded)
+
+
+# Product-page chrome that means a container captured more than the
+# description: customer reviews, rating widgets, buy box. A source text
+# containing any of these is rejected outright (never "cleaned"), because
+# review prose cannot be told apart from product prose deterministically.
+_PAGE_CHROME_PATTERNS = (
+    re.compile(r"\b\d+\s+đánh giá\b", re.IGNORECASE),
+    re.compile(r"gửi đánh giá", re.IGNORECASE),
+    re.compile(r"viết đánh giá", re.IGNORECASE),
+    re.compile(r"\btrả lời\s+\d+\s+(?:năm|tháng|tuần|ngày|giờ|phút)\s+trước", re.IGNORECASE),
+    re.compile(r"\bchọn mua\b", re.IGNORECASE),
+    re.compile(r"thêm vào giỏ", re.IGNORECASE),
+    re.compile(r"\btiết kiệm:", re.IGNORECASE),
+    re.compile(r"\d[\d.,]*\s*₫"),
+)
+
+
+def contains_page_chrome(text: str | None) -> bool:
+    """True when extracted text includes reviews/rating/buy-box chrome."""
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _PAGE_CHROME_PATTERNS)
+
+
+# Trailing page chrome after the description body ("Xem tất cả sách của
+# tác giả X", "Xem thêm", a table-of-contents tail): short paragraphs that
+# do not end a sentence. Trimmed from the end only.
+_TRAILING_CHROME_MAX_LENGTH = 150
+_SENTENCE_END_CHARACTERS = ".!?…\"”’»)"
+
+
+def _trim_trailing_chrome(paragraphs: list[str]) -> list[str]:
+    trimmed = list(paragraphs)
+    while trimmed:
+        last = trimmed[-1].rstrip()
+        if last.endswith(":") or (
+            len(last) <= _TRAILING_CHROME_MAX_LENGTH
+            and last[-1:] not in _SENTENCE_END_CHARACTERS
+        ):
+            trimmed.pop()
+            continue
+        break
+    return trimmed
+
+
+# Section headings product pages put above the description body
+# ("THÔNG TIN SẢN PHẨM", "Giới thiệu sách <title>", "Mô tả sản phẩm").
+_HEADING_PARAGRAPH_RE = re.compile(
+    r"^(?:thông tin sản phẩm|mô tả sản phẩm|giới thiệu sách|giới thiệu nội dung|nội dung sách)\b[^.!?]{0,150}$",
+    re.IGNORECASE,
+)
+
+
+def normalize_source_description(
+    text: str | None,
+    titles: Sequence[str | None] = (),
+) -> str:
+    """
+    Turn a collected source description into clean plain text:
+    decode HTML entities, drop HTML tags, normalize whitespace (keeping
+    paragraph breaks), remove a leading duplicated title, and drop
+    retailer/stock/shipping boilerplate sentences.
+
+    Never adds words. The result may still be TRUNCATED -- callers must
+    check find_text_defects() before using it as storefront content.
+    """
+    if not text:
+        return ""
+    paragraphs = clean_source_text(text).split("\n\n")
+    title_values = [
+        _normalize_paragraph(decode_html_entities(value))
+        for value in titles
+        if value and _normalize_paragraph(value)
+    ]
+    title_keys = {value.lower() for value in title_values}
+
+    cleaned: list[str] = []
+    for paragraph in paragraphs:
+        # Empty, or only punctuation/symbols ("…", "-", "+"): UI residue.
+        if not paragraph or not re.search(r"\w", paragraph):
+            continue
+        # A paragraph that is exactly a title, or a section heading, is
+        # page chrome, not content.
+        if paragraph.lower() in title_keys or _HEADING_PARAGRAPH_RE.match(paragraph):
+            continue
+        if not cleaned:
+            paragraph = _strip_duplicated_title_prefix(paragraph, title_values)
+        if paragraph:
+            cleaned.append(paragraph)
+
+    cleaned = _trim_trailing_chrome(cleaned)
+
+    without_boilerplate = remove_defective_sentences(
+        "\n\n".join(cleaned),
+        codes={SOURCE_BOILERPLATE, STOCK_WORDING, SHIPPING_WORDING},
+    )
+    # Removing boilerplate can expose more trailing chrome; trim again.
+    remaining = [paragraph for paragraph in without_boilerplate.split("\n\n") if paragraph.strip()]
+    return "\n\n".join(_trim_trailing_chrome(remaining)).strip()
+
+
+# --- detection ------------------------------------------------------
+
+
+def find_text_defects(text: str | None) -> set[str]:
+    """Every defect code present in one customer-facing text value."""
+    if not text:
+        return set()
+    value = str(text)
+    found: set[str] = set()
+    if _HTML_ENTITY_RE.search(value):
+        found.add(HTML_ENTITY)
+    if _HTML_TAG_RE.search(value):
+        found.add(HTML_MARKUP)
+    if _TRUNCATION_RE.search(value):
+        found.add(TRUNCATED)
+    for code, patterns in _PATTERN_GROUPS:
+        if any(pattern.search(value) for pattern in patterns):
+            found.add(code)
+    return found
+
+
+# Customer-facing fields that are running prose and must end a sentence.
+# Titles, SEO titles/descriptions, author lines and detail lists are not
+# required to end with terminal punctuation.
+PROSE_FIELDS = ("short_description", "long_description")
+
+_TERMINAL_CHARACTERS = ".!?…\"”’»)]:;"
+
+
+def ends_with_complete_sentence(text: str | None) -> bool:
+    """True when prose ends with terminal punctuation. A source snippet cut
+    at a character limit without an ellipsis ("...một cuộc chơi hoàn
+    toàn") fails this -- it is extraction truncation, not a sentence."""
+    if not text:
+        return False
+    stripped = text.rstrip()
+    return bool(stripped) and stripped[-1] in _TERMINAL_CHARACTERS
+
+
+def find_content_defects(
+    content: Mapping[str, object],
+    fields: Sequence[str],
+) -> dict[str, list[str]]:
+    """{field: sorted defect codes} for every field with a defect."""
+    findings: dict[str, list[str]] = {}
+    for field in fields:
+        value = content.get(field)
+        defects = find_text_defects(value)  # type: ignore[arg-type]
+        if field in PROSE_FIELDS and value and not ends_with_complete_sentence(str(value)):
+            defects.add(TRUNCATED)
+        if defects:
+            findings[field] = sorted(defects)
+    return findings
+
+
+def is_usable_source_description(text: str | None) -> bool:
+    """True when a normalized source description can stand as storefront
+    prose: long enough, no defect of any kind, and not cut off (it must
+    end a sentence)."""
+    if not text:
+        return False
+    stripped = text.strip()
+    if len(stripped) < MIN_USABLE_SOURCE_DESCRIPTION_LENGTH:
+        return False
+    if contains_page_chrome(stripped):
+        return False
+    if not ends_with_complete_sentence(stripped):
+        return False
+    return not find_text_defects(stripped)
+
+
+def leading_sentences(text: str, max_length: int) -> str:
+    """
+    Whole leading sentences of the first prose paragraph (the first one
+    that ends a sentence -- a subtitle/heading line is skipped), up to
+    max_length. Never cuts inside a sentence and never adds an ellipsis:
+    returns "" when even the first sentence is longer than max_length.
+    """
+    paragraphs = normalize_paragraphs(text).split("\n\n") if text else []
+    first_paragraph = next(
+        (paragraph for paragraph in paragraphs if ends_with_complete_sentence(paragraph)),
+        "",
+    )
+    selected: list[str] = []
+    length = 0
+    for sentence in split_sentences(first_paragraph):
+        extra = len(sentence) + (1 if selected else 0)
+        if length + extra > max_length:
+            break
+        selected.append(sentence)
+        length += extra
+    # A summary must not end on an ellipsis sentence: as the end of a field
+    # it reads as (and is detected as) extraction truncation.
+    while selected and _TRUNCATION_RE.search(selected[-1]):
+        selected.pop()
+    return " ".join(selected)

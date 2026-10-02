@@ -7,7 +7,7 @@ import unicodedata
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import parse_qs, urlsplit
 
 from dotenv import load_dotenv
@@ -26,13 +26,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.reference_sources import REFERENCE_SOURCE_PRIORITY, SourceType
+from src.domain.rules import storefront_text
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
 
 
 COLLECTOR_NAME = "reference_metadata_collector"
-COLLECTOR_VERSION = "1.5.1"
+COLLECTOR_VERSION = "1.6.0"
+DESCRIPTION_EXTRACTOR_VERSION = "full_description_dom_v2"
 
 NAVIGATION_TIMEOUT_MS = 60_000
 
@@ -140,6 +142,31 @@ def parse_arguments() -> argparse.Namespace:
         "--confirm-reset",
         action="store_true",
         help="Confirm --reset-stuck-in-progress without interactive input.",
+    )
+
+    parser.add_argument(
+        "--refresh-description",
+        action="store_true",
+        help=(
+            "Re-read one exact already-collected reference's registered "
+            "source page and replace a defective stored description "
+            "(truncated meta snippet / entity-encoded / retailer "
+            "boilerplate) with the full on-page description. Writes only "
+            "reference_description (previous value kept in raw_metadata); "
+            "never changes identity fields or match decisions. Requires "
+            "--reference-id and --confirm-refresh."
+        ),
+    )
+
+    parser.add_argument(
+        "--reference-id",
+        help="Exact product_references UUID for --refresh-description.",
+    )
+
+    parser.add_argument(
+        "--confirm-refresh",
+        action="store_true",
+        help="Confirm --refresh-description without interactive input.",
     )
 
     return parser.parse_args()
@@ -735,38 +762,123 @@ def extract_price_values(
     )
 
 
+# Full on-page product description containers, most specific first.
+# Fahasa: #desc_content (its ".description" class is a customer review --
+# deliberately never used). NetaBooks: .content-product-detail (its
+# JSON-LD/meta description is retailer SEO boilerplate). Then generic
+# product-page conventions.
+FULL_DESCRIPTION_SELECTORS = (
+    "#desc_content",
+    # NetaBooks: the inner text container only -- the outer
+    # .content-product-detail also holds customer reviews and the buy box.
+    ".txt-content-product-detail",
+    ".content-product-detail",
+    ".product-description",
+    ".product_getcontent",
+    '[itemprop="description"]',
+    ".rte",
+)
+
+
+def get_first_multiline_text(
+    page: Page,
+    selectors: Sequence[str],
+) -> list[str]:
+    """Visible text of every selector that matches, paragraph breaks kept."""
+    values: list[str] = []
+
+    for selector in selectors:
+        locator = page.locator(
+            selector
+        ).first
+
+        if locator.count() == 0:
+            continue
+
+        try:
+            value = locator.inner_text(
+                timeout=3_000
+            )
+
+        except PlaywrightTimeoutError:
+            continue
+
+        cleaned = storefront_text.clean_source_text(value)
+
+        if cleaned:
+            values.append(cleaned)
+
+    return values
+
+
+def choose_description(
+    candidates: Sequence[str | None],
+) -> str | None:
+    """
+    Pick the description to store: the first candidate (in priority
+    order) that is usable as storefront prose after normalization --
+    never a truncated meta snippet or retailer SEO boilerplate when a
+    full description exists. Falls back to the first non-empty candidate
+    so the reference still records what the source said (approval and
+    draft-safe selection independently refuse an unusable one).
+    """
+    cleaned = [
+        storefront_text.clean_source_text(candidate)
+        for candidate in candidates
+        if candidate
+    ]
+    cleaned = [value for value in cleaned if value]
+
+    for value in cleaned:
+        # A container that captured reviews/buy-box chrome is never used,
+        # even if the normalized remainder would look like prose.
+        if storefront_text.contains_page_chrome(value):
+            continue
+        if storefront_text.is_usable_source_description(
+            storefront_text.normalize_source_description(value)
+        ):
+            return value
+
+    return cleaned[0] if cleaned else None
+
+
 def extract_description(
     page: Page,
     product_json_ld: dict[str, Any] | None,
 ) -> str | None:
-    """Extract the primary product description."""
+    """
+    Extract the primary product description.
+
+    The full on-page description is preferred over JSON-LD/meta
+    descriptions, which on Fahasa are a ~150-character entity-encoded
+    snippet ending in "..." and on NetaBooks are retailer SEO boilerplate.
+    HTML entities are decoded and paragraph breaks preserved.
+    """
+    candidates: list[str | None] = list(
+        get_first_multiline_text(
+            page=page,
+            selectors=FULL_DESCRIPTION_SELECTORS,
+        )
+    )
+
     if product_json_ld:
-        description = normalize_whitespace(
-            product_json_ld.get(
-                "description"
-            )
+        json_ld_description = product_json_ld.get(
+            "description"
+        )
+        candidates.append(
+            json_ld_description
+            if isinstance(json_ld_description, str)
+            else None
         )
 
-        if description:
-            return description
-
-    meta_description = get_meta_content(
-        page,
-        'meta[name="description"]',
+    candidates.append(
+        get_meta_content(
+            page,
+            'meta[name="description"]',
+        )
     )
 
-    if meta_description:
-        return meta_description
-
-    return get_first_text(
-        page=page,
-        selectors=[
-            ".product-description",
-            ".product_getcontent",
-            ".rte",
-            '[itemprop="description"]',
-        ],
-    )
+    return choose_description(candidates)
 
 
 def extract_minhkhai_image_url(
@@ -2194,6 +2306,202 @@ def save_product_reference(
     return records[0], True
 
 
+def build_description_refresh_update(
+    reference: dict[str, Any],
+    new_description: str | None,
+    refreshed_at: str,
+) -> dict[str, Any] | None:
+    """
+    Pure: the exact product_references update for a description refresh,
+    or None when nothing may be written.
+
+    Only reference_description and raw_metadata change. The previous
+    description is preserved verbatim in raw_metadata.description_refresh
+    (auditable, reversible); title/author/ISBN/publisher and the existing
+    match_decision/match_confidence are never touched -- this refresh
+    cannot alter identity evidence. Refuses an unusable new description
+    and a no-op.
+    """
+    if not new_description or storefront_text.contains_page_chrome(new_description):
+        return None
+
+    normalized = storefront_text.normalize_source_description(
+        new_description,
+        titles=[reference.get("reference_title")],
+    )
+
+    if not storefront_text.is_usable_source_description(normalized):
+        return None
+
+    previous = reference.get("reference_description")
+
+    if previous == new_description:
+        return None
+
+    raw_metadata = dict(reference.get("raw_metadata") or {})
+    history = list(
+        (raw_metadata.get("description_refresh") or {}).get("history") or []
+    )
+    history.append(
+        {
+            "previous_reference_description": previous,
+            "refreshed_at": refreshed_at,
+            "extractor": DESCRIPTION_EXTRACTOR_VERSION,
+        }
+    )
+    raw_metadata["description_refresh"] = {
+        "last_refreshed_at": refreshed_at,
+        "extractor": DESCRIPTION_EXTRACTOR_VERSION,
+        "history": history,
+    }
+
+    return {
+        "reference_description": new_description,
+        "raw_metadata": raw_metadata,
+        "updated_at": refreshed_at,
+    }
+
+
+def refresh_reference_description(
+    repository: SupabaseRepository,
+    reference_id: str,
+) -> dict[str, Any]:
+    """
+    Re-read one exact, already-collected product_references row's source
+    page and replace a defective stored description (truncated meta
+    snippet, entity-encoded, retailer boilerplate) with the full on-page
+    description. Bounded to one reference_id; provenance unchanged
+    (same source_url_id, same registered source).
+    """
+    rows = (
+        repository.client
+        .table("product_references")
+        .select("*")
+        .eq("reference_id", reference_id)
+        .limit(2)
+        .execute()
+        .data
+        or []
+    )
+
+    if len(rows) != 1:
+        raise RuntimeError(
+            f"reference_id did not resolve to exactly one row: {reference_id}"
+        )
+
+    reference = rows[0]
+
+    if not reference.get("source_url_id"):
+        raise RuntimeError(
+            "Reference has no source_url_id; refusing to refresh a "
+            "reference without registered provenance."
+        )
+
+    source_rows = (
+        repository.client
+        .table("source_urls")
+        .select("source_url_id, source_url, source_type")
+        .eq("source_url_id", reference["source_url_id"])
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+
+    if not source_rows:
+        raise RuntimeError("Registered source_urls row was not found.")
+
+    source = source_rows[0]
+
+    if source.get("source_type") not in SUPPORTED_SOURCE_TYPES:
+        raise RuntimeError(
+            f"Source type {source.get('source_type')!r} is not supported "
+            "by this collector."
+        )
+
+    parser_name = select_parser(source["source_url"])
+
+    with sync_playwright() as playwright:
+        browser, context = create_browser(playwright)
+
+        try:
+            page, raw_text, _raw_html, _page_title = collect_page(
+                context=context,
+                source_url=source["source_url"],
+            )
+            metadata = parse_reference_page(
+                parser_name=parser_name,
+                page=page,
+                raw_text=raw_text,
+            )
+        finally:
+            context.close()
+            browser.close()
+
+    new_description = metadata.get("reference_description")
+    refreshed_at = utc_now_iso()
+    update = build_description_refresh_update(
+        reference=reference,
+        new_description=new_description,
+        refreshed_at=refreshed_at,
+    )
+
+    result = {
+        "reference_id": reference_id,
+        "source_url": source["source_url"],
+        "updated": update is not None,
+        "new_length": len(new_description or ""),
+        "new_usable": storefront_text.is_usable_source_description(
+            storefront_text.normalize_source_description(
+                new_description,
+                titles=[reference.get("reference_title")],
+            )
+        ),
+    }
+
+    if update is None:
+        return result
+
+    written = (
+        repository.client
+        .table("product_references")
+        .update(update)
+        .eq("reference_id", reference_id)
+        .execute()
+        .data
+        or []
+    )
+
+    if len(written) != 1:
+        raise RuntimeError("Reference description refresh did not update exactly one row.")
+
+    try:
+        repository.write_process_log(
+            message=(
+                f"Reference description refreshed for reference {reference_id} "
+                f"from its registered source ({source['source_url']})."
+            ),
+            process_name=COLLECTOR_NAME,
+            candidate_id=reference.get("candidate_id"),
+            process_step="REFRESH_REFERENCE_DESCRIPTION",
+            log_level="INFO",
+            status="UPDATED",
+            error_details={
+                "reference_id": reference_id,
+                "previous_length": len(reference.get("reference_description") or ""),
+                "new_length": len(new_description or ""),
+                "extractor": DESCRIPTION_EXTRACTOR_VERSION,
+            },
+        )
+    except Exception as error:
+        print(
+            "Warning: description refreshed, but writing the process_logs "
+            f"entry failed: {type(error).__name__}: {error}"
+        )
+
+    return result
+
+
 def create_browser(
     playwright: Playwright,
 ) -> tuple[
@@ -2528,6 +2836,21 @@ def main() -> None:
         raise RuntimeError(
             "Use either --candidate-code or --candidate-id, not both."
         )
+
+    if args.refresh_description:
+        if not args.reference_id:
+            raise RuntimeError("--refresh-description requires --reference-id.")
+
+        if not args.confirm_refresh:
+            raise RuntimeError("--refresh-description requires --confirm-refresh.")
+
+        print(f"Version: {COLLECTOR_VERSION}")
+        result = refresh_reference_description(
+            repository=SupabaseRepository(),
+            reference_id=args.reference_id,
+        )
+        print(f"REFRESH_RESULT {json.dumps(result, ensure_ascii=False)}")
+        return
 
     if args.non_interactive and not (
         args.candidate_code

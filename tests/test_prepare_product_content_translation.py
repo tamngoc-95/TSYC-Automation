@@ -28,7 +28,7 @@ CANDIDATE_ID = "candidate-1"
 PRODUCT_CODE = "TSYC-FB-HIST-2026-002-CAN-0001"
 
 VI_LONG = (
-    "“Gấu con đi ngủ” của Lê Minh hiện có tại Tiệm Sách Yêu Con.\n\n"
+    "“Gấu con đi ngủ” là sách tranh của Lê Minh.\n\n"
     "Câu chuyện kể về chú gấu nhỏ chuẩn bị đi ngủ cùng mẹ, với tranh minh "
     "họa màu sắc dịu nhẹ.\n\nSách dày 32 trang."
 )
@@ -36,34 +36,34 @@ VI_LONG = (
 EN_GOOD = {
     "product_name": "Little Bear Goes to Sleep (Gấu con đi ngủ)",
     "short_description": (
-        "“Gấu con đi ngủ” by Lê Minh is available at Tiệm Sách Yêu Con. "
+        "“Gấu con đi ngủ” is a picture book by Lê Minh. "
         "A gentle story about a little bear's bedtime."
     ),
     "long_description": (
-        "“Gấu con đi ngủ” by Lê Minh is now available at Tiệm Sách Yêu Con.\n\n"
+        "“Gấu con đi ngủ” is a picture book by Lê Minh.\n\n"
         "The story follows a little bear getting ready for bed with its "
         "mother, with softly coloured illustrations.\n\nThe book has 32 pages."
     ),
     "product_details": "Author: Lê Minh\nPages: 32",
     "seo_title": "Gấu con đi ngủ – Lê Minh",
-    "seo_description": "Gấu con đi ngủ by Lê Minh at Tiệm Sách Yêu Con.",
+    "seo_description": "Gấu con đi ngủ by Lê Minh – a gentle bedtime story.",
 }
 
 DE_GOOD = {
     "product_name": "Kleiner Bär geht schlafen (Gấu con đi ngủ)",
     "short_description": (
-        "„Gấu con đi ngủ“ von Lê Minh ist bei Tiệm Sách Yêu Con erhältlich. "
+        "„Gấu con đi ngủ“ ist ein Bilderbuch von Lê Minh. "
         "Eine sanfte Geschichte über die Schlafenszeit eines kleinen Bären."
     ),
     "long_description": (
-        "„Gấu con đi ngủ“ von Lê Minh ist jetzt bei Tiệm Sách Yêu Con "
-        "erhältlich.\n\nDie Geschichte erzählt, wie sich ein kleiner Bär mit "
+        "„Gấu con đi ngủ“ ist ein Bilderbuch von Lê Minh."
+        "\n\nDie Geschichte erzählt, wie sich ein kleiner Bär mit "
         "seiner Mutter auf das Schlafengehen vorbereitet, mit sanft "
         "kolorierten Illustrationen.\n\nDas Buch hat 32 Seiten."
     ),
     "product_details": "Autor: Lê Minh\nSeiten: 32",
     "seo_title": "Gấu con đi ngủ – Lê Minh",
-    "seo_description": "Gấu con đi ngủ von Lê Minh bei Tiệm Sách Yêu Con.",
+    "seo_description": "Gấu con đi ngủ von Lê Minh – eine sanfte Gutenachtgeschichte.",
 }
 
 
@@ -96,14 +96,14 @@ def make_vi_content(**overrides: Any) -> dict[str, Any]:
         "content_language": "vi",
         "product_name": "Gấu con đi ngủ",
         "short_description": (
-            "“Gấu con đi ngủ” của Lê Minh là ấn phẩm đang có tại Tiệm Sách "
-            "Yêu Con. Câu chuyện nhẹ nhàng về giờ đi ngủ của chú gấu nhỏ."
+            "“Gấu con đi ngủ” là sách tranh của Lê Minh. "
+            "Câu chuyện nhẹ nhàng về giờ đi ngủ của chú gấu nhỏ."
         ),
         "long_description": VI_LONG,
         "author_summary": None,
         "product_details": "Tác giả: Lê Minh\nSố trang: 32",
         "seo_title": "Gấu con đi ngủ – Lê Minh",
-        "seo_description": "Gấu con đi ngủ của Lê Minh tại Tiệm Sách Yêu Con.",
+        "seo_description": "Gấu con đi ngủ của Lê Minh – câu chuyện nhẹ nhàng trước giờ ngủ.",
         "content_status": "APPROVED",
         "review_required": False,
         "generation_method": "RULE_BASED",

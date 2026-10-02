@@ -20,6 +20,7 @@ from src.cli_bootstrap import configure_utf8_console
 from src.domain.content_status import ContentStatus, InternalProductContentStatus
 from src.domain.image_status import ImageStatus, InternalProductImageStatus
 from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
+from src.domain.rules import content_rules
 from src.domain.woocommerce_status import WooCommerceStatus, WooCommerceSyncStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
@@ -331,6 +332,26 @@ def get_approved_content(
     return rows[0]
 
 
+def require_storefront_valid_content(
+    content: dict[str, Any],
+) -> None:
+    """
+    Refuse to send APPROVED content that fails the storefront text rules
+    (entities, extraction truncation, provenance/workflow notes, retailer
+    boilerplate, stock/shipping wording). Content approved before those
+    rules existed must be repaired first (prepare_product_content.py
+    --action REPAIR) -- defective text must never reach WooCommerce.
+    """
+    check = content_rules.evaluate_storefront_text_quality(content)
+
+    if not check.is_auto_pass:
+        raise RuntimeError(
+            "Approved Vietnamese content fails storefront validation "
+            f"[{check.rule_code}] {check.reason}. Repair it before "
+            "WooCommerce draft creation."
+        )
+
+
 def get_publishable_images(
     repository: SupabaseRepository,
     candidate_id: str,
@@ -440,6 +461,8 @@ def revalidate_pre_create_state(
         raise RuntimeError(
             "Approved Vietnamese product content is no longer available."
         )
+
+    require_storefront_valid_content(content)
 
     images = get_publishable_images(
         repository=repository,
@@ -2218,6 +2241,8 @@ def main() -> None:
         raise RuntimeError(
             "Approved Vietnamese product content was not found."
         )
+
+    require_storefront_valid_content(content)
 
     images = get_publishable_images(
         repository=repository,

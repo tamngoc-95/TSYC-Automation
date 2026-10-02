@@ -15,7 +15,12 @@ from src.cli_bootstrap import configure_utf8_console
 from src.domain.content_package import ContentPackage, build_content_package
 from src.domain.content_status import ContentStatus
 from src.domain.decisions import Outcome
-from src.domain.rules import content_rules, multilingual_consistency, translation_rules
+from src.domain.rules import (
+    content_rules,
+    multilingual_consistency,
+    storefront_text,
+    translation_rules,
+)
 from src.repositories.supabase_repository import SupabaseRepository
 from src.services.translation_provider import (
     DEFAULT_PACKAGE_DIR,
@@ -38,6 +43,9 @@ VALID_ACTIONS = {
     "REVISE",
     "AUTO_REVISE",
     "SKIP",
+    # Authorized repair of APPROVED vi content failing storefront rules.
+    "REPAIR",
+    "REPAIR_PREVIEW",
     # Multilingual path (CLAUDE_AUTOMATION.md section 9): en+de together.
     "TRANSLATE",
     "EXPORT_PACKAGE",
@@ -58,11 +66,14 @@ TRANSLATION_FILE_FIELDS = (
 )
 TRANSLATION_GENERATION_METHODS = {"MANUAL", "AI_ASSISTED", "HYBRID"}
 
-# Minimum length of an excerpt used as short_description/seo_description
-# when auto-enriching from a reference description -- short enough to stay
-# a summary, long enough to be meaningfully distinct from the generic
-# safe-draft placeholder text.
-_AUTO_ENRICH_EXCERPT_LENGTH = 200
+# Maximum lengths of the whole-sentence summaries used as short_description/
+# seo_description when auto-enriching from a reference description. Whole
+# sentences only (storefront_text.leading_sentences) -- never a mid-sentence
+# cut with an ellipsis. The hard maximum is the fallback when the first
+# sentence alone is longer than the normal maximum.
+_AUTO_ENRICH_SHORT_MAX_LENGTH = 300
+_AUTO_ENRICH_SHORT_HARD_MAX_LENGTH = 600
+_AUTO_ENRICH_SEO_MAX_LENGTH = 160
 
 # Customer-facing product_contents fields a human reviewer is allowed to
 # revise through --action REVISE. product_name and author_summary are
@@ -164,6 +175,15 @@ def parse_arguments() -> argparse.Namespace:
             "Explicit machine-readable confirmation that replaces the "
             "interactive 'Type REVISE' prompt. Required with "
             "--non-interactive --action REVISE."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-repair",
+        action="store_true",
+        help=(
+            "Explicit confirmation for --action REPAIR: overwrite an "
+            "APPROVED vi row that fails storefront validation with its "
+            "deterministic repair (re-validated before approval)."
         ),
     )
     parser.add_argument(
@@ -517,6 +537,14 @@ def validate_approval_content(
     if not boilerplate_check.is_auto_pass:
         raise RuntimeError(
             f"[{boilerplate_check.rule_code}] {boilerplate_check.reason}"
+        )
+
+    # Entities, extraction truncation, provenance/workflow notes, retailer
+    # boilerplate, stock/shipping wording (src.domain.rules.storefront_text).
+    storefront_check = content_rules.evaluate_storefront_text_quality(content)
+    if not storefront_check.is_auto_pass:
+        raise RuntimeError(
+            f"[{storefront_check.rule_code}] {storefront_check.reason}"
         )
 
 
@@ -1215,58 +1243,467 @@ def get_references_for_candidate(
     return response.data or []
 
 
-def excerpt(text: str, max_length: int) -> str:
-    """Trim `text` to at most max_length characters, at a word boundary."""
-    cleaned = clean_text(text) or ""
-
-    if len(cleaned) <= max_length:
-        return cleaned
-
-    truncated = cleaned[:max_length].rsplit(" ", 1)[0].strip()
-    return f"{truncated}…" if truncated else cleaned[:max_length]
-
-
 def build_historical_enrichment_content(
     generated: dict[str, Any],
     product: dict[str, Any],
-    reference_description: str,
-    reference_source_type: str,
+    normalized_description: str,
 ) -> dict[str, Any]:
     """
     Build enriched short/long/SEO description fields for an FB-HIST
     candidate's generic draft, from an already-verified, non-conflicting
     reference description (content_rules.select_historical_draft_safe_
-    content_reference already confirmed eligibility -- this function only
-    formats the text, it never re-decides eligibility).
+    content_reference already confirmed eligibility and storefront
+    usability -- this function only formats the text, it never re-decides
+    eligibility).
 
-    Reuses the exact reference_description text collected by collect_
-    reference_metadata.py from an approved source -- never invents new
-    prose. product_name, author_summary, and product_details are carried
-    over unchanged from the existing safe draft (verified-metadata-only
-    fields; enrichment only ever touches the descriptive/SEO fields).
+    normalized_description is the reference_description collected by
+    collect_reference_metadata.py from an approved source after the
+    deterministic storefront normalization (entity decoding, retailer
+    boilerplate removal) -- no new prose is invented.
+
+    Customer-facing fields never carry provenance, stock, or workflow
+    wording (CLAUDE.md 15.1, TSYC_CONTENT_GUIDE.md sections 11-12); the
+    source reference is recorded in review_notes/process_logs instead.
+    Short/SEO descriptions are whole leading sentences only -- never a
+    mid-sentence excerpt with an ellipsis.
+
+    product_name, author_summary, and product_details are carried over
+    unchanged from the existing safe draft (verified-metadata-only fields).
     """
     title = clean_text(product.get("title")) or ""
     author = clean_text(product.get("author"))
-    author_phrase = f" của {author}" if author else ""
-    description_text = clean_text(reference_description) or ""
+    title_sentence = f"“{title}”" + (f" – {author}." if author else "")
+    description_text = storefront_text.normalize_paragraphs(normalized_description)
 
     enriched = dict(generated)
+    enriched["long_description"] = description_text
     enriched["short_description"] = (
-        f"“{title}”{author_phrase} là ấn phẩm đang có tại Tiệm Sách Yêu Con. "
-        + excerpt(description_text, _AUTO_ENRICH_EXCERPT_LENGTH)
-    )
-    enriched["long_description"] = (
-        f"“{title}”{author_phrase} hiện có tại Tiệm Sách Yêu Con.\n\n"
-        f"{description_text}\n\n"
-        f"(Mô tả tham khảo từ nguồn {reference_source_type} đã được xác minh.)"
+        storefront_text.leading_sentences(description_text, _AUTO_ENRICH_SHORT_MAX_LENGTH)
+        or storefront_text.leading_sentences(description_text, _AUTO_ENRICH_SHORT_HARD_MAX_LENGTH)
+        or title_sentence
     )
     enriched["seo_description"] = (
-        f"{title}"
-        + (f" của {author}" if author else "")
-        + " – "
-        + excerpt(description_text, 120)
+        storefront_text.leading_sentences(description_text, _AUTO_ENRICH_SEO_MAX_LENGTH)
+        or title_sentence
     )
     return enriched
+
+
+# --- authorized storefront-content repair -----------------------------------
+#
+# Repairs an APPROVED Vietnamese content row that fails the storefront text
+# rules (src.domain.rules.storefront_text) -- the FT-BATCH-9-2026-10-01
+# defect: AUTO_REVISE wrapped truncated/entity-encoded/boilerplate source
+# snippets in stock wording and an internal provenance note, and the
+# approval gate did not catch it. This is the ONLY path that may overwrite
+# APPROVED content, and only when that content demonstrably fails
+# validation; valid APPROVED content is always refused (CLAUDE.md 2.7).
+
+REPAIR_PROCESS_STEP = "STOREFRONT_REPAIR"
+REPAIR_AUDIT_DIR = PROJECT_ROOT / "data" / "processed" / "content_repairs"
+
+# The AUTO_REVISE template (pre-fix) always ended long_description with
+# this provenance note -- the reliable signature of a template row whose
+# prose came entirely from one reference description.
+_AUTO_REVISE_TEMPLATE_MARKER = "Mô tả tham khảo từ nguồn"
+
+# Defect categories (report/classification only).
+REPAIR_CATEGORY_INTERNAL_NOTE_ONLY = "INTERNAL_NOTE_ONLY"
+REPAIR_CATEGORY_HTML_ENTITY = "HTML_ENTITY"
+REPAIR_CATEGORY_TRUNCATED_SOURCE = "TRUNCATED_SOURCE"
+REPAIR_CATEGORY_STOCK_OR_BOILERPLATE = "STOCK_OR_REFERENCE_BOILERPLATE"
+REPAIR_CATEGORY_MULTIPLE = "MULTIPLE_DEFECTS"
+
+# Repair outcomes.
+REPAIR_OUTCOME_REPAIRABLE = "REPAIRABLE"
+REPAIR_OUTCOME_NEEDS_SOURCE_RECOLLECTION = "NEEDS_SOURCE_RECOLLECTION"
+REPAIR_OUTCOME_HUMAN_REVIEW = "GENUINE_HUMAN_REVIEW"
+REPAIR_OUTCOME_NOT_DEFECTIVE = "NOT_DEFECTIVE"
+
+_SUPPORTED_RECOLLECTION_SOURCE_TYPES = {"PUBLISHER", "AUTHORIZED_SUPPLIER", "BOOKSTORE", "FAHASA"}
+
+
+def classify_storefront_defects(findings: dict[str, list[str]]) -> str | None:
+    """Collapse per-field defect codes into one report category."""
+    codes = {code for field_codes in findings.values() for code in field_codes}
+
+    if not codes:
+        return None
+
+    groups = set()
+    if codes & {storefront_text.PROVENANCE_NOTE, storefront_text.INTERNAL_WORKFLOW}:
+        groups.add(REPAIR_CATEGORY_INTERNAL_NOTE_ONLY)
+    if codes & {storefront_text.HTML_ENTITY, storefront_text.HTML_MARKUP}:
+        groups.add(REPAIR_CATEGORY_HTML_ENTITY)
+    if storefront_text.TRUNCATED in codes:
+        groups.add(REPAIR_CATEGORY_TRUNCATED_SOURCE)
+    if codes & {
+        storefront_text.STOCK_WORDING,
+        storefront_text.SOURCE_BOILERPLATE,
+        storefront_text.SHIPPING_WORDING,
+    }:
+        groups.add(REPAIR_CATEGORY_STOCK_OR_BOILERPLATE)
+
+    return groups.pop() if len(groups) == 1 else REPAIR_CATEGORY_MULTIPLE
+
+
+def _clean_prose_field(value: str | None) -> str | None:
+    """Decode entities and drop defective sentences; keep everything else."""
+    decoded = storefront_text.clean_source_text(value)
+    cleaned = storefront_text.remove_defective_sentences(decoded)
+    return cleaned or None
+
+
+def _clean_product_details(value: str | None) -> str | None:
+    """Drop detail lines that carry a defect (e.g. "Tác giả: Đọc thử")."""
+    if not value:
+        return value
+    lines = [
+        line.strip()
+        for line in storefront_text.decode_html_entities(value).splitlines()
+        if line.strip() and not storefront_text.find_text_defects(line)
+    ]
+    return "\n".join(lines) or None
+
+
+def _clean_author(product: dict[str, Any]) -> str | None:
+    author = clean_text(product.get("author"))
+    if author and storefront_text.find_text_defects(author):
+        return None
+    return author
+
+
+def _clean_seo_title(value: str | None, title: str, author: str | None) -> str:
+    if value and not storefront_text.find_text_defects(value):
+        return value
+    return f"{title} – {author}" if author else title
+
+
+def plan_storefront_repair(
+    existing: dict[str, Any],
+    product: dict[str, Any],
+    candidate: dict[str, Any] | None,
+    references: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Pure: decide how one APPROVED content row can be repaired.
+
+    Returns {"outcome", "category", "strategy", "findings", "content",
+    "source_reference_id", "reason"}. content is the full repaired
+    payload when outcome == REPAIRABLE (it still has to pass
+    validate_approval_content before anything is written).
+
+    Strategies -- neither ever adds a fact:
+      TEMPLATE_REBUILD  the row is a pre-fix AUTO_REVISE template: rebuild
+                        it with the fixed builder from the selected draft-
+                        safe reference's normalized description (which must
+                        itself now be usable -- a stored truncated snippet
+                        means NEEDS_SOURCE_RECOLLECTION).
+      SENTENCE_REPAIR   any other row: decode entities, remove sentences
+                        carrying provenance/workflow/stock/shipping/
+                        retailer-boilerplate wording (a trailing stock
+                        clause is removed from an otherwise factual
+                        sentence), keep all remaining text verbatim.
+    """
+    findings = storefront_text.find_content_defects(
+        existing, content_rules.CUSTOMER_FACING_FIELDS
+    )
+    plan: dict[str, Any] = {
+        "outcome": None,
+        "category": classify_storefront_defects(findings),
+        "strategy": None,
+        "findings": findings,
+        "content": None,
+        "source_reference_id": None,
+        "reason": None,
+    }
+
+    if not findings:
+        plan["outcome"] = REPAIR_OUTCOME_NOT_DEFECTIVE
+        plan["reason"] = "Content passes storefront validation; nothing to repair."
+        return plan
+
+    title = clean_text(product.get("title")) or clean_text(existing.get("product_name")) or ""
+    author = _clean_author(product)
+    clean_product = {**product, "author": author}
+
+    base = {field: existing.get(field) for field in CONTENT_TEXT_FIELDS}
+    base["author_summary"] = _clean_prose_field(existing.get("author_summary"))
+    base["product_details"] = _clean_product_details(existing.get("product_details"))
+    base["seo_title"] = _clean_seo_title(existing.get("seo_title"), title, author)
+
+    if _AUTO_REVISE_TEMPLATE_MARKER in (existing.get("long_description") or ""):
+        plan["strategy"] = "TEMPLATE_REBUILD"
+        selection = content_rules.select_historical_draft_safe_content_reference(
+            candidate=candidate or {},
+            references=references,
+        )
+
+        if selection.outcome != Outcome.AUTO_PASS:
+            recollectable = any(
+                reference.get("source_url_id")
+                and reference.get("source_type") in _SUPPORTED_RECOLLECTION_SOURCE_TYPES
+                and reference.get("match_decision") in {"MATCH", "POSSIBLE_MATCH", "MANUAL_REVIEW"}
+                for reference in references
+            )
+            plan["outcome"] = (
+                REPAIR_OUTCOME_NEEDS_SOURCE_RECOLLECTION
+                if recollectable
+                else REPAIR_OUTCOME_HUMAN_REVIEW
+            )
+            plan["reason"] = (
+                "No stored reference description is usable as storefront "
+                f"prose ({selection.rule_code}: {selection.reason})"
+            )
+            return plan
+
+        plan["content"] = build_historical_enrichment_content(
+            generated=base,
+            product=clean_product,
+            normalized_description=selection.evidence["normalized_description"],
+        )
+        plan["source_reference_id"] = selection.evidence["reference_id"]
+    else:
+        plan["strategy"] = "SENTENCE_REPAIR"
+        repaired = dict(base)
+        for field in ("short_description", "long_description", "seo_description"):
+            repaired[field] = _clean_prose_field(existing.get(field))
+
+        if not repaired["long_description"]:
+            plan["outcome"] = REPAIR_OUTCOME_HUMAN_REVIEW
+            plan["reason"] = "Nothing customer-facing remains after removing defective sentences."
+            return plan
+
+        if not repaired["short_description"]:
+            repaired["short_description"] = storefront_text.leading_sentences(
+                repaired["long_description"], _AUTO_ENRICH_SHORT_MAX_LENGTH
+            ) or None
+        if not repaired["seo_description"]:
+            repaired["seo_description"] = storefront_text.leading_sentences(
+                repaired["long_description"], _AUTO_ENRICH_SEO_MAX_LENGTH
+            ) or None
+
+        plan["content"] = repaired
+
+    remaining = storefront_text.find_content_defects(
+        plan["content"], content_rules.CUSTOMER_FACING_FIELDS
+    )
+    if remaining:
+        truncated_only = all(
+            set(codes) <= {storefront_text.TRUNCATED} for codes in remaining.values()
+        )
+        plan["outcome"] = REPAIR_OUTCOME_HUMAN_REVIEW
+        plan["reason"] = (
+            "Defects remain after deterministic repair: "
+            + "; ".join(f"{f}={','.join(c)}" for f, c in sorted(remaining.items()))
+            + (" (source text itself is truncated)" if truncated_only else "")
+        )
+        plan["content"] = None
+        return plan
+
+    plan["outcome"] = REPAIR_OUTCOME_REPAIRABLE
+    plan["reason"] = f"Deterministic {plan['strategy']} removes every storefront defect."
+    return plan
+
+
+def write_repair_audit_file(
+    product_code: str,
+    existing: dict[str, Any],
+    repaired: dict[str, Any],
+    plan: dict[str, Any],
+    audit_dir: Path | None = None,
+) -> Path:
+    """Local, reversible before/after record of one repair (gitignored
+    data/processed/; the process_logs row is the database record)."""
+    audit_dir = audit_dir or REPAIR_AUDIT_DIR
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = audit_dir / f"{product_code}_{stamp}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "product_code": product_code,
+                "product_content_id": existing.get("product_content_id"),
+                "repaired_at": utc_now(),
+                "strategy": plan["strategy"],
+                "category": plan["category"],
+                "findings_before": plan["findings"],
+                "source_reference_id": plan["source_reference_id"],
+                "before": {field: existing.get(field) for field in CONTENT_TEXT_FIELDS},
+                "after": {field: repaired.get(field) for field in CONTENT_TEXT_FIELDS},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def run_repair_action(
+    repository: SupabaseRepository,
+    product_code: str | None,
+    non_interactive: bool,
+    confirm_repair: bool,
+    preview_only: bool = False,
+) -> dict[str, Any]:
+    """
+    --action REPAIR / REPAIR_PREVIEW for exactly one product.
+
+    Refuses unless the existing vi row is APPROVED *and* fails storefront
+    validation -- valid APPROVED content can never be overwritten here.
+    A repaired row is written APPROVED only if it passes the complete
+    approval validation; otherwise nothing is written and the row is
+    reported (never silently downgraded -- an unrepairable row is a
+    human-review item, and translation/Woo creation independently refuse
+    defective content).
+    """
+    if not product_code:
+        raise RuntimeError("--action REPAIR requires --product-code (exact targeting only).")
+
+    if not preview_only and non_interactive and not confirm_repair:
+        raise RuntimeError("--non-interactive --action REPAIR requires --confirm-repair.")
+
+    product, existing = get_content_for_exact_product(
+        repository=repository,
+        product_code=product_code,
+    )
+
+    if existing is None or existing.get("content_status") != ContentStatus.APPROVED:
+        raise RuntimeError(
+            "REPAIR only applies to an existing APPROVED Vietnamese content "
+            "row; use REVISE/APPROVE for DRAFTED or REVIEW_REQUIRED content."
+        )
+
+    candidate = get_candidate_for_product(
+        repository=repository,
+        candidate_id=product["candidate_id"],
+    )
+    references = get_references_for_candidate(
+        repository=repository,
+        candidate_id=product["candidate_id"],
+    )
+    plan = plan_storefront_repair(
+        existing=existing,
+        product=product,
+        candidate=candidate,
+        references=references,
+    )
+    report = {
+        "product_code": product_code,
+        "candidate_code": candidate.get("candidate_code"),
+        "category": plan["category"],
+        "strategy": plan["strategy"],
+        "outcome": plan["outcome"],
+        "reason": plan["reason"],
+        "written": False,
+    }
+
+    if plan["outcome"] == REPAIR_OUTCOME_NOT_DEFECTIVE:
+        raise RuntimeError(
+            "REPAIR refused: this APPROVED content passes storefront "
+            "validation. APPROVED content is never overwritten outside the "
+            "defect-repair workflow (CLAUDE.md 2.7)."
+        )
+
+    if plan["outcome"] == REPAIR_OUTCOME_REPAIRABLE:
+        try:
+            validate_approval_content(
+                existing=existing,
+                content=plan["content"],
+                generated=build_safe_draft(product),
+            )
+        except RuntimeError as error:
+            report["outcome"] = REPAIR_OUTCOME_HUMAN_REVIEW
+            report["reason"] = f"Repaired content fails approval validation: {error}"
+
+    if preview_only or report["outcome"] != REPAIR_OUTCOME_REPAIRABLE:
+        if not preview_only:
+            try:
+                repository.write_process_log(
+                    message=(
+                        f"Storefront repair not applied to {product_code}: "
+                        f"{report['outcome']} -- {report['reason']}"
+                    ),
+                    process_name="prepare_product_content",
+                    candidate_id=product.get("candidate_id"),
+                    process_step=REPAIR_PROCESS_STEP,
+                    log_level="WARNING",
+                    status=report["outcome"],
+                    error_details={"findings": plan["findings"], "category": plan["category"]},
+                )
+            except Exception as error:
+                print(f"Warning: process_logs entry failed: {type(error).__name__}: {error}")
+        report["preview_content"] = plan["content"]
+        return report
+
+    repaired = plan["content"]
+    changed_fields = [
+        field
+        for field in CONTENT_TEXT_FIELDS
+        if (existing.get(field) or None) != (repaired.get(field) or None)
+    ]
+    # Snapshot before any write: the audit trail must never depend on the
+    # caller's row object staying unmodified.
+    previous_values = {field: existing.get(field) for field in changed_fields}
+    audit_path = write_repair_audit_file(
+        product_code=product_code,
+        existing=existing,
+        repaired=repaired,
+        plan=plan,
+    )
+
+    save_content(
+        repository=repository,
+        product=product,
+        existing=existing,
+        content=repaired,
+        approve=True,
+        generation_method=existing.get("generation_method") or "RULE_BASED",
+        review_notes=(
+            f"{REPAIR_PROCESS_STEP}: {plan['strategy']} ({plan['category']}). "
+            f"Defects removed: {json.dumps(plan['findings'], ensure_ascii=False)}. "
+            + (
+                f"Source reference: {plan['source_reference_id']}. "
+                if plan["source_reference_id"]
+                else ""
+            )
+            + "Re-validated and auto-approved; previous content in "
+            f"process_logs and {audit_path.name}."
+        ),
+    )
+
+    try:
+        repository.write_process_log(
+            message=(
+                f"Storefront repair applied to {product_code}: "
+                f"{plan['strategy']} ({plan['category']}); changed "
+                + ", ".join(changed_fields)
+            ),
+            process_name="prepare_product_content",
+            candidate_id=product.get("candidate_id"),
+            process_step=REPAIR_PROCESS_STEP,
+            log_level="INFO",
+            status="REPAIRED",
+            error_details={
+                "strategy": plan["strategy"],
+                "category": plan["category"],
+                "findings_before": plan["findings"],
+                "source_reference_id": plan["source_reference_id"],
+                "audit_file": audit_path.name,
+                "previous": previous_values,
+            },
+        )
+    except Exception as error:
+        print(
+            "Warning: repair was saved, but writing the process_logs audit "
+            f"entry failed: {type(error).__name__}: {error}"
+        )
+
+    report["written"] = True
+    report["changed_fields"] = changed_fields
+    report["audit_file"] = str(audit_path)
+    return report
 
 
 def run_auto_revise_action(
@@ -1350,8 +1787,7 @@ def run_auto_revise_action(
     enriched_content = build_historical_enrichment_content(
         generated=generated,
         product=product,
-        reference_description=selection.evidence["reference_description"],
-        reference_source_type=selection.evidence["source_type"],
+        normalized_description=selection.evidence["normalized_description"],
     )
 
     print()
@@ -1487,6 +1923,18 @@ def require_approved_vietnamese_content(
             f"{product_code} has no APPROVED Vietnamese content "
             "(content_status=APPROVED, review_required=false). Vietnamese "
             "is the semantic source; approve it first."
+        )
+
+    # Never localize defective canonical content: an APPROVED row approved
+    # before the storefront rules existed may still carry entities,
+    # truncation, provenance or stock wording -- repair it first.
+    storefront_check = content_rules.evaluate_storefront_text_quality(vi_content)
+    if not storefront_check.is_auto_pass:
+        raise RuntimeError(
+            "Translation refused: product "
+            f"{product_code} Vietnamese content fails storefront "
+            f"validation [{storefront_check.rule_code}] "
+            f"{storefront_check.reason}. Run --action REPAIR first."
         )
 
     return vi_content
@@ -2083,6 +2531,17 @@ def main() -> None:
             repository=repository,
             product_code=args.product_code,
         )
+        return
+
+    if action in {"REPAIR", "REPAIR_PREVIEW"}:
+        report = run_repair_action(
+            repository=repository,
+            product_code=args.product_code,
+            non_interactive=args.non_interactive,
+            confirm_repair=args.confirm_repair,
+            preview_only=action == "REPAIR_PREVIEW",
+        )
+        print(f"REPAIR_RESULT {json.dumps(report, ensure_ascii=False)}")
         return
 
     content_language = getattr(args, "content_language", "vi") or "vi"

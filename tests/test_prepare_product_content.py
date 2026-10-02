@@ -279,6 +279,14 @@ def test_validate_approval_content_allows_enriched_content():
         "Nội dung sách kể về một hành trình khám phá thế giới xung quanh, "
         "được biên tập lại từ bài đăng Facebook đã được phép sử dụng."
     )
+    # Fully enriched: the generic draft's short/SEO text (stock wording,
+    # "verified data" note) must not survive into approved content.
+    enriched["short_description"] = (
+        "Một hành trình khám phá thế giới xung quanh qua từng trang sách."
+    )
+    enriched["seo_description"] = (
+        "Sách kể về một hành trình khám phá thế giới xung quanh."
+    )
 
     # Must not raise.
     ppc.validate_approval_content(
@@ -397,6 +405,14 @@ def test_attempt_content_approval_approves_enriched_content():
     enriched["long_description"] = (
         "Nội dung sách kể về một hành trình khám phá thế giới xung quanh, "
         "được biên tập lại từ bài đăng Facebook đã được phép sử dụng."
+    )
+    # Fully enriched: the generic draft's short/SEO text (stock wording,
+    # "verified data" note) must not survive into approved content.
+    enriched["short_description"] = (
+        "Một hành trình khám phá thế giới xung quanh qua từng trang sách."
+    )
+    enriched["seo_description"] = (
+        "Sách kể về một hành trình khám phá thế giới xung quanh."
     )
     existing = {"product_content_id": "content-1", "content_status": "DRAFTED", **enriched}
 

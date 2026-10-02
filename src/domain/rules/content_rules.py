@@ -27,10 +27,12 @@ from typing import Any, Mapping, Sequence
 from src.domain.decisions import DecisionResult, Outcome
 from src.domain.identity_status import MatchDecision
 from src.domain.reference_sources import REFERENCE_SOURCE_PRIORITY
+from src.domain.rules import storefront_text
 from src.domain.rules.identity_rules import reference_business_conflict_reason
 
 # --- rule codes ----------------------------------------------------
 
+CONTENT_STOREFRONT_TEXT_DEFECT = "CONTENT_STOREFRONT_TEXT_DEFECT"
 CONTENT_VERIFIED_FACTS_ONLY = "CONTENT_VERIFIED_FACTS_ONLY"
 CONTENT_MISSING_OPTIONAL_METADATA = "CONTENT_MISSING_OPTIONAL_METADATA"
 CONTENT_INTERNAL_BOILERPLATE = "CONTENT_INTERNAL_BOILERPLATE"
@@ -132,6 +134,41 @@ def evaluate_internal_boilerplate(content: Mapping[str, Any]) -> DecisionResult:
         outcome=Outcome.AUTO_PASS,
         rule_code=CONTENT_INTERNAL_BOILERPLATE,
         reason="No internal workflow language found in customer-facing content.",
+        evidence={"findings": {}},
+    )
+
+
+def evaluate_storefront_text_quality(
+    content: Mapping[str, Any],
+    fields: Sequence[str] = CUSTOMER_FACING_FIELDS,
+) -> DecisionResult:
+    """
+    CLAUDE.md 15.1/15.3 and TSYC_CONTENT_GUIDE.md sections 11-12:
+    customer-facing content must not contain unresolved HTML entities or
+    markup, text cut off by source extraction, internal provenance or
+    workflow notes, retailer SEO boilerplate, or stock/shipping wording.
+    Shared definitions: src.domain.rules.storefront_text.
+    """
+    findings = storefront_text.find_content_defects(content, fields)
+
+    if findings:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=CONTENT_STOREFRONT_TEXT_DEFECT,
+            reason=(
+                "Customer-facing content has storefront text defects: "
+                + "; ".join(
+                    f"{field}={','.join(codes)}"
+                    for field, codes in sorted(findings.items())
+                )
+            ),
+            evidence={"findings": findings},
+        )
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=CONTENT_STOREFRONT_TEXT_DEFECT,
+        reason="No storefront text defects found in customer-facing content.",
         evidence={"findings": {}},
     )
 
@@ -316,6 +353,10 @@ def select_historical_draft_safe_content_reference(
       - reference_description exists and is at least
         _MIN_USABLE_DESCRIPTION_LENGTH characters (not too thin to
         meaningfully identify the product)
+      - after storefront normalization (entity decoding, retailer
+        boilerplate removal) it is usable as storefront prose:
+        storefront_text.is_usable_source_description -- a truncated
+        meta snippet or pure SEO boilerplate is never selected
       - no ISBN/title/publisher/author/sellable-unit conflict with the
         candidate (identity_rules.reference_business_conflict_reason) --
         the same shared check image_rules.
@@ -328,9 +369,11 @@ def select_historical_draft_safe_content_reference(
     tie prefers a real MATCH over POSSIBLE_MATCH/MANUAL_REVIEW.
 
     Never invents a description -- evidence["reference_description"] is
-    always the exact, unmodified text already collected and stored by
-    collect_reference_metadata.py from an approved source. Never decides
-    match_decision or identity_status.
+    the exact text already collected and stored by
+    collect_reference_metadata.py from an approved source, and
+    evidence["normalized_description"] is that same text after the
+    deterministic storefront normalization (no words added). Never
+    decides match_decision or identity_status.
     """
     candidates_for_selection = [
         reference
@@ -339,6 +382,10 @@ def select_historical_draft_safe_content_reference(
         and reference.get("source_type") in REFERENCE_SOURCE_PRIORITY
         and len(str(reference.get("reference_description") or "").strip())
         >= _MIN_USABLE_DESCRIPTION_LENGTH
+        and not storefront_text.contains_page_chrome(reference.get("reference_description"))
+        and storefront_text.is_usable_source_description(
+            normalized_reference_description(reference, candidate)
+        )
     ]
 
     passing: list[tuple[dict[str, Any], str | None]] = []
@@ -390,6 +437,25 @@ def select_historical_draft_safe_content_reference(
             "reference_description": selected_reference.get(
                 "reference_description"
             ),
+            "normalized_description": normalized_reference_description(
+                selected_reference, candidate
+            ),
             "match_decision": selected_reference.get("match_decision"),
         },
+    )
+
+
+def normalized_reference_description(
+    reference: Mapping[str, Any],
+    candidate: Mapping[str, Any] | None = None,
+) -> str:
+    """The reference description after deterministic storefront
+    normalization, stripping a leading duplicated reference/candidate
+    title (storefront_text.normalize_source_description)."""
+    titles = [reference.get("reference_title")]
+    if candidate:
+        titles.append(candidate.get("extracted_title"))
+    return storefront_text.normalize_source_description(
+        reference.get("reference_description"),
+        titles=titles,
     )
