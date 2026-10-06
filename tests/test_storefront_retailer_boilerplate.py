@@ -97,6 +97,37 @@ def test_cross_sell_followed_by_real_prose_keeps_the_prose():
     assert long_prose.strip()[:40] in cleaned
 
 
+# --- orphaned retailer footer stub ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Sách Gia Đình Tỉnh Thức của tác giả TS.",
+        "Sách Mạnh Mẽ Như Dòng Sông của tác giả Sarah Noble",
+    ],
+)
+def test_orphaned_retailer_footer_stub_is_boilerplate(text):
+    assert storefront_text.SOURCE_BOILERPLATE in storefront_text.find_text_defects(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Sách của tác giả Nguyễn Nhật Ánh kể về tuổi thơ ở một làng quê miền Trung.",
+        "Sách Gia Đình Tỉnh Thức của tác giả Shefali Tsabary là tài liệu hữu ích cho cha mẹ.",
+    ],
+)
+def test_real_sentences_about_the_author_are_kept(text):
+    assert storefront_text.SOURCE_BOILERPLATE not in storefront_text.find_text_defects(text)
+
+
+def test_repair_removes_the_footer_stub_paragraph():
+    long_description = f"{BODY}\n\nSách Gia Đình Tỉnh Thức của tác giả TS."
+    cleaned = storefront_text.remove_defective_sentences(long_description)
+    assert cleaned == BODY
+
+
 # --- German closing quotes --------------------------------------------
 
 

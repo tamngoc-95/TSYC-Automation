@@ -157,6 +157,15 @@ _CROSS_SELL_RE = re.compile(
     r"|\b(?:tìm mua|đặt mua|sưu tầm) (?:trọn|cả) bộ\b"
 )
 
+# The NetaBooks footer "Sách <title> của tác giả <name>, có bán tại ..."
+# split at an honorific period ("... của tác giả TS.") leaves an orphaned
+# stub line once the store clause is removed (2026-10-06, Gia Đình Tỉnh
+# Thức). Only a whole line of exactly that shape matches -- a real
+# sentence about the book continues with a verb and is never a match.
+_RETAILER_FOOTER_STUB_RE = re.compile(
+    r"(?im)^\s*sách\s[^.!?\n]{1,150}\bcủa tác giả\b(?:\s+[^\s.!?]{1,20}){0,4}\.?\s*$"
+)
+
 _SOURCE_BOILERPLATE_PATTERNS = (
     re.compile(r"có bán tại", re.IGNORECASE),
     re.compile(r"nhà sách online", re.IGNORECASE),
@@ -175,6 +184,7 @@ _SOURCE_BOILERPLATE_PATTERNS = (
     re.compile(r"\bĐọc thử\b"),
     _SECTION_HEADING_LINE_RE,
     _CROSS_SELL_RE,
+    _RETAILER_FOOTER_STUB_RE,
 )
 
 _STOCK_PATTERNS = (
