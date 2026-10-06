@@ -27,7 +27,7 @@ from typing import Any, Mapping, Sequence
 from src.domain.decisions import DecisionResult, Outcome
 from src.domain.identity_status import MatchDecision
 from src.domain.reference_sources import REFERENCE_SOURCE_PRIORITY
-from src.domain.rules import storefront_text
+from src.domain.rules import author_rules, storefront_text
 from src.domain.rules.identity_rules import reference_business_conflict_reason
 
 # --- rule codes ----------------------------------------------------
@@ -43,6 +43,10 @@ CONTENT_SAFE_APPROVAL = "CONTENT_SAFE_APPROVAL"
 # section 6.2/15) -- see select_historical_draft_safe_content_reference().
 CONTENT_REFERENCE_DRAFT_SAFE_SELECTED = "CONTENT_REFERENCE_DRAFT_SAFE_SELECTED"
 CONTENT_REFERENCE_NONE_DRAFT_SAFE = "CONTENT_REFERENCE_NONE_DRAFT_SAFE"
+# Customer-facing text misspells the product's own structured author or
+# title (2026-10-02 audit: "Chris Hadfiled" vs author "Chris Hadfield";
+# quoted title "người thấy tốt" vs title "Người Thầy Tốt").
+CONTENT_NAME_INCONSISTENCY = "CONTENT_NAME_INCONSISTENCY"
 
 # A reference description shorter than this is treated as too thin to
 # meaningfully identify the product -- CLAUDE.md 15.3 "description cannot
@@ -169,6 +173,79 @@ def evaluate_storefront_text_quality(
         outcome=Outcome.AUTO_PASS,
         rule_code=CONTENT_STOREFRONT_TEXT_DEFECT,
         reason="No storefront text defects found in customer-facing content.",
+        evidence={"findings": {}},
+    )
+
+
+_QUOTED_SPAN_RE = re.compile(r"[“\"«„]([^“”\"«»„]{3,160})[”\"»“]")
+
+
+def find_name_inconsistencies(
+    content: Mapping[str, Any],
+    product: Mapping[str, Any],
+    fields: Sequence[str] = CUSTOMER_FACING_FIELDS,
+) -> dict[str, list[str]]:
+    """
+    {field: [offending text]} where customer-facing text contains a
+    single-edit misspelling of the product's structured author name(s) or
+    -- inside quotation marks -- of its title. Detection only: no rule
+    here ever rewrites the text (a correction is a REVISE decision).
+    """
+    names = [
+        name
+        for name in author_rules.split_person_names(product.get("author"))
+        if len(name.split()) >= 2
+    ]
+    title = str(product.get("title") or "").strip()
+    findings: dict[str, list[str]] = {}
+
+    for field in fields:
+        value = content.get(field)
+        if not value:
+            continue
+        text = str(value)
+        hits: list[str] = []
+        for name in names:
+            hits.extend(author_rules.find_name_near_misses(text, name))
+        if title and len(title.split()) >= 2:
+            for match in _QUOTED_SPAN_RE.finditer(text):
+                quoted = match.group(1).strip()
+                if quoted.casefold() == title.casefold():
+                    continue
+                if author_rules.find_name_near_misses(quoted, title) == [quoted]:
+                    hits.append(quoted)
+        if hits:
+            findings[field] = hits
+
+    return findings
+
+
+def evaluate_name_consistency(
+    content: Mapping[str, Any],
+    product: Mapping[str, Any],
+) -> DecisionResult:
+    """REVIEW_REQUIRED when customer-facing text misspells the product's
+    own author/title (find_name_inconsistencies). Never auto-repaired."""
+    findings = find_name_inconsistencies(content, product)
+
+    if findings:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=CONTENT_NAME_INCONSISTENCY,
+            reason=(
+                "Customer-facing text misspells the product's author/title: "
+                + "; ".join(
+                    f"{field}={', '.join(repr(hit) for hit in hits)}"
+                    for field, hits in sorted(findings.items())
+                )
+            ),
+            evidence={"findings": findings},
+        )
+
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=CONTENT_NAME_INCONSISTENCY,
+        reason="Author/title spelling in customer-facing text is consistent.",
         evidence={"findings": {}},
     )
 

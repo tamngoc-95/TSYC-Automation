@@ -506,6 +506,7 @@ def validate_approval_content(
     existing: dict[str, Any] | None,
     content: dict[str, Any],
     generated: dict[str, Any],
+    product: dict[str, Any] | None = None,
 ) -> None:
     """
     Reject approval when content validation does not pass.
@@ -546,6 +547,13 @@ def validate_approval_content(
         raise RuntimeError(
             f"[{storefront_check.rule_code}] {storefront_check.reason}"
         )
+
+    # Misspelled structured author/title in the text (detection only;
+    # correcting it is a REVISE decision, never an automatic rewrite).
+    if product is not None:
+        name_check = content_rules.evaluate_name_consistency(content, product)
+        if not name_check.is_auto_pass:
+            raise RuntimeError(f"[{name_check.rule_code}] {name_check.reason}")
 
 
 def restore_existing_content(
@@ -778,6 +786,7 @@ def attempt_content_approval(
             existing=existing,
             content=content,
             generated=generated,
+            product=product,
         )
     except RuntimeError as error:
         if not non_interactive:
@@ -1318,6 +1327,7 @@ REPAIR_CATEGORY_HTML_ENTITY = "HTML_ENTITY"
 REPAIR_CATEGORY_TRUNCATED_SOURCE = "TRUNCATED_SOURCE"
 REPAIR_CATEGORY_STOCK_OR_BOILERPLATE = "STOCK_OR_REFERENCE_BOILERPLATE"
 REPAIR_CATEGORY_QUOTED_EXCERPT = "QUOTED_BOOK_EXCERPT"
+REPAIR_CATEGORY_TYPOGRAPHY = "TYPOGRAPHY"
 REPAIR_CATEGORY_MULTIPLE = "MULTIPLE_DEFECTS"
 
 # Repair outcomes.
@@ -1351,15 +1361,18 @@ def classify_storefront_defects(findings: dict[str, list[str]]) -> str | None:
         groups.add(REPAIR_CATEGORY_STOCK_OR_BOILERPLATE)
     if storefront_text.QUOTED_EXCERPT in codes:
         groups.add(REPAIR_CATEGORY_QUOTED_EXCERPT)
+    if codes & storefront_text.TYPOGRAPHY_DEFECT_CODES:
+        groups.add(REPAIR_CATEGORY_TYPOGRAPHY)
 
     return groups.pop() if len(groups) == 1 else REPAIR_CATEGORY_MULTIPLE
 
 
 def _clean_prose_field(value: str | None) -> str | None:
-    """Decode entities and drop defective sentences; keep everything else."""
+    """Decode entities, drop defective sentences, and apply the
+    deterministic typography repair; keep everything else."""
     decoded = storefront_text.clean_source_text(value)
     cleaned = storefront_text.remove_defective_sentences(decoded)
-    return cleaned or None
+    return storefront_text.repair_typography(cleaned) or None
 
 
 def _clean_product_details(value: str | None) -> str | None:
@@ -1639,6 +1652,7 @@ def run_repair_action(
                 existing=existing,
                 content=plan["content"],
                 generated=build_safe_draft(product),
+                product=product,
             )
         except RuntimeError as error:
             report["outcome"] = REPAIR_OUTCOME_HUMAN_REVIEW

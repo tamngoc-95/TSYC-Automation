@@ -40,6 +40,12 @@ SOURCE_BOILERPLATE = "SOURCE_BOILERPLATE"
 STOCK_WORDING = "STOCK_WORDING"
 SHIPPING_WORDING = "SHIPPING_WORDING"
 QUOTED_EXCERPT = "QUOTED_EXCERPT"
+# Source-extraction typography artifacts (2026-10-02 production audit:
+# CSV-escaped ""Intelligence Quotient"" and "không?." reached APPROVED
+# storefront text). Both have a single deterministic repair
+# (repair_typography); neither ever changes a word.
+DOUBLED_QUOTE = "DOUBLED_QUOTE"
+MALFORMED_PUNCTUATION = "MALFORMED_PUNCTUATION"
 
 ALL_DEFECT_CODES = (
     HTML_ENTITY,
@@ -51,7 +57,11 @@ ALL_DEFECT_CODES = (
     STOCK_WORDING,
     SHIPPING_WORDING,
     QUOTED_EXCERPT,
+    DOUBLED_QUOTE,
+    MALFORMED_PUNCTUATION,
 )
+
+TYPOGRAPHY_DEFECT_CODES = frozenset({DOUBLED_QUOTE, MALFORMED_PUNCTUATION})
 
 # --- patterns -------------------------------------------------------
 
@@ -63,6 +73,23 @@ _HTML_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^<>]*)?/?>")
 # text -- mid-sentence or closing a stylistic paragraph of a full
 # description -- are legitimate punctuation.
 _TRUNCATION_RE = re.compile(r"(?:\.{3}|…)\s*$")
+
+# Two adjacent ASCII double quotes: a CSV/JSON escaping artifact. Real
+# prose never needs an empty "" pair in a product description.
+_DOUBLED_QUOTE_RE = re.compile(r'""')
+# "?." / "!." / ",." -- a terminal mark followed by a stray period. The
+# negative lookahead keeps an ellipsis ("?...", ",...") untouched. ".,"
+# is deliberately NOT included: "v.v.," (Vietnamese "etc.,") is correct.
+_MALFORMED_PUNCTUATION_RE = re.compile(r"[?!,]\.(?!\.)")
+_STRAY_PERIOD_AFTER_MARK_RE = re.compile(r"([?!])\.(?!\.)")
+_COMMA_PERIOD_RE = re.compile(r",\.(?!\.)")
+
+# Same word twice in a row on one line ("biết biết"). ADVISORY ONLY:
+# Vietnamese reduplication is grammatical and very common ("song song",
+# "luôn luôn", "từ từ", "dần dần", "mãi mãi" -- measured on production
+# content 2026-10-02), and no deterministic rule separates it from a
+# typo. Never a defect code, never repaired.
+_DUPLICATED_WORD_RE = re.compile(r"\b(\w{2,})[ \t]+\1\b", re.IGNORECASE)
 
 _PROVENANCE_PATTERNS = (
     re.compile(r"mô tả tham khảo từ nguồn", re.IGNORECASE),
@@ -350,6 +377,25 @@ def remove_defective_sentences(
     return "\n\n".join(kept_paragraphs)
 
 
+def repair_typography(text: str | None) -> str:
+    """Deterministic fix for TYPOGRAPHY_DEFECT_CODES only: collapse a
+    doubled "" to ", drop the stray period in "?." / "!.", and turn ",."
+    into ".". Never adds, removes, or changes a word."""
+    if not text:
+        return ""
+    repaired = _DOUBLED_QUOTE_RE.sub('"', str(text))
+    repaired = _STRAY_PERIOD_AFTER_MARK_RE.sub(r"\1", repaired)
+    return _COMMA_PERIOD_RE.sub(".", repaired)
+
+
+def find_duplicated_words(text: str | None) -> list[str]:
+    """Advisory: adjacent repeated words, for operator review notes only
+    (see _DUPLICATED_WORD_RE -- never a defect, never repaired)."""
+    if not text:
+        return []
+    return [match.group(0) for match in _DUPLICATED_WORD_RE.finditer(str(text))]
+
+
 def clean_source_text(text: str | None) -> str:
     """Decode entities, drop HTML tags, normalize whitespace (paragraph
     breaks kept). Removes nothing else -- this is what a collector stores
@@ -461,7 +507,7 @@ def normalize_source_description(
     )
     # Removing boilerplate can expose more trailing chrome; trim again.
     remaining = [paragraph for paragraph in without_boilerplate.split("\n\n") if paragraph.strip()]
-    return "\n\n".join(_trim_trailing_chrome(remaining)).strip()
+    return repair_typography("\n\n".join(_trim_trailing_chrome(remaining)).strip())
 
 
 # --- detection ------------------------------------------------------
@@ -479,6 +525,10 @@ def find_text_defects(text: str | None) -> set[str]:
         found.add(HTML_MARKUP)
     if _TRUNCATION_RE.search(value):
         found.add(TRUNCATED)
+    if _DOUBLED_QUOTE_RE.search(value):
+        found.add(DOUBLED_QUOTE)
+    if _MALFORMED_PUNCTUATION_RE.search(value):
+        found.add(MALFORMED_PUNCTUATION)
     for code, patterns in _PATTERN_GROUPS:
         if any(pattern.search(value) for pattern in patterns):
             found.add(code)
