@@ -736,6 +736,26 @@ image reference
 description reference
 Fahasa must NOT be treated as official purchase-price source.
 Reference discovery is enrichment for historical migration, not a mandatory blocker when historical draft-safe policy already permits progression.
+Automatic Reference Discovery (FB-HIST only)
+Derived state REFERENCE_DISCOVERY_PENDING_HISTORICAL: an FB-HIST SINGLE_BOOK with a title, a corroborating author or valid 978/979 ISBN, no product_references and no candidate_reference_sources.
+run_batch.py dispatches scripts/discover_reference_sources.py (rules: src/domain/rules/reference_discovery_rules.py).
+Sites are searched in CLAUDE.md 8.1 priority (BOOKSTORE NetaBooks before FAHASA).
+A page is accepted only with an exact or series-volume title match PLUS an equal ISBN or a shared author, and no identity/sellable-unit conflict. A title alone never registers a reference. Used-book and combo/set listings are rejected.
+An accepted page is registered only through register_reference_source.py; the normal collect → match → enrich stages then run unchanged.
+Each completed attempt (FOUND / NOT_FOUND) is logged in process_logs (process_name = reference_discovery) and never repeated under the same DISCOVERY_RULES_VERSION. A network/site ERROR is not a completed attempt.
+Combo/set candidates and candidates with no author/ISBN are never searched automatically.
+Content Source Availability (FB-HIST only)
+A historical candidate with no usable reference AND no automatable metadata-only path stops at CONTENT_SOURCE_UNAVAILABLE_HISTORICAL (lane ENRICHMENT_NEEDED) before internal-product creation, instead of producing a generic placeholder draft that can never be approved.
+Metadata-only content (src/domain/rules/metadata_only_content.py) is implemented and validated but automatic approval is DISABLED (METADATA_ONLY_AUTO_APPROVAL_ENABLED = False) pending an explicit shop-owner decision (CLAUDE.md 15.3 "not generic placeholder-only copy"). Automation must not enable it.
+Image Price Labels (FB-HIST only)
+Shop owner instruction 2026-10-02: an own Facebook-export shop photo whose persisted evidence shows a selling-price label is never auto-selected as PRIMARY or GALLERY (src/domain/rules/image_price_rules.py). It stays registered, unselected.
+If no price-free eligible image remains, a draft-safe reference image is downloaded instead (IMAGE_REFERENCE_FALLBACK_PENDING_HISTORICAL); otherwise IMAGE_PRICE_LABEL_REPLACEMENT_NEEDED (ENRICHMENT_NEEDED). Images are never edited or cropped automatically.
+Detection uses persisted evidence only (price_label_visible, evidence_text). An unrecorded label is treated as unknown, not as labelled.
+Content Quality Gates
+Vietnamese approval additionally rejects a single-edit misspelling of the product's own structured author or (quoted) title (CONTENT_NAME_INCONSISTENCY). Detection only; never auto-corrected.
+Source typography artifacts (doubled "" quotes, "?." / "!." / ",.") are storefront defects with a deterministic word-preserving repair.
+Multilingual Translation Dispatch
+run_batch.py --translation-provider claude dispatches prepare_product_content.py --action TRANSLATE for READY_FOR_DRAFT candidates missing APPROVED en/de. Default is none (stop with MULTILINGUAL_CONTENT_REQUIRED). An en/de row already REVIEW_REQUIRED/REJECTED is never re-translated automatically.
 Recovery Policy
 Never blind retry uncertain Woo creation.
 When Woo create result is uncertain:
