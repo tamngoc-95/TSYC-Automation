@@ -97,6 +97,23 @@ def test_cross_sell_followed_by_real_prose_keeps_the_prose():
     assert long_prose.strip()[:40] in cleaned
 
 
+# --- German closing quotes --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, complete",
+    [
+        ("„Mama, hast du mich dann trotzdem noch lieb?“", True),
+        ("»Werde schnell groß!«", True),
+        ("Ein Zitat endet hier.“", True),
+        ("Der Text bricht hier ab „", False),  # stray opening quote
+        ("Der Text bricht hier ab“", False),  # no sentence punctuation
+    ],
+)
+def test_german_closing_quote_ends_a_sentence_only_after_punctuation(text, complete):
+    assert storefront_text.ends_with_complete_sentence(text) is complete
+
+
 # --- REPAIR of an already-APPROVED row ---------------------------------
 
 

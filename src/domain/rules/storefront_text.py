@@ -591,6 +591,9 @@ PROSE_FIELDS = ("short_description", "long_description")
 SUMMARY_FIELDS = ("short_description", "seo_description")
 
 _TERMINAL_CHARACTERS = ".!?…\"”’»)]:;"
+# German/French closing quotes („…“, »…«) that are also opening quotes
+# elsewhere: terminal only right after sentence punctuation ("…lieb?“").
+_CLOSING_QUOTE_AFTER_PUNCTUATION = "“«"
 
 
 def ends_with_complete_sentence(text: str | None) -> bool:
@@ -600,6 +603,8 @@ def ends_with_complete_sentence(text: str | None) -> bool:
     if not text:
         return False
     stripped = text.rstrip()
+    if stripped[-1:] in _CLOSING_QUOTE_AFTER_PUNCTUATION:
+        return stripped[-2:-1] in ".!?…"
     return bool(stripped) and stripped[-1] in _TERMINAL_CHARACTERS
 
 
