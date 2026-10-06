@@ -90,6 +90,25 @@ class DispatchEntry:
 # flag -- never any pricing, publish, or human-judgment argument the
 # orchestrator itself is not authorized to decide.
 AUTOMATABLE_DISPATCH: dict[str, DispatchEntry] = {
+    # Automatic approved-source reference discovery (FB-HIST single books
+    # with no reference source at all -- src.domain.rules.reference_
+    # discovery_rules). The script re-checks every precondition, registers
+    # an accepted page only through register_reference_source.py, and
+    # logs the completed attempt so it never runs twice per rules version.
+    "REFERENCE_DISCOVERY_PENDING_HISTORICAL": DispatchEntry(
+        script="discover_reference_sources.py",
+        build_args=lambda state: [
+            "--candidate-code",
+            state.candidate_code,
+            "--non-interactive",
+            "--confirm-discover",
+        ],
+        description=(
+            "Search approved reference sites (CLAUDE.md 8.1 priority) and "
+            "register the first page whose title is corroborated by "
+            "author/ISBN."
+        ),
+    ),
     "REFERENCE_REGISTERED": DispatchEntry(
         script="collect_reference_metadata.py",
         build_args=lambda state: [
@@ -451,6 +470,20 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--translation-provider",
+        choices=(TRANSLATION_PROVIDER_NONE, TRANSLATION_PROVIDER_CLAUDE),
+        default=TRANSLATION_PROVIDER_NONE,
+        help=(
+            "EN/DE localization for READY_FOR_DRAFT candidates whose "
+            "multilingual content is missing. 'claude' dispatches "
+            "prepare_product_content.py --action TRANSLATE --translation-"
+            "provider claude (requires ANTHROPIC_API_KEY; every result is "
+            "still validated before approval). Default 'none': stop with "
+            "MULTILINGUAL_CONTENT_REQUIRED, exactly as before."
+        ),
+    )
+
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help=(
@@ -641,6 +674,41 @@ def decide_action(
 
 MULTILINGUAL_CONTENT_REQUIRED = "MULTILINGUAL_CONTENT_REQUIRED"
 
+TRANSLATION_PROVIDER_NONE = "none"
+TRANSLATION_PROVIDER_CLAUDE = "claude"
+
+# Existing EN/DE generation path: APPROVED vi -> provider -> cross-language
+# consistency -> translation save -> deterministic translation APPROVE
+# (prepare_product_content.py --action TRANSLATE). Opt-in per run.
+TRANSLATE_DISPATCH = DispatchEntry(
+    script="prepare_product_content.py",
+    build_args=lambda state: [
+        "--product-code",
+        state.product_code,
+        "--action",
+        "TRANSLATE",
+        "--translation-provider",
+        TRANSLATION_PROVIDER_CLAUDE,
+        "--non-interactive",
+    ],
+    description=(
+        "Localize the APPROVED Vietnamese content to EN and DE and validate "
+        "it (cross-language consistency + translation approval rules)."
+    ),
+)
+
+_TRANSLATION_STOP_STATUSES = {"REVIEW_REQUIRED", "REJECTED"}
+
+
+def translation_needs_review(bundle: dict[str, Any]) -> bool:
+    """An en/de row already declined by validation is a review item: it is
+    never re-translated automatically (no blind retry of a failed stage)."""
+    return any(
+        content.get("content_language") in ("en", "de")
+        and content.get("content_status") in _TRANSLATION_STOP_STATUSES
+        for content in bundle.get("contents") or []
+    )
+
 
 def multilingual_content_missing(
     state: CandidateState,
@@ -764,13 +832,30 @@ def process_one_candidate(
     for _ in range(MAX_STAGES_PER_CANDIDATE):
         kind, dispatch, description = decide_action(state, args.allow_woo_draft)
 
-        if multilingual_content_missing(state, bundle):
-            kind = "multilingual_content_required"
-            dispatch = None
-            description = (
-                "APPROVED 'en' and 'de' product content is required before "
-                "WooCommerce draft creation; the Woo writer was not invoked."
-            )
+        multilingual_missing_before = multilingual_content_missing(state, bundle)
+
+        if multilingual_missing_before:
+            if (
+                getattr(args, "translation_provider", TRANSLATION_PROVIDER_NONE)
+                == TRANSLATION_PROVIDER_CLAUDE
+                and not translation_needs_review(bundle)
+            ):
+                kind = "invoke"
+                dispatch = TRANSLATE_DISPATCH
+                description = TRANSLATE_DISPATCH.description
+            else:
+                kind = "multilingual_content_required"
+                dispatch = None
+                description = (
+                    "APPROVED 'en' and 'de' product content is required before "
+                    "WooCommerce draft creation; the Woo writer was not invoked."
+                    + (
+                        " An en/de translation was already declined by "
+                        "validation and needs review."
+                        if translation_needs_review(bundle)
+                        else ""
+                    )
+                )
 
         report.next_action_kind = kind
         report.next_action_description = description
@@ -904,6 +989,10 @@ def process_one_candidate(
         if (
             new_state.derived_state == state.derived_state
             and new_state.blocked == state.blocked
+            # A translation stage leaves the derived state unchanged; its
+            # transition is multilingual content becoming complete.
+            and multilingual_content_missing(new_state, bundle)
+            == multilingual_missing_before
         ):
             report.result = "STALLED"
             state = new_state
@@ -1185,6 +1274,10 @@ def print_grouped_summary(reports: list[CandidateReport], requested: int) -> Non
 # own deterministic validation can go either way, both branches are
 # named rather than picking one.
 _EXPECTED_NEXT_STATE_AFTER_ACTION: dict[str, str] = {
+    "REFERENCE_DISCOVERY_PENDING_HISTORICAL": (
+        "REFERENCE_REGISTERED (or CONTENT_SOURCE_UNAVAILABLE_HISTORICAL if "
+        "no approved-source page passes validation)"
+    ),
     "REFERENCE_REGISTERED": "REFERENCE_COLLECTED",
     "REFERENCE_COLLECTED": (
         "IDENTITY_VERIFIED (or IDENTITY_PENDING/IDENTITY_CONFLICT if "
@@ -1347,6 +1440,7 @@ def main(
     print(f"Dry run: {args.dry_run}")
     print(f"Non-interactive: {args.non_interactive}")
     print(f"Allow Woo draft creation: {args.allow_woo_draft}")
+    print(f"Translation provider: {args.translation_provider}")
 
     if repository is None:
         repository = SupabaseRepository()

@@ -82,15 +82,37 @@ def _repository(
 def test_historical_candidate_with_failed_crawl_no_longer_reports_reference_registered():
     """The exact bug: a selected-but-FAILED discovery must not be
     reported as REFERENCE_REGISTERED (it is not collectible -- the
-    collector would immediately raise RuntimeError). It should proceed
-    draft-safe with unverified identity instead, matching the "no
-    reference found" outcome, not loop forever."""
+    collector would immediately raise RuntimeError), and must not loop.
+    Since 2026-10-02 it no longer proceeds to a product whose content can
+    only stall at CONTENT_REVIEW_REQUIRED: with no reference and no
+    metadata-only content path it is an enrichment item (blocked, never a
+    human gate)."""
     candidate = _candidate()
     discovery = _discovery(discovery_status="FAILED")
     repository = _repository(candidate, [discovery])
 
     bundle = load_candidate_bundle(repository, HIST_CANDIDATE_CODE)
     state = derive_candidate_state(bundle)
+
+    assert state.derived_state == "CONTENT_SOURCE_UNAVAILABLE_HISTORICAL"
+    assert state.blocked is True
+    assert state.human_gate is False
+    assert "crawl failed" in (state.blocked_reason or "")
+
+
+def test_historical_failed_crawl_still_proceeds_when_metadata_only_content_is_available(
+    monkeypatch,
+):
+    """The pre-existing draft-safe fall-through is kept whenever an
+    approvable content source exists without a reference."""
+    from src.domain.rules import metadata_only_content
+
+    monkeypatch.setattr(metadata_only_content, "METADATA_ONLY_AUTO_APPROVAL_ENABLED", True)
+    candidate = _candidate(verified_author="Nguyễn Nhật Ánh")
+    discovery = _discovery(discovery_status="FAILED")
+    repository = _repository(candidate, [discovery])
+
+    state = derive_candidate_state(load_candidate_bundle(repository, HIST_CANDIDATE_CODE))
 
     assert state.derived_state == "IDENTITY_PENDING_HISTORICAL_DRAFT_SAFE"
     assert state.human_gate is False
@@ -155,15 +177,30 @@ def test_live_candidate_with_still_selected_crawl_is_unaffected():
     assert state.human_gate is False
 
 
-def test_historical_candidate_no_discovery_at_all_is_unaffected():
-    """No candidate_reference_sources row whatsoever must still fall
-    through to the pre-existing "no reference found" draft-safe path --
-    unrelated to the FAILED-discovery fix, must not regress."""
-    candidate = _candidate()
+def test_historical_candidate_no_discovery_at_all_attempts_automatic_discovery():
+    """No candidate_reference_sources row whatsoever: an eligible single
+    book (title + author to corroborate) gets automatic approved-source
+    discovery first -- unattended, no human gate."""
+    candidate = _candidate(extracted_author="Lưu Quang Vũ")
     repository = _repository(candidate, [])
 
     bundle = load_candidate_bundle(repository, HIST_CANDIDATE_CODE)
     state = derive_candidate_state(bundle)
 
-    assert state.derived_state == "IDENTITY_PENDING_HISTORICAL_DRAFT_SAFE"
+    assert state.derived_state == "REFERENCE_DISCOVERY_PENDING_HISTORICAL"
+    assert state.human_gate is False
+    assert state.blocked is False
+
+
+def test_historical_candidate_no_discovery_without_corroboration_is_enrichment_item():
+    """Nothing to corroborate a title match with (no author, no ISBN):
+    discovery is not attempted, and with no content source the candidate
+    is an enrichment item -- not a human-review dumping ground."""
+    candidate = _candidate()
+    repository = _repository(candidate, [])
+
+    state = derive_candidate_state(load_candidate_bundle(repository, HIST_CANDIDATE_CODE))
+
+    assert state.derived_state == "CONTENT_SOURCE_UNAVAILABLE_HISTORICAL"
+    assert state.blocked is True
     assert state.human_gate is False

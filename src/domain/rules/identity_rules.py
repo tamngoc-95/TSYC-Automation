@@ -290,6 +290,42 @@ def sellable_unit_conflicts(
     )
 
 
+_SERIES_VOLUME_SEPARATOR_RE = re.compile(r"\s+[-–—:]\s+|:\s+")
+_SERIES_EDITION_SUFFIX_RE = re.compile(
+    r"\s*[\(\[](?:tái bản|tb|bản|phiên bản|tái bản lần)[^\)\]]*[\)\]]\s*$",
+    re.IGNORECASE,
+)
+
+
+def exact_title_key(title: str | None) -> str:
+    """NFC, case-folded, punctuation removed, diacritics PRESERVED."""
+    if not title:
+        return ""
+    text = unicodedata.normalize("NFC", str(title)).casefold()
+    text = re.sub(r"[^\w\s]", " ", text)
+    return " ".join(text.split())
+
+
+def is_series_volume_title(
+    candidate_title: str | None,
+    reference_title: str | None,
+) -> bool:
+    """
+    True when reference_title is "<series prefix> - <candidate title>"
+    (also ":"/"–" separators, trailing edition suffix ignored) with the
+    volume part EXACTLY equal to a multi-word candidate title -- CLAUDE.md
+    9.1 "exact volume title with only a known/common series prefix
+    omitted" (e.g. "Bé Làm Quen Với Vật Lý - Tia Nắng Bé Con" for the
+    shop's "Tia Nắng Bé Con"). Plain similarity under-scores this form.
+    """
+    candidate_key = exact_title_key(candidate_title)
+    if not candidate_key or len(candidate_key.split()) < 2 or not reference_title:
+        return False
+    reference = _SERIES_EDITION_SUFFIX_RE.sub("", str(reference_title)).strip()
+    segments = _SERIES_VOLUME_SEPARATOR_RE.split(reference)
+    return len(segments) >= 2 and exact_title_key(segments[-1]) == candidate_key
+
+
 def reference_business_conflict_reason(
     candidate: dict[str, Any],
     reference: dict[str, Any],
@@ -330,7 +366,11 @@ def reference_business_conflict_reason(
 
     candidate_title = candidate.get("verified_title") or candidate.get("extracted_title")
     reference_title = reference.get("reference_title")
-    title_similarity = calculate_similarity(candidate_title, reference_title)
+    title_similarity = (
+        1.0
+        if is_series_volume_title(candidate_title, reference_title)
+        else calculate_similarity(candidate_title, reference_title)
+    )
 
     if reference_title and title_similarity < _TITLE_MATERIALLY_DIFFERENT_THRESHOLD:
         return (

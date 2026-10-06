@@ -45,7 +45,14 @@ from src.domain.decisions import DecisionResult, Outcome
 from src.domain.identity_status import IdentityStatus, MatchDecision
 from src.domain.image_status import InternalProductImageStatus
 from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
-from src.domain.rules import content_rules, image_rules, readiness_rules
+from src.domain.rules import (
+    content_rules,
+    image_price_rules,
+    image_rules,
+    metadata_only_content,
+    readiness_rules,
+    reference_discovery_rules,
+)
 from src.domain.woocommerce_status import WooCommerceStatus, WooCommerceSyncStatus
 from src.repositories.supabase_repository import SupabaseRepository  # noqa: E402
 from src.services.historical_image_extraction import (  # noqa: E402
@@ -102,8 +109,11 @@ DERIVED_STATES = {
     "IMAGE_INGEST_PENDING_HISTORICAL",
     "IMAGE_APPROVAL_PENDING_HISTORICAL",
     "IMAGE_REFERENCE_FALLBACK_PENDING_HISTORICAL",
+    "IMAGE_PRICE_LABEL_REPLACEMENT_NEEDED",
     "IMAGE_CAPABILITY_UNAVAILABLE",
     "IMAGE_GROUP_OWNERSHIP_AMBIGUOUS",
+    "REFERENCE_DISCOVERY_PENDING_HISTORICAL",
+    "CONTENT_SOURCE_UNAVAILABLE_HISTORICAL",
     "CONTENT_REVISE_PENDING_HISTORICAL",
     "IMAGE_VALIDATED",
     "READY_FOR_DRAFT",
@@ -265,6 +275,20 @@ def load_candidate_bundle(
         or []
     )
 
+    # Completed automatic reference-discovery attempts (process_logs
+    # bookkeeping written by discover_reference_sources.py) -- how the
+    # state machine tells "never searched" from "searched, none found".
+    discovery_attempts = (
+        repository.client
+        .table("process_logs")
+        .select("process_log_id, candidate_id, process_name, status, error_details, created_at")
+        .eq("candidate_id", candidate_id)
+        .eq("process_name", reference_discovery_rules.PROCESS_NAME)
+        .execute()
+        .data
+        or []
+    )
+
     internal_product_rows = (
         repository.client
         .table("internal_products")
@@ -363,6 +387,7 @@ def load_candidate_bundle(
         "candidate": candidate,
         "references": references,
         "discovery_sources": discovery_sources,
+        "discovery_attempts": discovery_attempts,
         "images": images,
         "internal_product": internal_product,
         "contents": contents,
@@ -421,6 +446,20 @@ def load_all_candidate_bundles(
         .data
         or []
     )
+    discovery_attempt_rows = (
+        repository.client.table("process_logs")
+        .select("process_log_id, candidate_id, process_name, status, error_details, created_at")
+        .eq("process_name", reference_discovery_rules.PROCESS_NAME)
+        .execute()
+        .data
+        or []
+    )
+
+    discovery_attempts_by_candidate: dict[str, list[dict[str, Any]]] = {}
+    for attempt in discovery_attempt_rows:
+        discovery_attempts_by_candidate.setdefault(
+            str(attempt.get("candidate_id")), []
+        ).append(attempt)
 
     references_by_candidate: dict[str, list[dict[str, Any]]] = {}
     for reference in references:
@@ -527,6 +566,7 @@ def load_all_candidate_bundles(
             "candidate": candidate,
             "references": references_by_candidate.get(candidate_id, []),
             "discovery_sources": discovery_by_candidate.get(candidate_id, []),
+            "discovery_attempts": discovery_attempts_by_candidate.get(candidate_id, []),
             "images": candidate_images,
             "internal_product": internal_product,
             "contents": candidate_contents,
@@ -878,8 +918,58 @@ def _derive_image_content_state(
                     )
 
             if eligible_images:
+                # Shop owner instruction 2026-10-02 (image_price_rules):
+                # an own shop photo whose persisted evidence shows a
+                # selling-price label is never auto-selected as PRIMARY
+                # or GALLERY. It stays registered, just unselected.
+                price_free_images = [
+                    (image, rights_status)
+                    for image, rights_status in eligible_images
+                    if not image_price_rules.image_has_price_label(image, candidate)
+                ]
+
+                if not price_free_images:
+                    fallback_decision = (
+                        image_rules.select_historical_draft_safe_image_reference(
+                            candidate=candidate,
+                            references=bundle["references"],
+                        )
+                    )
+
+                    if fallback_decision.outcome == Outcome.AUTO_PASS:
+                        return CandidateState(
+                            candidate_code=candidate_code,
+                            candidate_id=candidate_id,
+                            product_code=product_code,
+                            derived_state=(
+                                "IMAGE_REFERENCE_FALLBACK_PENDING_HISTORICAL"
+                            ),
+                            auto_reference_id=str(
+                                fallback_decision.evidence["reference_id"]
+                            ),
+                            warnings=warnings,
+                        )
+
+                    return CandidateState(
+                        candidate_code=candidate_code,
+                        candidate_id=candidate_id,
+                        product_code=product_code,
+                        derived_state="IMAGE_PRICE_LABEL_REPLACEMENT_NEEDED",
+                        blocked=True,
+                        blocked_reason=(
+                            "Every eligible image is a shop photo with a "
+                            "visible selling-price label (persisted "
+                            "evidence), and no draft-safe reference image "
+                            "is available as a price-free replacement: "
+                            f"{fallback_decision.reason} Reference "
+                            "discovery/collection can supply one; images "
+                            "are never edited automatically."
+                        ),
+                        warnings=warnings,
+                    )
+
                 primary_decision = image_rules.select_primary_candidate_image(
-                    eligible_images
+                    price_free_images
                 )
 
                 return CandidateState(
@@ -1329,6 +1419,60 @@ def _derive_pre_product_state(
         ]
 
         if is_historical:
+            # Automatic approved-source discovery (reference_discovery_
+            # rules): before falling through with no reference at all,
+            # search the approved sites once. Never repeated after a
+            # completed attempt under the same rules version.
+            if not discovery_sources:
+                eligibility = reference_discovery_rules.evaluate_discovery_eligibility(
+                    candidate
+                )
+                attempt = reference_discovery_rules.latest_completed_attempt(
+                    bundle.get("discovery_attempts") or []
+                )
+
+                if eligibility.is_auto_pass and attempt is None:
+                    return CandidateState(
+                        candidate_code=candidate_code,
+                        candidate_id=candidate_id,
+                        product_code=None,
+                        derived_state="REFERENCE_DISCOVERY_PENDING_HISTORICAL",
+                    )
+
+                discovery_outcome = (
+                    eligibility.reason
+                    if not eligibility.is_auto_pass
+                    else "Automatic reference discovery found no approved-source "
+                    "page that passed validation."
+                )
+            else:
+                discovery_outcome = (
+                    "The registered reference source was not collected "
+                    "(crawl failed or not selected)."
+                )
+
+            # With no reference, the only automatable content path left is
+            # metadata-only content. When that is unavailable too, creating
+            # the internal product would only end at CONTENT_REVIEW_
+            # REQUIRED with a generic placeholder draft -- stop here as an
+            # enrichment item instead (not a human-review dumping ground).
+            metadata_path = metadata_only_content.metadata_only_path_available(
+                candidate
+            )
+
+            if not metadata_path.is_auto_pass:
+                return CandidateState(
+                    candidate_code=candidate_code,
+                    candidate_id=candidate_id,
+                    product_code=None,
+                    derived_state="CONTENT_SOURCE_UNAVAILABLE_HISTORICAL",
+                    blocked=True,
+                    blocked_reason=(
+                        "No approvable content source: "
+                        f"{discovery_outcome} {metadata_path.reason}"
+                    ),
+                )
+
             if failed_selected_sources:
                 # A reference source was found and selected, but its
                 # crawl already permanently failed (see comment above) --
