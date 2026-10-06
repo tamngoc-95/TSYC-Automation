@@ -26,7 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.reference_sources import REFERENCE_SOURCE_PRIORITY, SourceType
-from src.domain.rules import author_rules, storefront_text
+from src.domain.rules import author_rules, identity_rules, storefront_text
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -1093,7 +1093,12 @@ def extract_isbn(
     body_text: str,
     product_json_ld: dict[str, Any] | None,
 ) -> str | None:
-    """Extract and validate a possible ISBN."""
+    """Extract and validate a possible ISBN.
+
+    Only a value that identity_rules.looks_like_valid_isbn() accepts is
+    returned: retailer JSON-LD "sku"/"gtin13" fields often carry a store
+    code (NetaBooks "2421762043452") or an 893 barcode, never an ISBN
+    (CLAUDE.md 2.2/2.3)."""
     possible_values: list[str] = []
 
     if product_json_ld:
@@ -1135,7 +1140,7 @@ def extract_isbn(
         if len(digits) in {
             10,
             13,
-        }:
+        } and identity_rules.looks_like_valid_isbn(digits):
             return digits
 
     return None

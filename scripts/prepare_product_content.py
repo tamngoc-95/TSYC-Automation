@@ -17,6 +17,7 @@ from src.domain.content_status import ContentStatus
 from src.domain.decisions import Outcome
 from src.domain.rules import (
     content_rules,
+    identity_rules,
     multilingual_consistency,
     storefront_text,
     translation_rules,
@@ -332,7 +333,8 @@ def build_product_details(product: dict[str, Any]) -> str:
         ("Tác giả", product.get("author")),
         ("Nhà xuất bản", product.get("publisher")),
         ("Số trang", product.get("page_count")),
-        ("ISBN", product.get("isbn")),
+        # A stored non-ISBN (retailer SKU/barcode) is never shown as ISBN.
+        ("ISBN", identity_rules.first_valid_isbn(product.get("isbn"))),
     ]
 
     for label, value in mappings:
@@ -1328,6 +1330,7 @@ REPAIR_CATEGORY_TRUNCATED_SOURCE = "TRUNCATED_SOURCE"
 REPAIR_CATEGORY_STOCK_OR_BOILERPLATE = "STOCK_OR_REFERENCE_BOILERPLATE"
 REPAIR_CATEGORY_QUOTED_EXCERPT = "QUOTED_BOOK_EXCERPT"
 REPAIR_CATEGORY_TYPOGRAPHY = "TYPOGRAPHY"
+REPAIR_CATEGORY_INVALID_ISBN = "INVALID_ISBN"
 REPAIR_CATEGORY_MULTIPLE = "MULTIPLE_DEFECTS"
 
 # Repair outcomes.
@@ -1363,6 +1366,8 @@ def classify_storefront_defects(findings: dict[str, list[str]]) -> str | None:
         groups.add(REPAIR_CATEGORY_QUOTED_EXCERPT)
     if codes & storefront_text.TYPOGRAPHY_DEFECT_CODES:
         groups.add(REPAIR_CATEGORY_TYPOGRAPHY)
+    if storefront_text.INVALID_ISBN in codes:
+        groups.add(REPAIR_CATEGORY_INVALID_ISBN)
 
     return groups.pop() if len(groups) == 1 else REPAIR_CATEGORY_MULTIPLE
 

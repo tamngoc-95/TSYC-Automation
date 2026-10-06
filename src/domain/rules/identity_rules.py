@@ -115,6 +115,19 @@ def looks_like_valid_isbn(value: str | None) -> bool:
     return False
 
 
+def first_valid_isbn(*values: str | None) -> str | None:
+    """
+    The first value that looks_like_valid_isbn(), as written (stripped),
+    or None. Retailer SKUs/barcodes are never promoted to ISBN (CLAUDE.md
+    2.2/2.3: 2026-10-06, NetaBooks store codes such as "2421762043452"
+    had been recorded as reference_isbn/internal_products.isbn).
+    """
+    for value in values:
+        if value is not None and looks_like_valid_isbn(str(value)):
+            return str(value).strip()
+    return None
+
+
 def normalize_text(value: str | None) -> str:
     """
     Diacritic-stripping, case-folding normalization for FUZZY title/

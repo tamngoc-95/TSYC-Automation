@@ -49,6 +49,9 @@ MALFORMED_PUNCTUATION = "MALFORMED_PUNCTUATION"
 # Encyclopedia footnote marker glued to the text ("...Việt Nam[3].",
 # 2026-10-06 Fast Track Batch 5). Removing it never changes a word.
 CITATION_MARKER = "CITATION_MARKER"
+# "ISBN: <value>" where the value is not an ISBN (a retailer SKU such as
+# NetaBooks "2421762043452", or an 893 barcode) -- CLAUDE.md 2.2/2.3.
+INVALID_ISBN = "INVALID_ISBN"
 
 ALL_DEFECT_CODES = (
     HTML_ENTITY,
@@ -63,6 +66,7 @@ ALL_DEFECT_CODES = (
     DOUBLED_QUOTE,
     MALFORMED_PUNCTUATION,
     CITATION_MARKER,
+    INVALID_ISBN,
 )
 
 TYPOGRAPHY_DEFECT_CODES = frozenset({DOUBLED_QUOTE, MALFORMED_PUNCTUATION, CITATION_MARKER})
@@ -90,6 +94,25 @@ _COMMA_PERIOD_RE = re.compile(r",\.(?!\.)")
 # "[3]" directly after a word/punctuation mark (no space): a footnote
 # reference. "Tập [1]" (space before the bracket) is never matched.
 _CITATION_MARKER_RE = re.compile(r"(?<=[^\s\[])\[\d{1,3}\]")
+
+# Labelled ISBN value. Validity mirrors identity_rules.looks_like_valid_
+# isbn() (kept local: this module has no project imports; a test pins
+# the two together): ISBN-13 starting 978/979, or ISBN-10.
+_ISBN_LABEL_RE = re.compile(r"\bISBN(?:-1[03])?\s*:?\s*([0-9Xx][0-9Xx \-]{8,20}[0-9Xx])")
+
+
+def _is_isbn_value(value: str) -> bool:
+    digits = re.sub(r"[\s\-]", "", value).upper()
+    if len(digits) == 13 and digits.isdigit():
+        return digits.startswith(("978", "979"))
+    return len(digits) == 10 and digits[:9].isdigit() and (digits[9].isdigit() or digits[9] == "X")
+
+
+def has_invalid_isbn(text: str | None) -> bool:
+    """True when text labels a non-ISBN value as "ISBN"."""
+    if not text:
+        return False
+    return any(not _is_isbn_value(match.group(1)) for match in _ISBN_LABEL_RE.finditer(str(text)))
 
 # Same word twice in a row on one line ("biết biết"). ADVISORY ONLY:
 # Vietnamese reduplication is grammatical and very common ("song song",
@@ -576,6 +599,8 @@ def find_text_defects(text: str | None) -> set[str]:
         found.add(MALFORMED_PUNCTUATION)
     if _CITATION_MARKER_RE.search(value):
         found.add(CITATION_MARKER)
+    if has_invalid_isbn(value):
+        found.add(INVALID_ISBN)
     for code, patterns in _PATTERN_GROUPS:
         if any(pattern.search(value) for pattern in patterns):
             found.add(code)

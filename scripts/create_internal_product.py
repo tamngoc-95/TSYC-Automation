@@ -15,6 +15,7 @@ from src.domain.identity_status import IdentityStatus, MatchDecision
 from src.domain.image_status import ImageStatus, InternalProductImageStatus
 from src.domain.content_status import InternalProductContentStatus
 from src.domain.woocommerce_status import WooCommerceStatus
+from src.domain.rules.identity_rules import first_valid_isbn
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -602,9 +603,11 @@ def build_product_metadata(
             for field_name, field_value in (
                 (
                     "isbn",
-                    candidate.get("verified_isbn")
-                    or reference.get("reference_isbn")
-                    or candidate.get("possible_isbn"),
+                    first_valid_isbn(
+                        candidate.get("verified_isbn"),
+                        reference.get("reference_isbn"),
+                        candidate.get("possible_isbn"),
+                    ),
                 ),
                 (
                     "weight_grams",
@@ -716,15 +719,13 @@ def create_internal_product(
         )
     )
 
+    # Only a real ISBN (978/979 ISBN-13 or ISBN-10) is ever stored --
+    # a retailer SKU or 893 barcode is left out, not promoted (2.2/2.3).
     isbn = clean_text(
-        candidate.get(
-            "verified_isbn"
-        )
-        or reference_data.get(
-            "reference_isbn"
-        )
-        or candidate.get(
-            "possible_isbn"
+        first_valid_isbn(
+            candidate.get("verified_isbn"),
+            reference_data.get("reference_isbn"),
+            candidate.get("possible_isbn"),
         )
     )
 
@@ -963,7 +964,7 @@ def print_preview(
 
     print(
         "ISBN: "
-        f"{candidate.get('verified_isbn') or reference.get('reference_isbn') or '[not found]'}"
+        f"{first_valid_isbn(candidate.get('verified_isbn'), reference.get('reference_isbn')) or '[not found]'}"
     )
 
     print(
