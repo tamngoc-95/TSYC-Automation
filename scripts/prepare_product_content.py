@@ -1491,6 +1491,8 @@ def plan_storefront_repair(
         if storefront_text.has_leading_quoted_excerpt(long_description):
             # Drop a leading book passage only when real prose follows.
             long_description = storefront_text.drop_leading_quoted_excerpts(long_description)
+        # A cross-sell line plus its list of other titles goes as a unit.
+        long_description = storefront_text.drop_cross_sell_tail(long_description)
         repaired["long_description"] = _clean_prose_field(long_description)
         for field in ("short_description", "seo_description"):
             # A summary that opens with a quoted book passage is rebuilt

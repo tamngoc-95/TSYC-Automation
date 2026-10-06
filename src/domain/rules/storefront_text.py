@@ -46,6 +46,9 @@ QUOTED_EXCERPT = "QUOTED_EXCERPT"
 # (repair_typography); neither ever changes a word.
 DOUBLED_QUOTE = "DOUBLED_QUOTE"
 MALFORMED_PUNCTUATION = "MALFORMED_PUNCTUATION"
+# Encyclopedia footnote marker glued to the text ("...Việt Nam[3].",
+# 2026-10-06 Fast Track Batch 5). Removing it never changes a word.
+CITATION_MARKER = "CITATION_MARKER"
 
 ALL_DEFECT_CODES = (
     HTML_ENTITY,
@@ -59,9 +62,10 @@ ALL_DEFECT_CODES = (
     QUOTED_EXCERPT,
     DOUBLED_QUOTE,
     MALFORMED_PUNCTUATION,
+    CITATION_MARKER,
 )
 
-TYPOGRAPHY_DEFECT_CODES = frozenset({DOUBLED_QUOTE, MALFORMED_PUNCTUATION})
+TYPOGRAPHY_DEFECT_CODES = frozenset({DOUBLED_QUOTE, MALFORMED_PUNCTUATION, CITATION_MARKER})
 
 # --- patterns -------------------------------------------------------
 
@@ -83,6 +87,9 @@ _DOUBLED_QUOTE_RE = re.compile(r'""')
 _MALFORMED_PUNCTUATION_RE = re.compile(r"[?!,]\.(?!\.)")
 _STRAY_PERIOD_AFTER_MARK_RE = re.compile(r"([?!])\.(?!\.)")
 _COMMA_PERIOD_RE = re.compile(r",\.(?!\.)")
+# "[3]" directly after a word/punctuation mark (no space): a footnote
+# reference. "Tập [1]" (space before the bracket) is never matched.
+_CITATION_MARKER_RE = re.compile(r"(?<=[^\s\[])\[\d{1,3}\]")
 
 # Same word twice in a row on one line ("biết biết"). ADVISORY ONLY:
 # Vietnamese reduplication is grammatical and very common ("song song",
@@ -114,6 +121,19 @@ _INTERNAL_WORKFLOW_PATTERNS = (
     re.compile(r"trước khi (?:sản phẩm được )?xuất bản", re.IGNORECASE),
 )
 
+# A retailer section heading kept as its own line/sentence: "Giới thiệu
+# sách <title>" with no sentence period (the title itself may end in "?"
+# -- 2026-10-06 Fast Track Batch 5, "... Mẹ Vẫn Yêu Con Chứ?").
+_SECTION_HEADING_LINE_RE = re.compile(
+    r"(?im)^\s*(?:giới thiệu sách|giới thiệu nội dung|thông tin sản phẩm|mô tả sản phẩm)\b[^.!\n]{0,160}$"
+)
+# Retailer cross-sell: "Mời các bạn tìm mua trọn bộ:", "Mời quý độc giả
+# đón đọc ...", "... tìm mua trọn bộ".
+_CROSS_SELL_RE = re.compile(
+    r"(?i)\bmời (?:các |quý )?(?:bạn|độc giả|phụ huynh|ba mẹ|bố mẹ)\b[^\n]{0,80}?\b(?:tìm mua|đặt mua|mua|đón đọc|tìm đọc|sưu tầm)\b"
+    r"|\b(?:tìm mua|đặt mua|sưu tầm) (?:trọn|cả) bộ\b"
+)
+
 _SOURCE_BOILERPLATE_PATTERNS = (
     re.compile(r"có bán tại", re.IGNORECASE),
     re.compile(r"nhà sách online", re.IGNORECASE),
@@ -130,6 +150,8 @@ _SOURCE_BOILERPLATE_PATTERNS = (
     re.compile(r"✔️|✔|✅"),
     # Publisher-page button text that leaked into extracted metadata.
     re.compile(r"\bĐọc thử\b"),
+    _SECTION_HEADING_LINE_RE,
+    _CROSS_SELL_RE,
 )
 
 _STOCK_PATTERNS = (
@@ -379,13 +401,35 @@ def remove_defective_sentences(
 
 def repair_typography(text: str | None) -> str:
     """Deterministic fix for TYPOGRAPHY_DEFECT_CODES only: collapse a
-    doubled "" to ", drop the stray period in "?." / "!.", and turn ",."
-    into ".". Never adds, removes, or changes a word."""
+    doubled "" to ", drop the stray period in "?." / "!.", turn ",."
+    into ".", and drop a glued footnote marker "[3]". Never adds,
+    removes, or changes a word."""
     if not text:
         return ""
     repaired = _DOUBLED_QUOTE_RE.sub('"', str(text))
     repaired = _STRAY_PERIOD_AFTER_MARK_RE.sub(r"\1", repaired)
+    repaired = _CITATION_MARKER_RE.sub("", repaired)
     return _COMMA_PERIOD_RE.sub(".", repaired)
+
+
+def drop_cross_sell_tail(text: str | None) -> str:
+    """
+    Remove a retailer cross-sell paragraph ("Mời các bạn tìm mua trọn
+    bộ:") together with the list of other titles after it -- but only
+    when every following paragraph is a short list item (no longer than
+    _TRAILING_CHROME_MAX_LENGTH). Otherwise only the cross-sell sentence
+    itself is removed later (SOURCE_BOILERPLATE); real prose after it is
+    never dropped.
+    """
+    if not text:
+        return ""
+    paragraphs = normalize_paragraphs(text).split("\n\n")
+    for index, paragraph in enumerate(paragraphs):
+        if _CROSS_SELL_RE.search(paragraph) and all(
+            len(rest) <= _TRAILING_CHROME_MAX_LENGTH for rest in paragraphs[index + 1:]
+        ):
+            return "\n\n".join(paragraphs[:index])
+    return "\n\n".join(paragraphs)
 
 
 def find_duplicated_words(text: str | None) -> list[str]:
@@ -497,6 +541,7 @@ def normalize_source_description(
         if paragraph:
             cleaned.append(paragraph)
 
+    cleaned = [p for p in drop_cross_sell_tail("\n\n".join(cleaned)).split("\n\n") if p]
     cleaned = _trim_trailing_chrome(cleaned)
     # A leading verbatim book passage is not product description.
     cleaned = [p for p in drop_leading_quoted_excerpts("\n\n".join(cleaned)).split("\n\n") if p]
@@ -529,6 +574,8 @@ def find_text_defects(text: str | None) -> set[str]:
         found.add(DOUBLED_QUOTE)
     if _MALFORMED_PUNCTUATION_RE.search(value):
         found.add(MALFORMED_PUNCTUATION)
+    if _CITATION_MARKER_RE.search(value):
+        found.add(CITATION_MARKER)
     for code, patterns in _PATTERN_GROUPS:
         if any(pattern.search(value) for pattern in patterns):
             found.add(code)
