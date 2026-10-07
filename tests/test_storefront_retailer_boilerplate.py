@@ -128,6 +128,32 @@ def test_repair_removes_the_footer_stub_paragraph():
     assert cleaned == BODY
 
 
+# --- list lead-ins and rating widgets (Batch 20) -----------------------
+
+
+@pytest.mark.parametrize("text", ["Hãy sẳn sàng để:", "Sách gồm các phần sau;"])
+def test_prose_ending_on_a_colon_is_truncated(text):
+    defects = storefront_text.find_content_defects({"short_description": text}, ["short_description"])
+    assert storefront_text.TRUNCATED in defects["short_description"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "4,7*/5 với 1,607 lượt đánh giá trên trang Amazon.com",
+        "4,2*/5 với 3,748 lượt đánh giá trên trang Goodreads.com",
+        "Sách đạt 4.5/5 với hơn 2.000 lượt đánh giá.",
+    ],
+)
+def test_rating_widgets_are_boilerplate(text):
+    assert storefront_text.SOURCE_BOILERPLATE in storefront_text.find_text_defects(text)
+
+
+def test_a_sentence_mentioning_five_parts_is_not_a_rating():
+    text = "Cuốn sách gồm 5 phần, mỗi phần là một bài học về cuộc sống."
+    assert storefront_text.SOURCE_BOILERPLATE not in storefront_text.find_text_defects(text)
+
+
 # --- German closing quotes --------------------------------------------
 
 

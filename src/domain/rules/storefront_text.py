@@ -185,6 +185,11 @@ _SOURCE_BOILERPLATE_PATTERNS = (
     _SECTION_HEADING_LINE_RE,
     _CROSS_SELL_RE,
     _RETAILER_FOOTER_STUB_RE,
+    # Retailer rating widgets copied with the description: "4,7*/5 với
+    # 1,607 lượt đánh giá trên trang Amazon.com" (2026-10-06 Batch 20).
+    re.compile(r"\d(?:[.,]\d+)?\s*\*?\s*/\s*5\b[^\n]{0,40}\blượt đánh giá", re.IGNORECASE),
+    re.compile(r"\bamazon\.(?:com|de|co\.uk)\b", re.IGNORECASE),
+    re.compile(r"\bgoodreads(?:\.com)?\b", re.IGNORECASE),
 )
 
 _STOCK_PATTERNS = (
@@ -625,7 +630,10 @@ PROSE_FIELDS = ("short_description", "long_description")
 # Summary fields must never open with a quoted book passage.
 SUMMARY_FIELDS = ("short_description", "seo_description")
 
-_TERMINAL_CHARACTERS = ".!?…\"”’»)]:;"
+# ":" and ";" are deliberately absent: prose that stops on a colon is the
+# lead-in of a list that is not there ("Hãy sẳn sàng để:" was approved as
+# a whole short_description, 2026-10-06 Fast Track Batch 20).
+_TERMINAL_CHARACTERS = ".!?…\"”’»)]"
 # German/French closing quotes („…“, »…«) that are also opening quotes
 # elsewhere: terminal only right after sentence punctuation ("…lieb?“").
 _CLOSING_QUOTE_AFTER_PUNCTUATION = "“«"
