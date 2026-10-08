@@ -277,7 +277,9 @@ def test_validate_approval_content_allows_enriched_content():
     enriched = dict(generated)
     enriched["long_description"] = (
         "Nội dung sách kể về một hành trình khám phá thế giới xung quanh, "
-        "được biên tập lại từ bài đăng Facebook đã được phép sử dụng."
+        "được biên tập lại từ bài đăng Facebook đã được phép sử dụng. Mỗi "
+        "trang sách mở ra một khung cảnh mới, với hình minh họa và lời kể "
+        "nhẹ nhàng dành cho các bạn nhỏ cùng ba mẹ."
     )
     # Fully enriched: the generic draft's short/SEO text (stock wording,
     # "verified data" note) must not survive into approved content.
@@ -404,7 +406,9 @@ def test_attempt_content_approval_approves_enriched_content():
     enriched = dict(generated)
     enriched["long_description"] = (
         "Nội dung sách kể về một hành trình khám phá thế giới xung quanh, "
-        "được biên tập lại từ bài đăng Facebook đã được phép sử dụng."
+        "được biên tập lại từ bài đăng Facebook đã được phép sử dụng. Mỗi "
+        "trang sách mở ra một khung cảnh mới, với hình minh họa và lời kể "
+        "nhẹ nhàng dành cho các bạn nhỏ cùng ba mẹ."
     )
     # Fully enriched: the generic draft's short/SEO text (stock wording,
     # "verified data" note) must not survive into approved content.

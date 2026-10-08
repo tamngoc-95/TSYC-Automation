@@ -57,7 +57,10 @@ FULL_DESCRIPTION = (
     "chính mình?\n\n"
     "Cuốn sách sẽ giải mã bạn là ai, bạn cần Tư duy ngược để thành công và "
     "hạnh phúc như thế nào và các phương pháp giúp bạn dũng cảm sống cuộc "
-    "đời mà bạn muốn."
+    "đời mà bạn muốn.\n\n"
+    "Qua từng chương, tác giả đặt ra những câu hỏi về thói quen suy nghĩ "
+    "quen thuộc và gợi mở cách nhìn khác về công việc, các mối quan hệ và "
+    "những lựa chọn trong cuộc sống hằng ngày."
 )
 LEGACY_TEMPLATE_LONG = (
     "“Đắc Nhân Tâm” hiện có tại Tiệm Sách Yêu Con.\n\n"
@@ -486,7 +489,7 @@ def test_trailing_page_chrome_is_trimmed():
         "Xem tất cả sách của tác giả Nguyễn Anh Dũng"
     )
     normalized = storefront_text.normalize_source_description(text, titles=["Tư Duy Ngược"])
-    assert normalized.endswith("dũng cảm sống cuộc đời mà bạn muốn.")
+    assert normalized.endswith("những lựa chọn trong cuộc sống hằng ngày.")
     assert storefront_text.is_usable_source_description(normalized)
 
 

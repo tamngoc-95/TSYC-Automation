@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import html
 import re
+import unicodedata
 from typing import Iterable, Mapping, Sequence
 
 # --- defect codes ---------------------------------------------------
@@ -52,6 +53,16 @@ CITATION_MARKER = "CITATION_MARKER"
 # "ISBN: <value>" where the value is not an ISBN (a retailer SKU such as
 # NetaBooks "2421762043452", or an 893 barcode) -- CLAUDE.md 2.2/2.3.
 INVALID_ISBN = "INVALID_ISBN"
+# Content-quality codes (2026-10-08 review of the 30 Fast Track drafts):
+# a retailer page's table of contents, praise/review/press section copied
+# into the description (repairable: the section is dropped whole);
+THIRD_PARTY_SECTION = "THIRD_PARTY_SECTION"
+# Approval-gate codes (content_rules.evaluate_description_substance, not
+# storefront defects): the author's own first-person preface copied as the
+# description, and a description too thin to describe the book. Neither
+# is repairable without new text.
+FIRST_PERSON_SOURCE = "FIRST_PERSON_SOURCE"
+THIN_DESCRIPTION = "THIN_DESCRIPTION"
 
 ALL_DEFECT_CODES = (
     HTML_ENTITY,
@@ -67,6 +78,7 @@ ALL_DEFECT_CODES = (
     MALFORMED_PUNCTUATION,
     CITATION_MARKER,
     INVALID_ISBN,
+    THIRD_PARTY_SECTION,
 )
 
 TYPOGRAPHY_DEFECT_CODES = frozenset({DOUBLED_QUOTE, MALFORMED_PUNCTUATION, CITATION_MARKER})
@@ -190,7 +202,74 @@ _SOURCE_BOILERPLATE_PATTERNS = (
     re.compile(r"\d(?:[.,]\d+)?\s*\*?\s*/\s*5\b[^\n]{0,40}\blượt đánh giá", re.IGNORECASE),
     re.compile(r"\bamazon\.(?:com|de|co\.uk)\b", re.IGNORECASE),
     re.compile(r"\bgoodreads(?:\.com)?\b", re.IGNORECASE),
+    # Retailer promotion / unsupported marketing (2026-10-08 review):
+    # "cuốn sách hot nhất", "bộ sách mà mọi em bé 5+ đều nhất định cần
+    # có", "không nên bỏ qua", "đã chính thức trở lại kệ sách", a
+    # subscription-box name, a gift promise ("Mừng tuổi ngay ... sticker").
+    re.compile(r"\bhot nhất\b", re.IGNORECASE),
+    re.compile(r"\bnhất định (?:phải|cần) (?:có|đọc)\b", re.IGNORECASE),
+    re.compile(r"\bkhông (?:nên|thể) bỏ (?:qua|lỡ)\b", re.IGNORECASE),
+    re.compile(r"\btrở lại kệ sách\b", re.IGNORECASE),
+    re.compile(r"\bhộp háo hức\b", re.IGNORECASE),
+    re.compile(r"\bmừng tuổi ngay\b", re.IGNORECASE),
+    # Source-page navigation left as its own short line.
+    re.compile(r"(?im)^\s*(?:trang chủ|xem thêm|xem tất cả|quay lại|danh mục sản phẩm)\b[^.!?\n]{0,60}$"),
 )
+
+# --- third-party sections, first-person sources, thin descriptions ----
+
+# Headings that open a block which is not the shop's description of the
+# book: table of contents, praise/reviews, press quotes. The block runs to
+# the next author-information heading (kept) or to the end.
+_THIRD_PARTY_HEADING_RE = re.compile(
+    r"^\s*(?:mục lục(?: sách)?|lời khen(?: tặng| cho cuốn sách[^\n]{0,80})?|nhận xét|"
+    r"một số đánh giá[^\n]{0,60}|đánh giá(?: của độc giả)?|người nổi tiếng nói về[^\n]{0,80}|"
+    r"báo chí (?:nói|nhắc|viết) gì về[^\n]{0,80}|review(?:s)?)\s*:?\s*$",
+    re.IGNORECASE,
+)
+_SECTION_END_HEADING_RE = re.compile(
+    r"^\s*(?:thông tin tác giả|giới thiệu tác giả|về tác giả)\b", re.IGNORECASE
+)
+_QUOTED_SPAN_FOR_VOICE_RE = re.compile(r"[“\"«„][^“”\"«»„]{0,600}[”\"»“]")
+_FIRST_PERSON_RE = re.compile(r"(?<!\w)tôi(?!\w)", re.IGNORECASE)
+_FIRST_PERSON_MIN_OCCURRENCES = 3
+MIN_DESCRIPTION_LENGTH = 200
+
+
+def drop_third_party_sections(text: str | None) -> str:
+    """Remove table-of-contents / praise / review / press blocks: the
+    heading paragraph and everything after it up to the next author-
+    information heading (kept) or the end. Never touches other prose."""
+    if not text:
+        return ""
+    kept: list[str] = []
+    skipping = False
+    for paragraph in normalize_paragraphs(text).split("\n\n"):
+        if _THIRD_PARTY_HEADING_RE.match(paragraph):
+            skipping = True
+            continue
+        if skipping and _SECTION_END_HEADING_RE.match(paragraph):
+            skipping = False
+        if not skipping:
+            kept.append(paragraph)
+    return "\n\n".join(kept)
+
+
+def has_third_party_section(text: str | None) -> bool:
+    return bool(text) and any(
+        _THIRD_PARTY_HEADING_RE.match(paragraph)
+        for paragraph in normalize_paragraphs(text).split("\n\n")
+    )
+
+
+def is_first_person_source(text: str | None) -> bool:
+    """True when the description is narrated in the first person outside
+    quotation marks ("tôi" at least _FIRST_PERSON_MIN_OCCURRENCES times),
+    i.e. an author preface copied as the product description."""
+    if not text:
+        return False
+    unquoted = _QUOTED_SPAN_FOR_VOICE_RE.sub(" ", unicodedata.normalize("NFC", str(text)))
+    return len(_FIRST_PERSON_RE.findall(unquoted)) >= _FIRST_PERSON_MIN_OCCURRENCES
 
 _STOCK_PATTERNS = (
     re.compile(r"(?:hiện|đang|sẵn)\s+có\s+(?:bán\s+)?tại\s+Tiệm Sách Yêu Con", re.IGNORECASE),
@@ -579,6 +658,7 @@ def normalize_source_description(
         if paragraph:
             cleaned.append(paragraph)
 
+    cleaned = [p for p in drop_third_party_sections("\n\n".join(cleaned)).split("\n\n") if p]
     cleaned = [p for p in drop_cross_sell_tail("\n\n".join(cleaned)).split("\n\n") if p]
     cleaned = _trim_trailing_chrome(cleaned)
     # A leading verbatim book passage is not product description.
@@ -668,6 +748,8 @@ def find_content_defects(
             defects.add(QUOTED_EXCERPT)
         if field == "long_description" and has_leading_quoted_excerpt(value):  # type: ignore[arg-type]
             defects.add(QUOTED_EXCERPT)
+        if field == "long_description" and value and has_third_party_section(str(value)):
+            defects.add(THIRD_PARTY_SECTION)
         if defects:
             findings[field] = sorted(defects)
     return findings
@@ -681,6 +763,8 @@ def is_usable_source_description(text: str | None) -> bool:
         return False
     stripped = text.strip()
     if len(stripped) < MIN_USABLE_SOURCE_DESCRIPTION_LENGTH:
+        return False
+    if is_first_person_source(stripped) or has_third_party_section(stripped):
         return False
     if contains_page_chrome(stripped):
         return False

@@ -557,6 +557,12 @@ def validate_approval_content(
         if not name_check.is_auto_pass:
             raise RuntimeError(f"[{name_check.rule_code}] {name_check.reason}")
 
+        # Thin descriptions and copied first-person prefaces are never
+        # auto-approved (2026-10-08 content-quality review).
+        substance = content_rules.evaluate_description_substance(content)
+        if not substance.is_auto_pass:
+            raise RuntimeError(f"[{substance.rule_code}] {substance.reason}")
+
 
 def restore_existing_content(
     repository: SupabaseRepository,
@@ -1368,6 +1374,8 @@ def classify_storefront_defects(findings: dict[str, list[str]]) -> str | None:
         groups.add(REPAIR_CATEGORY_TYPOGRAPHY)
     if storefront_text.INVALID_ISBN in codes:
         groups.add(REPAIR_CATEGORY_INVALID_ISBN)
+    if storefront_text.THIRD_PARTY_SECTION in codes:
+        groups.add(REPAIR_CATEGORY_STOCK_OR_BOILERPLATE)
 
     return groups.pop() if len(groups) == 1 else REPAIR_CATEGORY_MULTIPLE
 
@@ -1498,6 +1506,8 @@ def plan_storefront_repair(
             long_description = storefront_text.drop_leading_quoted_excerpts(long_description)
         # A cross-sell line plus its list of other titles goes as a unit.
         long_description = storefront_text.drop_cross_sell_tail(long_description)
+        # A table of contents / praise / press block goes as a unit.
+        long_description = storefront_text.drop_third_party_sections(long_description)
         repaired["long_description"] = _clean_prose_field(long_description)
         for field in ("short_description", "seo_description"):
             # A summary that opens with a quoted book passage is rebuilt

@@ -250,6 +250,51 @@ def evaluate_name_consistency(
     )
 
 
+CONTENT_DESCRIPTION_SUBSTANCE = "CONTENT_DESCRIPTION_SUBSTANCE"
+
+
+def evaluate_description_substance(content: Mapping[str, Any]) -> DecisionResult:
+    """
+    Automatic approval gate (2026-10-08 review of Fast Track drafts): the
+    long description must actually describe the book as the shop --
+    REVIEW_REQUIRED when it is
+      - too thin (< storefront_text.MIN_DESCRIPTION_LENGTH characters,
+        e.g. a two-sentence aphorism), or
+      - the author's own first-person preface copied from the source
+        ("tôi" narration outside quotation marks).
+    Detection only; neither case is repairable without new text.
+    """
+    long_description = str(content.get("long_description") or "")
+    reasons: list[str] = []
+    codes: list[str] = []
+    length = len(" ".join(long_description.split()))
+    if length < storefront_text.MIN_DESCRIPTION_LENGTH:
+        codes.append(storefront_text.THIN_DESCRIPTION)
+        reasons.append(
+            f"long_description has {length} characters (minimum "
+            f"{storefront_text.MIN_DESCRIPTION_LENGTH}) -- too thin to describe the book"
+        )
+    if storefront_text.is_first_person_source(long_description):
+        codes.append(storefront_text.FIRST_PERSON_SOURCE)
+        reasons.append(
+            "long_description is narrated in the first person (an author "
+            "preface copied from the source), not a description of the book"
+        )
+    if reasons:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=CONTENT_DESCRIPTION_SUBSTANCE,
+            reason="; ".join(reasons) + ".",
+            evidence={"codes": codes},
+        )
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=CONTENT_DESCRIPTION_SUBSTANCE,
+        reason="Long description has substance and is not a first-person source preface.",
+        evidence={"codes": []},
+    )
+
+
 def evaluate_unsupported_claims(
     claimed_facts: Mapping[str, Any],
     verifiable_facts: Mapping[str, Any],

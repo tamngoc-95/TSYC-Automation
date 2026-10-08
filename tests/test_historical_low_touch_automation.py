@@ -117,7 +117,10 @@ def _reference(**overrides: Any) -> dict[str, Any]:
         "reference_image_url": "https://example-bookstore.test/dac-nhan-tam.jpg",
         "reference_description": (
             "Đắc Nhân Tâm là cuốn sách kinh điển về nghệ thuật giao tiếp và "
-            "ứng xử, được hàng triệu độc giả trên thế giới tin đọc."
+            "ứng xử, được hàng triệu độc giả trên thế giới tin đọc. Qua "
+            "những câu chuyện gần gũi, cuốn sách trình bày các nguyên tắc "
+            "lắng nghe, thấu hiểu và tôn trọng người khác trong cuộc sống "
+            "hằng ngày."
         ),
     }
     row.update(overrides)
