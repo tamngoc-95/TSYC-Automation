@@ -44,10 +44,11 @@ from __future__ import annotations
 import re
 import unicodedata
 from difflib import SequenceMatcher
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from src.domain.decisions import DecisionResult, Outcome
 from src.domain.identity_status import MatchDecision
+from src.domain.rules import author_rules
 
 # --- rule codes --------------------------------------------------------
 
@@ -339,6 +340,139 @@ def is_series_volume_title(
     return len(segments) >= 2 and exact_title_key(segments[-1]) == candidate_key
 
 
+IDENTITY_SERIES_VOLUME_CONFIRMED = "IDENTITY_SERIES_VOLUME_CONFIRMED"
+IDENTITY_SERIES_VOLUME_UNCONFIRMED = "IDENTITY_SERIES_VOLUME_UNCONFIRMED"
+
+# "Tập 3", "tập 03", "Vol. 2", "Volume 2", "Quyển 1", "Số 4", "#5", "Phần 2".
+_VOLUME_NUMBER_RE = re.compile(
+    r"(?:\b(?:tập|tap|vol\.?|volume|quyển|quyen|số|so|phần|phan|book|band)\s*|#)(\d{1,3})\b",
+    re.IGNORECASE,
+)
+# Listings that sell several volumes as one unit (never one volume).
+_MULTI_VOLUME_LISTING_RE = re.compile(
+    r"^\s*[\[\(]?\s*(?:combo|trọn bộ|tron bo|bộ sách|bo sach|bộ\s+\d|bo\s+\d|boxset|box set|set\b|hộp|hop\b)"
+    r"|\(\s*\d+\s*(?:cuốn|cuon|quyển|quyen|tập|tap|volumes?)\s*\)"
+    r"|\btrọn bộ\b|\btron bo\b",
+    re.IGNORECASE,
+)
+_SINGLE_UNIT_CANDIDATE_TYPES = frozenset({"SINGLE_BOOK"})
+
+
+def volume_numbers(title: str | None) -> set[int]:
+    """Explicit volume numbers stated in a title ("Tập 3" -> {3})."""
+    return {int(match) for match in _VOLUME_NUMBER_RE.findall(unicodedata.normalize("NFC", str(title or "")))}
+
+
+def is_multi_volume_listing(title: str | None) -> bool:
+    """True for a combo/set/box/"(4 cuốn)" listing title."""
+    return bool(_MULTI_VOLUME_LISTING_RE.search(unicodedata.normalize("NFC", str(title or "")).strip()))
+
+
+def _shared_specific_authors(first: str | None, second: str | None) -> list[str]:
+    def keys(field: str | None) -> dict[str, str]:
+        return {
+            author_rules.person_name_key(name): name
+            for name in author_rules.split_person_names(field)
+            if is_specific_author(name)
+        }
+
+    left, right = keys(first), keys(second)
+    return sorted(left[key] for key in left.keys() & right.keys())
+
+
+def evaluate_series_volume_identity(
+    candidate: Mapping[str, Any],
+    reference: Mapping[str, Any],
+) -> DecisionResult:
+    """
+    Deterministic series-volume identity (CLAUDE.md 9.1 "exact volume
+    title with only a known/common series prefix omitted"). AUTO_PASS only
+    when ALL hold:
+
+      series form    the reference title is "<series> - <candidate title>"
+                     (is_series_volume_title: exact volume part, edition
+                     suffix ignored -- edition is not identity, 9.3)
+      volume number  any volume number stated on either side is the same
+                     on both (a stated number never matches a different
+                     or a missing one)
+      sellable unit  the candidate is a SINGLE_BOOK and the reference is
+                     not a combo/set/box/"(N cuốn)" listing -- a complete
+                     series never matches one volume, nor the reverse
+      corroboration  a shared specific author, or an equal valid ISBN
+      no conflict    no differing valid ISBNs; publishers, when both are
+                     stated, agree
+
+    Otherwise REVIEW_REQUIRED with every unmet condition listed. Never
+    assigns a match by similarity.
+    """
+    candidate_title = candidate.get("verified_title") or candidate.get("extracted_title")
+    reference_title = reference.get("reference_title")
+    reasons: list[str] = []
+
+    if not is_series_volume_title(candidate_title, reference_title):
+        reasons.append("reference title is not '<series> - <candidate title>'")
+
+    candidate_volumes = volume_numbers(candidate_title)
+    reference_volumes = volume_numbers(reference_title)
+    if candidate_volumes and candidate_volumes != reference_volumes:
+        reasons.append(
+            f"volume number differs (candidate {sorted(candidate_volumes)}, reference {sorted(reference_volumes)})"
+        )
+
+    if candidate.get("candidate_type") not in _SINGLE_UNIT_CANDIDATE_TYPES:
+        reasons.append(f"candidate_type {candidate.get('candidate_type')!r} is not a single book")
+    if is_multi_volume_listing(reference_title):
+        reasons.append("reference is a multi-volume (combo/set) listing")
+
+    candidate_isbn = candidate.get("verified_isbn") or candidate.get("possible_isbn")
+    reference_isbn = reference.get("reference_isbn")
+    isbn_both_valid = looks_like_valid_isbn(candidate_isbn) and looks_like_valid_isbn(reference_isbn)
+    isbn_match = isbn_both_valid and normalize_isbn(candidate_isbn) == normalize_isbn(reference_isbn)
+    if isbn_both_valid and not isbn_match:
+        reasons.append("valid ISBNs differ")
+
+    shared_authors = _shared_specific_authors(
+        candidate.get("verified_author") or candidate.get("extracted_author"),
+        reference.get("reference_author"),
+    )
+    if not isbn_match and not shared_authors:
+        reasons.append("no shared specific author or equal ISBN corroborates the volume")
+
+    candidate_publisher = candidate.get("verified_publisher") or candidate.get("extracted_publisher")
+    reference_publisher = reference.get("reference_publisher")
+    if candidate_publisher and reference_publisher:
+        left, right = normalize_text(candidate_publisher), normalize_text(reference_publisher)
+        if left and right and left not in right and right not in left:
+            reasons.append(f"publisher differs ({candidate_publisher!r} vs {reference_publisher!r})")
+
+    evidence = {
+        "candidate_title": candidate_title,
+        "reference_title": reference_title,
+        "volume_numbers": {"candidate": sorted(candidate_volumes), "reference": sorted(reference_volumes)},
+        "shared_authors": shared_authors,
+        "isbn_match": isbn_match,
+        "unmet": reasons,
+    }
+    if reasons:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=IDENTITY_SERIES_VOLUME_UNCONFIRMED,
+            reason="Series-volume match not confirmed: " + "; ".join(reasons) + ".",
+            evidence=evidence,
+        )
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=IDENTITY_SERIES_VOLUME_CONFIRMED,
+        reason=(
+            "Exact volume title under a series prefix, single-book unit on both sides, "
+            + ("equal ISBN" if isbn_match else f"shared author {', '.join(shared_authors)}")
+            + "."
+        ),
+        evidence=evidence,
+        confidence=0.97 if isbn_match else 0.9,
+    )
+
+
 def reference_business_conflict_reason(
     candidate: dict[str, Any],
     reference: dict[str, Any],
@@ -573,6 +707,23 @@ def evaluate_single_reference_identity(
             "but differ.",
             MatchDecision.NO_MATCH,
             0.99,
+        )
+
+    # "<series> - <volume title>" scores low on plain similarity although
+    # it is the exact volume (CLAUDE.md 9.1). Only the strict, fully
+    # corroborated form is accepted -- see evaluate_series_volume_identity().
+    series_decision = evaluate_series_volume_identity(candidate, reference)
+    if series_decision.is_auto_pass:
+        return DecisionResult(
+            outcome=Outcome.AUTO_PASS,
+            rule_code=series_decision.rule_code,
+            reason=series_decision.reason,
+            evidence={
+                **base_evidence,
+                "series_volume": dict(series_decision.evidence),
+                "match_decision": MatchDecision.MATCH,
+            },
+            confidence=series_decision.confidence,
         )
 
     if title_similarity >= 0.90 and author_similarity >= 0.90:
