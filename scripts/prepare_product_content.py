@@ -66,6 +66,7 @@ TRANSLATION_FILE_FIELDS = (
     set(translation_rules.TRANSLATABLE_TEXT_FIELDS) | TRANSLATION_PROVENANCE_FIELDS
 )
 TRANSLATION_GENERATION_METHODS = {"MANUAL", "AI_ASSISTED", "HYBRID"}
+REVISE_GENERATION_METHODS = frozenset({"MANUAL", "AI_ASSISTED"})
 
 # Maximum lengths of the whole-sentence summaries used as short_description/
 # seo_description when auto-enriching from a reference description. Whole
@@ -209,6 +210,17 @@ def parse_arguments() -> argparse.Namespace:
             "<candidate_code>.json (create it with --action "
             "EXPORT_PACKAGE, then fill the en/de fields); claude calls the "
             "Claude API (opt-in, requires ANTHROPIC_API_KEY)."
+        ),
+    )
+    parser.add_argument(
+        "--generation-method",
+        choices=sorted(REVISE_GENERATION_METHODS),
+        default="MANUAL",
+        help=(
+            "Who wrote a --action REVISE content file: MANUAL (human "
+            "reviewer, default) or AI_ASSISTED (Claude Code original "
+            "description from verified source facts). Recorded as the "
+            "row's generation_method; approval is unchanged."
         ),
     )
     return parser.parse_args()
@@ -1082,12 +1094,22 @@ def run_revise_action(
     non_interactive: bool,
     confirm_revise: bool,
     prompt: Callable[[str], str] = input,
+    generation_method: str = "MANUAL",
 ) -> dict[str, Any] | None:
     """
     Run --action REVISE end to end: resolve target, validate the content
     file, compute a diff, confirm, write, and log. Returns the written row,
     or None when the run is a no-op or is cancelled.
+
+    generation_method records who wrote the revision: MANUAL (a human
+    reviewer, the default) or AI_ASSISTED (Claude Code writing an original
+    description from verified source facts). Provenance is never
+    mislabeled; either way the row stays DRAFTED until APPROVE validates.
     """
+    if generation_method not in REVISE_GENERATION_METHODS:
+        raise RuntimeError(
+            f"--generation-method must be one of {sorted(REVISE_GENERATION_METHODS)}."
+        )
     if not product_code:
         raise RuntimeError(
             "--action REVISE requires --product-code (exact targeting "
@@ -1157,9 +1179,15 @@ def run_revise_action(
         existing=existing,
         content=revised_content,
         approve=False,
-        generation_method="MANUAL",
+        generation_method=generation_method,
         review_notes=(
-            "Revised via HUMAN_REVIEW (REVISE). Changed fields: "
+            (
+                "Revised via HUMAN_REVIEW (REVISE). "
+                if generation_method == "MANUAL"
+                else "Revised via CLAUDE_CODE (REVISE, AI_ASSISTED original "
+                "description from verified source facts). "
+            )
+            + "Changed fields: "
             + ", ".join(field for field, _, _ in changes)
             + "."
         ),
@@ -2641,6 +2669,7 @@ def main() -> None:
             content_file=args.content_file,
             non_interactive=args.non_interactive,
             confirm_revise=args.confirm_revise,
+            generation_method=args.generation_method,
         )
         return
 

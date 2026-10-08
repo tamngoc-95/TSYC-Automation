@@ -133,6 +133,39 @@ def test_revise_valid_drafted_row_applies_changes(tmp_path):
     assert result["long_description"] == "Mô tả dài đã được biên tập, có nội dung thật."
 
 
+def test_revise_default_provenance_is_manual_human_review(tmp_path):
+    repository = make_repository(make_product(), make_drafted_content())
+    content_file = write_content_file(tmp_path, {"long_description": "Mô tả dài mới, có nội dung thật."})
+    result = ppc.run_revise_action(
+        repository=repository, product_code=PRODUCT_CODE, content_file=str(content_file),
+        non_interactive=True, confirm_revise=True,
+    )
+    assert result["generation_method"] == "MANUAL"
+    assert "HUMAN_REVIEW" in result["review_notes"]
+
+
+def test_revise_ai_assisted_provenance_is_never_labeled_human(tmp_path):
+    repository = make_repository(make_product(), make_drafted_content())
+    content_file = write_content_file(tmp_path, {"long_description": "Mô tả dài mới, có nội dung thật."})
+    result = ppc.run_revise_action(
+        repository=repository, product_code=PRODUCT_CODE, content_file=str(content_file),
+        non_interactive=True, confirm_revise=True, generation_method="AI_ASSISTED",
+    )
+    assert result["generation_method"] == "AI_ASSISTED"
+    assert "HUMAN_REVIEW" not in result["review_notes"]
+    assert result["content_status"] == "DRAFTED"  # approval is still a separate validated step
+
+
+def test_revise_rejects_unknown_generation_method(tmp_path):
+    repository = make_repository(make_product(), make_drafted_content())
+    content_file = write_content_file(tmp_path, {"long_description": "x"})
+    with pytest.raises(RuntimeError, match="--generation-method"):
+        ppc.run_revise_action(
+            repository=repository, product_code=PRODUCT_CODE, content_file=str(content_file),
+            non_interactive=True, confirm_revise=True, generation_method="RULE_BASED",
+        )
+
+
 # --------------------------------------------------------------------------
 # 2. Omitted fields are preserved
 # --------------------------------------------------------------------------
