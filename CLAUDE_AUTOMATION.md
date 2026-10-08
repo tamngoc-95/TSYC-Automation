@@ -756,6 +756,14 @@ Vietnamese approval additionally rejects a single-edit misspelling of the produc
 Source typography artifacts (doubled "" quotes, "?." / "!." / ",.") are storefront defects with a deterministic word-preserving repair.
 Multilingual Translation Dispatch
 run_batch.py --translation-provider claude dispatches prepare_product_content.py --action TRANSLATE for READY_FOR_DRAFT candidates missing APPROVED en/de. Default is none (stop with MULTILINGUAL_CONTENT_REQUIRED). An en/de row already REVIEW_REQUIRED/REJECTED is never re-translated automatically.
+Claude Code fallback (no API call): run_batch.py --translation-provider package-file. Claude Code exports the package (prepare_product_content.py --action EXPORT_PACKAGE; never overwrites an existing file), fills description_en/de, short_description_en/de and product_title_en/de from the APPROVED vi text per TSYC_CONTENT_GUIDE.md, and the orchestrator dispatches TRANSLATE --translation-provider package-file only for candidates whose package has en and de filled. TRANSLATE refuses a stale package, runs cross-language consistency, saves, and approves only on PASS.
+Every en/de approval, including the per-language --content-file APPROVE path, must pass multilingual_consistency (numbers carried over, names preserved, no commerce wording, single language) as well as translation_rules.
+ISBN Integrity
+Only a 978/979 ISBN-13 or an ISBN-10 is ever stored as ISBN. Retailer product codes (e.g. NetaBooks JSON-LD sku/gtin13) and 893 barcodes are never ISBNs. collect_reference_metadata.extract_isbn and create_internal_product enforce this; audit_pipeline_state reports a stored non-ISBN as ERROR ISBN_NOT_AN_ISBN; scripts/clear_invalid_isbn.py (bounded, dry run by default, previous values logged to process_logs) clears existing values. A real ISBN is only written when confirmed by identity evidence; clearing is never replaced by a guess.
+Series-Volume Identity
+identity_rules.evaluate_series_volume_identity accepts "<series> - <volume title>" as MATCH only with: exact volume title, equal volume numbers wherever stated, SINGLE_BOOK candidate and non-combo/set reference, a shared specific author or equal valid ISBN, and no ISBN/publisher conflict. A complete series never matches one volume.
+Content Substance Gate
+Vietnamese auto-approval additionally requires (content_rules.evaluate_description_substance) a long description of at least 200 characters and not a first-person author preface copied from the source. Tables of contents, praise/review/press sections, retailer promotion and navigation are removed deterministically (normalization and REPAIR). Failing candidates are isolated for content review; Claude Code may write an original description only from verified source facts via the sanctioned REVISE path, never inventing plot, benefits, awards or author intent.
 Recovery Policy
 Never blind retry uncertain Woo creation.
 When Woo create result is uncertain:
