@@ -32,6 +32,7 @@ from src.domain.content_status import ContentStatus, InternalProductContentStatu
 from src.domain.identity_status import IdentityStatus, MatchDecision
 from src.domain.image_status import ImageStatus, InternalProductImageStatus
 from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
+from src.domain.rules.identity_rules import looks_like_valid_isbn
 from src.domain.woocommerce_status import WooCommerceStatus
 from src.repositories.supabase_repository import SupabaseRepository
 from sync_woocommerce_product_status import LOCAL_STATUSES_VALID_WITH_REMOTE_ID
@@ -415,6 +416,18 @@ def audit_candidate_product_linkage(
                 product_code,
                 "ISBN_MISSING",
                 "ISBN is missing. This does not block WooCommerce draft creation.",
+            )
+        elif not looks_like_valid_isbn(product.get("isbn")):
+            # CLAUDE.md 2.2/2.3: a retailer SKU or 893 barcode stored as
+            # ISBN is invented metadata (2026-10-08 NetaBooks finding).
+            add_issue(
+                issues,
+                "ERROR",
+                product_code,
+                "ISBN_NOT_AN_ISBN",
+                f"Stored isbn {product.get('isbn')!r} is not a valid ISBN "
+                "(978/979 ISBN-13 or ISBN-10); clear it with "
+                "scripts/clear_invalid_isbn.py.",
             )
 
         if product.get("weight_grams") in (
