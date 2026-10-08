@@ -23,7 +23,7 @@ import unicodedata
 from typing import Any, Mapping
 
 from src.domain.decisions import DecisionResult, Outcome
-from src.domain.rules import content_rules
+from src.domain.rules import content_rules, multilingual_consistency
 
 TRANSLATION_VALIDATION = "TRANSLATION_VALIDATION"
 
@@ -345,7 +345,7 @@ def evaluate_translation(
     source = source_text(vi_content)
     source_normalized = _normalize(source)
     verified = verified_fact_values(product)
-    allowed_numbers = _numbers(source) | _numbers(
+    allowed_numbers = _numbers(source) | multilingual_consistency.number_parts(source) | _numbers(
         " ".join(str(value) for value in verified.values())
     )
     target_text = "\n".join(

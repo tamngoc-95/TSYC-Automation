@@ -61,6 +61,16 @@ def test_numbers_written_as_words_or_split_ranges_are_carried_over(vi_fragment, 
     assert mc.TRANSLATION_DROPPED_FACT not in _evaluate(BODY_VI + " " + vi_fragment, BODY_EN + " " + en_fragment)
 
 
+def test_digits_of_a_vi_range_are_not_added_facts():
+    codes = _evaluate(BODY_VI + " cậu bé mới 8,9 tuổi.", BODY_EN + " a boy of only 8 or 9.")
+    assert mc.TRANSLATION_ADDED_FACT not in codes
+    assert mc.TRANSLATION_DROPPED_FACT not in codes
+
+
+def test_an_invented_number_is_still_an_added_fact():
+    assert mc.TRANSLATION_ADDED_FACT in _evaluate(BODY_VI, BODY_EN + " The book has 196 pages.")
+
+
 def test_a_really_dropped_number_still_fails():
     assert mc.TRANSLATION_DROPPED_FACT in _evaluate(BODY_VI + " Sách có 196 trang.", BODY_EN + " The book has many pages.")
 

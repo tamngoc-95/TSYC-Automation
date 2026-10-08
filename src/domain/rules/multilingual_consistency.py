@@ -185,6 +185,19 @@ def _number_words(text: str) -> set[str]:
     return {_NUMBER_WORDS[word] for word in re.findall(r"[^\W\d_]+", _normalize(text)) if word in _NUMBER_WORDS}
 
 
+def number_parts(text: str) -> set[str]:
+    """Separated parts of numbers written with "," or "." ("8,9 tuổi" =
+    8 or 9 years; "200.300" = 200300): a translation stating "8 or 9" adds
+    no fact. Shared with translation_rules."""
+    return {
+        part
+        for raw in _NUMBER_PATTERN.findall(text or "")
+        if re.search(r"[.,]", raw)
+        for part in re.split(r"[.,]", raw)
+        if part
+    }
+
+
 def _dropped_numbers(vi_text: str, target_text: str) -> list[str]:
     """VI numbers absent from the target. A VI token whose separated parts
     ("8,9" = 8 or 9) all appear, or a small number written as a word
@@ -340,7 +353,7 @@ def evaluate_multilingual_consistency(
     strip_names.sort(key=len, reverse=True)
 
     vi_numbers = _numbers(vi_text)
-    allowed_numbers = vi_numbers | _numbers(
+    allowed_numbers = vi_numbers | number_parts(vi_text) | _numbers(
         " ".join(str(value) for value in verified_facts.values())
     )
 
