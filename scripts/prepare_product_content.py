@@ -50,6 +50,9 @@ VALID_ACTIONS = {
     # Multilingual path (CLAUDE_AUTOMATION.md section 9): en+de together.
     "TRANSLATE",
     "EXPORT_PACKAGE",
+    # Versioned replacement of APPROVED vi/en/de text (validated first,
+    # previous version preserved). See run_replace_approved_action().
+    "REPLACE_APPROVED",
 }
 
 # product_contents.content_language values (migrations/008 check
@@ -211,6 +214,10 @@ def parse_arguments() -> argparse.Namespace:
             "EXPORT_PACKAGE, then fill the en/de fields); claude calls the "
             "Claude API (opt-in, requires ANTHROPIC_API_KEY)."
         ),
+    )
+    parser.add_argument(
+        "--repair-reason",
+        help="Required with --action REPLACE_APPROVED: why the APPROVED text is replaced (recorded).",
     )
     parser.add_argument(
         "--generation-method",
@@ -2555,6 +2562,209 @@ def run_translate_action(
     return report
 
 
+# --- REPLACE_APPROVED: versioned replacement of APPROVED content ----------
+#
+# The only transition that may change the text of an APPROVED row with new
+# (non-deterministic) wording. REPAIR stays the deterministic path; REVISE
+# stays DRAFTED/REVIEW_REQUIRED-only. Everything is validated before any
+# write; the previous version is preserved (audit file + process_logs).
+
+REPLACE_PROCESS_NAME = "content_replace_approved"
+REPLACE_LANGUAGES = ("vi", "en", "de")
+
+
+def _merge_fields(existing: dict[str, Any], replacement: dict[str, Any]) -> dict[str, Any]:
+    merged = {field: existing.get(field) for field in CONTENT_TEXT_FIELDS}
+    merged.update({field: value for field, value in replacement.items() if field in CONTENT_TEXT_FIELDS})
+    return merged
+
+
+def plan_replace_approved(
+    repository: SupabaseRepository,
+    product: dict[str, Any],
+    package: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """
+    Pure validation (reads only): {language: {"existing", "content"}} for
+    every language in the package, or RuntimeError naming every failure.
+
+      - each target row must exist and be APPROVED (others use SAVE/REVISE)
+      - vi: the full Vietnamese approval gate (validate_approval_content)
+      - en/de: translation_rules AND cross-language consistency against the
+        effective vi (the replacement vi if supplied, else the stored one)
+      - replacing vi requires replacing every APPROVED en/de in the same
+        call, so no approved translation is left describing old text
+    """
+    unknown = sorted(set(package) - set(REPLACE_LANGUAGES))
+    if unknown or not package:
+        raise RuntimeError(f"Package must contain only {REPLACE_LANGUAGES}; got {sorted(package)}.")
+
+    plans: dict[str, dict[str, Any]] = {}
+    existing_rows = {
+        language: get_existing_content(repository, product["internal_product_id"], language)
+        for language in REPLACE_LANGUAGES
+    }
+    for language, fields in package.items():
+        existing = existing_rows[language]
+        if not existing or existing.get("content_status") != ContentStatus.APPROVED:
+            raise RuntimeError(
+                f"{language!r} row is {existing.get('content_status') if existing else 'missing'!r}; "
+                "REPLACE_APPROVED only replaces APPROVED content (use SAVE/REVISE otherwise)."
+            )
+        if not isinstance(fields, dict):
+            raise RuntimeError(f"{language!r} replacement must be an object.")
+        validated = (
+            validate_reviewer_content_payload(fields)
+            if language == "vi"
+            else {k: v for k, v in validate_translation_payload(fields).items() if k in CONTENT_TEXT_FIELDS}
+        )
+        plans[language] = {"existing": existing, "content": _merge_fields(existing, validated)}
+
+    if "vi" in plans:
+        stale = [
+            language for language in ("en", "de")
+            if existing_rows[language]
+            and existing_rows[language].get("content_status") == ContentStatus.APPROVED
+            and language not in plans
+        ]
+        if stale:
+            raise RuntimeError(
+                "Replacing vi would leave APPROVED translations of the old text: "
+                + ", ".join(stale) + ". Include them in the same package."
+            )
+        validate_approval_content(
+            existing=plans["vi"]["existing"],
+            content=plans["vi"]["content"],
+            generated=build_safe_draft(product),
+            product=product,
+        )
+
+    effective_vi = plans["vi"]["content"] if "vi" in plans else existing_rows["vi"]
+    if not effective_vi:
+        raise RuntimeError("No Vietnamese content to validate translations against.")
+
+    failures: list[str] = []
+    for language in ("en", "de"):
+        if language not in plans:
+            continue
+        translation = {field: plans[language]["content"].get(field) for field in translation_rules.TRANSLATABLE_TEXT_FIELDS}
+        decision = evaluate_translation_for_product(
+            repository, product, language, translation, {**effective_vi, "content_status": "APPROVED", "review_required": False}
+        )
+        if not decision.is_auto_pass:
+            failures.append(f"[{language}] {decision.reason}")
+        consistency = multilingual_consistency.evaluate_multilingual_consistency(
+            vi={field: effective_vi.get(field) for field in ("product_name", "short_description", "long_description")},
+            translations={language: translation},
+            verified_facts=translation_rules.verified_fact_values(product),
+        )
+        if not consistency.language_passed(language):
+            failures.extend(f for f in consistency.failures if f.startswith(f"[{language}]"))
+    if failures:
+        raise RuntimeError("Replacement refused, nothing written: " + "; ".join(failures))
+    return plans
+
+
+def run_replace_approved_action(
+    repository: SupabaseRepository,
+    product_code: str | None,
+    content_file: str | None,
+    repair_reason: str | None,
+    generation_method: str,
+    non_interactive: bool,
+    confirm_repair: bool,
+    audit_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Validate every language first, then write all of them. Previous
+    content is preserved in an audit file and in process_logs."""
+    if not product_code or not content_file:
+        raise RuntimeError("--action REPLACE_APPROVED requires --product-code and --content-file.")
+    if not repair_reason or len(repair_reason.strip()) < 10:
+        raise RuntimeError("--action REPLACE_APPROVED requires a --repair-reason (at least 10 characters).")
+    if not non_interactive or not confirm_repair:
+        raise RuntimeError("--action REPLACE_APPROVED requires --non-interactive --confirm-repair.")
+    if generation_method not in REVISE_GENERATION_METHODS:
+        raise RuntimeError(f"--generation-method must be one of {sorted(REVISE_GENERATION_METHODS)}.")
+
+    products = get_products(repository, product_code)
+    if not products:
+        raise RuntimeError(f"Internal product was not found: {product_code}")
+    product = products[0]
+    package = load_reviewer_content_file(Path(content_file))
+    plans = plan_replace_approved(repository, product, package)
+
+    audit_dir = audit_dir or REPAIR_AUDIT_DIR
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    audit_path = audit_dir / f"{product_code}_replace_{stamp}.json"
+    previous = {
+        language: {field: plan["existing"].get(field) for field in CONTENT_TEXT_FIELDS}
+        | {"product_content_id": plan["existing"].get("product_content_id"),
+           "generation_method": plan["existing"].get("generation_method"),
+           "approved_at": plan["existing"].get("approved_at")}
+        for language, plan in plans.items()
+    }
+    audit_path.write_text(
+        json.dumps(
+            {
+                "product_code": product_code,
+                "replaced_at": utc_now(),
+                "reason": repair_reason,
+                "generation_method": generation_method,
+                "before": previous,
+                "after": {language: plan["content"] for language, plan in plans.items()},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    now = utc_now()
+    written: dict[str, Any] = {}
+    for language, plan in plans.items():
+        payload = {
+            **plan["content"],
+            "content_status": ContentStatus.APPROVED,
+            "review_required": False,
+            "generation_method": generation_method,
+            "approved_at": now,
+            "updated_at": now,
+            "review_notes": (
+                f"Replaced via REPLACE_APPROVED ({generation_method}): {repair_reason.strip()} "
+                f"Validated before write; previous version in {audit_path.name} and process_logs "
+                f"({REPLACE_PROCESS_NAME})."
+            ),
+        }
+        rows = (
+            repository.client.table("product_contents").update(payload)
+            .eq("product_content_id", plan["existing"]["product_content_id"])
+            .eq("content_status", ContentStatus.APPROVED)
+            .execute().data or []
+        )
+        if len(rows) != 1:
+            raise RuntimeError(f"{language!r} replacement did not update exactly one APPROVED row.")
+        written[language] = rows[0]
+
+    repository.write_process_log(
+        message=f"Replaced APPROVED content ({', '.join(plans)}) for {product_code}.",
+        process_name=REPLACE_PROCESS_NAME,
+        candidate_id=product.get("candidate_id"),
+        process_step="REPLACE_APPROVED",
+        log_level="INFO",
+        status="REPLACED",
+        error_details={
+            "product_code": product_code,
+            "reason": repair_reason,
+            "generation_method": generation_method,
+            "audit_file": audit_path.name,
+            "previous": previous,
+        },
+    )
+    print(f"REPLACE_RESULT {json.dumps({'product_code': product_code, 'languages': list(plans), 'audit_file': str(audit_path)}, ensure_ascii=False)}")
+    return {"written": written, "audit_file": audit_path}
+
+
 def run_export_package_action(
     repository: SupabaseRepository,
     product_code: str | None,
@@ -2635,6 +2845,18 @@ def main() -> None:
         run_export_package_action(
             repository=repository,
             product_code=args.product_code,
+        )
+        return
+
+    if action == "REPLACE_APPROVED":
+        run_replace_approved_action(
+            repository=repository,
+            product_code=args.product_code,
+            content_file=args.content_file,
+            repair_reason=args.repair_reason,
+            generation_method=args.generation_method,
+            non_interactive=args.non_interactive,
+            confirm_repair=args.confirm_repair,
         )
         return
 
