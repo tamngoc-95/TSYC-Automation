@@ -405,6 +405,18 @@ class TestTranslationWrites:
         assert rows(repository, "de")[0]["content_status"] == "APPROVED"
         assert rows(repository, "vi")[0]["content_status"] == "APPROVED"
 
+    def test_content_file_approval_also_requires_cross_language_consistency(self, tmp_path):
+        """2026-10-08: per-language --content-file APPROVE used to skip the
+        multilingual consistency gate that TRANSLATE applies."""
+        repository = make_repository(vi=make_vi_content())
+        commerce = {**EN_GOOD, "long_description": EN_GOOD["long_description"] + " Order now at a special price."}
+        run(repository, "SAVE", "en", tmp_path, commerce)
+        run(repository, "APPROVE", "en")
+
+        en_row = rows(repository, "en")[0]
+        assert en_row["content_status"] == "REVIEW_REQUIRED"
+        assert "MULTILINGUAL_CONSISTENCY" in en_row["review_notes"]
+
     def test_approve_requires_non_interactive_without_write(self, tmp_path):
         repository = make_repository(vi=make_vi_content())
         run(repository, "SAVE", "en", tmp_path, EN_GOOD)

@@ -163,6 +163,61 @@ def test_translation_that_does_not_complete_stalls_without_retry():
     assert report.result == "STALLED"
 
 
+def _filled_package(tmp_path, *, de: str = "Eine Beschreibung.") -> None:
+    (tmp_path / f"{HIST_CODE}.json").write_text(
+        __import__("json").dumps({
+            "candidate_code": HIST_CODE,
+            "description_en": "A description.", "short_description_en": "A summary.",
+            "description_de": de, "short_description_de": "Eine Zusammenfassung." if de else "",
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_package_file_fallback_dispatches_translate_when_package_is_filled(monkeypatch):
+    monkeypatch.setattr(run_batch, "filled_package_available", lambda code: True)
+    calls: list[list[str]] = []
+    run_batch.process_one_candidate(
+        HIST_CODE, _args("package-file"), _ready_repository(),
+        lambda argv: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""),
+        lambda _p: True, None,
+    )
+    translate_argv = calls[0]
+    assert translate_argv[translate_argv.index("--action") + 1] == "TRANSLATE"
+    assert translate_argv[translate_argv.index("--translation-provider") + 1] == "package-file"
+
+
+def test_package_file_fallback_without_a_filled_package_stops_without_any_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_batch, "filled_package_available", lambda code: False)
+    calls: list[list[str]] = []
+    report = run_batch.process_one_candidate(
+        HIST_CODE, _args("package-file"), _ready_repository(),
+        lambda argv: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""),
+        lambda _p: True, None,
+    )
+    assert calls == []
+    assert report.result == run_batch.MULTILINGUAL_CONTENT_REQUIRED
+
+
+def test_filled_package_requires_both_languages(tmp_path):
+    _filled_package(tmp_path)
+    assert run_batch.filled_package_available(HIST_CODE, tmp_path) is True
+    _filled_package(tmp_path, de="")
+    assert run_batch.filled_package_available(HIST_CODE, tmp_path) is False
+    assert run_batch.filled_package_available("FB-HIST-MISSING", tmp_path) is False
+
+
+def test_package_file_fallback_never_retries_a_declined_translation(monkeypatch):
+    monkeypatch.setattr(run_batch, "filled_package_available", lambda code: True)
+    calls: list[list[str]] = []
+    run_batch.process_one_candidate(
+        HIST_CODE, _args("package-file"), _ready_repository(_translation("de", "REVIEW_REQUIRED")),
+        lambda argv: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""),
+        lambda _p: True, None,
+    )
+    assert calls == []
+
+
 def test_run_batch_cli_accepts_translation_provider_flag():
     args = run_batch.parse_arguments(["--candidate-code", HIST_CODE, "--max-candidates", "1",
                                       "--translation-provider", "claude"])

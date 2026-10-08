@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -471,14 +472,17 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
 
     parser.add_argument(
         "--translation-provider",
-        choices=(TRANSLATION_PROVIDER_NONE, TRANSLATION_PROVIDER_CLAUDE),
+        choices=TRANSLATION_PROVIDERS,
         default=TRANSLATION_PROVIDER_NONE,
         help=(
             "EN/DE localization for READY_FOR_DRAFT candidates whose "
             "multilingual content is missing. 'claude' dispatches "
             "prepare_product_content.py --action TRANSLATE --translation-"
-            "provider claude (requires ANTHROPIC_API_KEY; every result is "
-            "still validated before approval). Default 'none': stop with "
+            "provider claude (requires ANTHROPIC_API_KEY). 'package-file' "
+            "dispatches the same TRANSLATE path reading a Claude Code-"
+            "filled content package (no API call), only for candidates "
+            "whose package has en and de filled. Every result is validated "
+            "before approval. Default 'none': stop with "
             "MULTILINGUAL_CONTENT_REQUIRED, exactly as before."
         ),
     )
@@ -676,26 +680,79 @@ MULTILINGUAL_CONTENT_REQUIRED = "MULTILINGUAL_CONTENT_REQUIRED"
 
 TRANSLATION_PROVIDER_NONE = "none"
 TRANSLATION_PROVIDER_CLAUDE = "claude"
-
-# Existing EN/DE generation path: APPROVED vi -> provider -> cross-language
-# consistency -> translation save -> deterministic translation APPROVE
-# (prepare_product_content.py --action TRANSLATE). Opt-in per run.
-TRANSLATE_DISPATCH = DispatchEntry(
-    script="prepare_product_content.py",
-    build_args=lambda state: [
-        "--product-code",
-        state.product_code,
-        "--action",
-        "TRANSLATE",
-        "--translation-provider",
-        TRANSLATION_PROVIDER_CLAUDE,
-        "--non-interactive",
-    ],
-    description=(
-        "Localize the APPROVED Vietnamese content to EN and DE and validate "
-        "it (cross-language consistency + translation approval rules)."
-    ),
+# Claude Code fallback (no API call): the controller fills the exported
+# content package (prepare_product_content.py --action EXPORT_PACKAGE,
+# then en/de fields), and TRANSLATE reads it via PackageFileTranslation
+# Provider -- same consistency check, save and approval path as "claude".
+TRANSLATION_PROVIDER_PACKAGE_FILE = "package-file"
+TRANSLATION_PROVIDERS = (
+    TRANSLATION_PROVIDER_NONE,
+    TRANSLATION_PROVIDER_CLAUDE,
+    TRANSLATION_PROVIDER_PACKAGE_FILE,
 )
+
+
+def build_translate_dispatch(provider: str) -> DispatchEntry:
+    """Existing EN/DE generation path: APPROVED vi -> provider -> cross-
+    language consistency -> translation save -> deterministic translation
+    APPROVE (prepare_product_content.py --action TRANSLATE). Opt-in."""
+    return DispatchEntry(
+        script="prepare_product_content.py",
+        build_args=lambda state: [
+            "--product-code",
+            state.product_code,
+            "--action",
+            "TRANSLATE",
+            "--translation-provider",
+            provider,
+            "--non-interactive",
+        ],
+        description=(
+            "Localize the APPROVED Vietnamese content to EN and DE and "
+            f"validate it ({provider}; cross-language consistency + "
+            "translation approval rules)."
+        ),
+    )
+
+
+TRANSLATE_DISPATCH = build_translate_dispatch(TRANSLATION_PROVIDER_CLAUDE)
+
+
+def filled_package_available(
+    candidate_code: str,
+    directory: Path | None = None,
+) -> bool:
+    """True when a content package for this candidate exists with non-empty
+    en AND de descriptions. Only a precondition for dispatch -- the
+    TRANSLATE action itself re-checks staleness against the current
+    APPROVED vi row and validates everything before any approval."""
+    from src.services.translation_provider import DEFAULT_PACKAGE_DIR, package_file_path
+
+    try:
+        path = package_file_path(candidate_code, Path(directory or DEFAULT_PACKAGE_DIR))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return isinstance(payload, dict) and all(
+        str(payload.get(f"description_{language}") or "").strip()
+        and str(payload.get(f"short_description_{language}") or "").strip()
+        for language in ("en", "de")
+    )
+
+
+def translation_dispatch_for(
+    provider: str,
+    state: CandidateState,
+) -> DispatchEntry | None:
+    """The TRANSLATE dispatch for this run's provider, or None when it
+    cannot run for this candidate (no provider, or no filled package)."""
+    if provider == TRANSLATION_PROVIDER_CLAUDE:
+        return TRANSLATE_DISPATCH
+    if provider == TRANSLATION_PROVIDER_PACKAGE_FILE and filled_package_available(
+        state.candidate_code
+    ):
+        return build_translate_dispatch(TRANSLATION_PROVIDER_PACKAGE_FILE)
+    return None
 
 _TRANSLATION_STOP_STATUSES = {"REVIEW_REQUIRED", "REJECTED"}
 
@@ -835,14 +892,18 @@ def process_one_candidate(
         multilingual_missing_before = multilingual_content_missing(state, bundle)
 
         if multilingual_missing_before:
-            if (
-                getattr(args, "translation_provider", TRANSLATION_PROVIDER_NONE)
-                == TRANSLATION_PROVIDER_CLAUDE
-                and not translation_needs_review(bundle)
-            ):
+            translate_dispatch = (
+                None
+                if translation_needs_review(bundle)
+                else translation_dispatch_for(
+                    getattr(args, "translation_provider", TRANSLATION_PROVIDER_NONE),
+                    state,
+                )
+            )
+            if translate_dispatch is not None:
                 kind = "invoke"
-                dispatch = TRANSLATE_DISPATCH
-                description = TRANSLATE_DISPATCH.description
+                dispatch = translate_dispatch
+                description = translate_dispatch.description
             else:
                 kind = "multilingual_content_required"
                 dispatch = None

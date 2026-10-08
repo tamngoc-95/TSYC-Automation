@@ -14,7 +14,7 @@ from create_internal_product import is_historical_candidate_code
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.content_package import ContentPackage, build_content_package
 from src.domain.content_status import ContentStatus
-from src.domain.decisions import Outcome
+from src.domain.decisions import DecisionResult, Outcome
 from src.domain.rules import (
     content_rules,
     identity_rules,
@@ -2175,6 +2175,25 @@ def approve_translation(
     )
     provenance = build_translation_provenance(vi_content, product)
     provenance_note = "provenance=" + json.dumps(provenance, ensure_ascii=False)
+
+    # The same cross-language consistency gate the TRANSLATE path applies
+    # (numbers carried over, names preserved, no commerce wording, single
+    # language). Without it, a --content-file translation could be
+    # approved on the per-language rules alone (2026-10-08 finding).
+    consistency = multilingual_consistency.evaluate_multilingual_consistency(
+        vi={field: vi_content.get(field) for field in ("product_name", "short_description", "long_description")},
+        translations={language: translation},
+        verified_facts=translation_rules.verified_fact_values(product),
+    )
+    if decision.is_auto_pass and not consistency.language_passed(language):
+        language_failures = "; ".join(
+            failure for failure in consistency.failures if failure.startswith(f"[{language}]")
+        )
+        decision = DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=multilingual_consistency.RULE_CODE,
+            reason=f"Cross-language consistency failed: {language_failures}",
+        )
 
     if decision.is_auto_pass:
         status = ContentStatus.APPROVED
