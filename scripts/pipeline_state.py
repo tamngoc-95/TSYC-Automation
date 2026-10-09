@@ -40,6 +40,7 @@ from prepare_product_content import (  # noqa: E402
     is_generic_safe_draft,
 )
 from src.domain import woo_remote_lifecycle
+from src.domain.candidate_origin import is_fahasa_discovery_candidate_code
 from src.domain.content_status import InternalProductContentStatus
 from src.domain.decisions import DecisionResult, Outcome
 from src.domain.identity_status import IdentityStatus, MatchDecision
@@ -722,6 +723,26 @@ def _historical_reference_image_fallback_hint(bundle: dict[str, Any]) -> str | N
     )
 
 
+def _fahasa_cover_reference(
+    candidate: dict[str, Any],
+    references: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """This candidate's MATCH FAHASA reference with a cover image URL, or
+    None (the precondition for an automatic owner-authorized cover
+    download -- CLAUDE.md 14.8)."""
+    return next(
+        (
+            reference
+            for reference in references
+            if reference.get("source_type") == "FAHASA"
+            and reference.get("match_decision") == MatchDecision.MATCH
+            and str(reference.get("candidate_id")) == str(candidate.get("candidate_id"))
+            and reference.get("reference_image_url")
+        ),
+        None,
+    )
+
+
 def _derive_image_content_state(
     bundle: dict[str, Any],
 ) -> CandidateState:
@@ -865,6 +886,22 @@ def _derive_image_content_state(
                     candidate_id=candidate_id,
                     product_code=product_code,
                     derived_state="IMAGE_INGEST_PENDING_HISTORICAL",
+                    warnings=warnings,
+                )
+
+            if is_fahasa_discovery_candidate_code(candidate_code) and _fahasa_cover_reference(
+                candidate, bundle["references"]
+            ):
+                # Owner-authorized Fahasa covers (CLAUDE.md 14.8): a Fahasa-
+                # discovered candidate's image IS its MATCH Fahasa page's
+                # cover. Downloading/registering it is bounded and non-
+                # judgmental (safe defaults: PENDING / RIGHTS_UNKNOWN); the
+                # authorization and quality gates run at approval below.
+                return CandidateState(
+                    candidate_code=candidate_code,
+                    candidate_id=candidate_id,
+                    product_code=product_code,
+                    derived_state="IMAGE_DOWNLOAD_PENDING_FAHASA_COVER",
                     warnings=warnings,
                 )
 
@@ -1015,6 +1052,64 @@ def _derive_image_content_state(
             )
         )
 
+        fahasa_cover_failure: str | None = None
+
+        if not has_publishable_rights and not is_historical:
+            # Owner-authorized Fahasa covers (CLAUDE.md 14.8), live
+            # candidates: each image is checked against its own linked
+            # reference by image_rules.evaluate_fahasa_cover_authorization
+            # (provenance, identity/volume, quality, visual-review gates).
+            # Only images that pass every gate are approved; anything else
+            # stays isolated at RIGHTS_REVIEW_REQUIRED with the reason.
+            reference_by_id = {
+                str(reference["reference_id"]): reference
+                for reference in bundle["references"]
+                if reference.get("reference_id")
+            }
+            fahasa_eligible: list[tuple[dict[str, Any], str]] = []
+            fahasa_failures: list[str] = []
+
+            for image in images:
+                if image.get("source_type") != "FAHASA":
+                    continue
+                decision = image_rules.evaluate_fahasa_cover_authorization(
+                    image,
+                    reference_by_id.get(str(image.get("reference_id") or "")),
+                    candidate,
+                )
+                if decision.outcome == Outcome.AUTO_PASS:
+                    fahasa_eligible.append((image, decision.evidence["rights_status"]))
+                else:
+                    fahasa_failures.append(decision.reason)
+
+            if fahasa_eligible:
+                primary_decision = image_rules.select_primary_candidate_image(
+                    fahasa_eligible
+                )
+
+                return CandidateState(
+                    candidate_code=candidate_code,
+                    candidate_id=candidate_id,
+                    product_code=product_code,
+                    derived_state="IMAGE_APPROVAL_PENDING_FAHASA_COVER",
+                    auto_main_image_id=str(
+                        primary_decision.evidence["primary_image_id"]
+                    ),
+                    auto_rights_status=primary_decision.evidence[
+                        "primary_rights_status"
+                    ],
+                    auto_gallery_images=tuple(
+                        (str(image_id), rights_status)
+                        for image_id, rights_status in primary_decision.evidence[
+                            "gallery"
+                        ]
+                    ),
+                    warnings=warnings,
+                )
+
+            if fahasa_failures:
+                fahasa_cover_failure = " ".join(fahasa_failures)
+
         if not has_publishable_rights:
             if is_historical:
                 fallback_decision = (
@@ -1046,6 +1141,9 @@ def _derive_image_content_state(
 
             if historical_fallback_hint:
                 reason += f" {historical_fallback_hint}"
+
+            if fahasa_cover_failure:
+                reason += f" {fahasa_cover_failure}"
 
             return CandidateState(
                 candidate_code=candidate_code,

@@ -728,6 +728,28 @@ def determine_extension(
     return ".bin"
 
 
+def measure_image_dimensions(
+    content: bytes,
+) -> dict[str, int]:
+    """
+    {width_pixels, height_pixels} of the downloaded image, or {} when the
+    bytes cannot be decoded. Recorded so image-quality gates (e.g.
+    image_rules.evaluate_fahasa_cover_authorization's minimum edge) decide
+    on persisted evidence; an unmeasurable image simply fails those gates.
+    """
+    import io
+
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            width, height = image.size
+    except (UnidentifiedImageError, OSError, ValueError):
+        return {}
+
+    return {"width_pixels": int(width), "height_pixels": int(height)}
+
+
 def calculate_sha256(
     content: bytes,
 ) -> str:
@@ -1377,6 +1399,7 @@ def attempt_download_for_reference(
         file_size_bytes=len(content),
         image_hash=image_hash,
     )
+    payload.update(measure_image_dimensions(content))
 
     try:
         inserted = insert_product_image(

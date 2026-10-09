@@ -246,6 +246,55 @@ AUTOMATABLE_DISPATCH: dict[str, DispatchEntry] = {
             "Facebook-export image for this historical candidate."
         ),
     ),
+    # Owner-authorized Fahasa covers (CLAUDE.md 14.8). pipeline_state.py
+    # reaches the download state only for a FAHASA- candidate with a MATCH
+    # Fahasa reference carrying a cover URL; download_bookstore_product_
+    # image.py re-resolves the MATCH reference itself and registers the
+    # image with safe defaults (PENDING / RIGHTS_UNKNOWN).
+    "IMAGE_DOWNLOAD_PENDING_FAHASA_COVER": DispatchEntry(
+        script="download_bookstore_product_image.py",
+        build_args=lambda state: [
+            "--candidate-code",
+            state.candidate_code,
+            "--non-interactive",
+            "--confirm-download",
+        ],
+        description=(
+            "Download and register the cover image of this candidate's "
+            "MATCH Fahasa reference page."
+        ),
+    ),
+    # The approval state is reached only after image_rules.
+    # evaluate_fahasa_cover_authorization() passed every provenance,
+    # identity, quality and visual-review gate for the selected image.
+    "IMAGE_APPROVAL_PENDING_FAHASA_COVER": DispatchEntry(
+        script="review_product_images.py",
+        build_args=lambda state: [
+            "--candidate-code",
+            state.candidate_code,
+            "--non-interactive",
+            "--approve",
+            "--confirm-approve",
+            "--main-image-id",
+            state.auto_main_image_id,
+            "--rights-status",
+            state.auto_rights_status,
+            *[
+                arg
+                for image_id, rights_status in state.auto_gallery_images
+                for arg in (
+                    "--gallery-image-id",
+                    image_id,
+                    "--gallery-rights-status",
+                    rights_status,
+                )
+            ],
+        ],
+        description=(
+            "Validate and approve the owner-authorized Fahasa cover "
+            "(CLAUDE.md 14.8) as the main image at SUPPLIER_APPROVED."
+        ),
+    ),
     "INTERNAL_PRODUCT_CREATED": DispatchEntry(
         script="prepare_product_content.py",
         build_args=lambda state: [

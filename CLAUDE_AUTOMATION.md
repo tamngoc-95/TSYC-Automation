@@ -268,6 +268,17 @@ STORE_OWNED → allowed
 PUBLISHER_APPROVED → allowed
 SUPPLIER_APPROVED → allowed
 unknown/unconfigured → human review
+Owner-authorized Fahasa covers (CLAUDE.md 14.8, adopted 2026-10-09):
+applies to historical, Fahasa-discovered (FAHASA-) and live candidates
+only the cover of the candidate's own MATCH Fahasa product page
+→ SUPPLIER_APPROVED automatically, no per-image owner approval
+gates (image_rules.evaluate_fahasa_cover_authorization): FAHASA provenance + MATCH reference of this candidate, same volume/sellable unit, stored, >= 400 px edges, no persisted price-label / misleading-transformation / wrong-book visual verdict
+failing cover → RIGHTS_REVIEW_REQUIRED (isolate, continue); never edited automatically
+never applies to other Fahasa images, other sites, or other uses
+Fahasa-discovered candidates (FAHASA-<batch>-CAN-NNNN):
+created only from NEW_CONFIRMED discoveries re-checked against a fresh unified identity index (scripts/import_fahasa_candidates.py)
+live pipeline: IDENTITY_VERIFIED required; WooCommerce drafts need bounded owner authorization (--allow-woo-draft)
+supply status PREORDER_PENDING_SUPPLY_CONFIRMATION in source_evidence; no price ever recorded
 Rights approval does not prove product relevance.
 Both are required:
 rights acceptable

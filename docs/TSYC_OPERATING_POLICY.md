@@ -43,6 +43,13 @@ Public reference sites are never purchase-price sources.
   - SUPPLIER_AUTHORIZED
   - LICENSED
 - RIGHTS_UNKNOWN and DO_NOT_USE are not publishable.
+- Owner-authorized Fahasa covers (2026-10-09): TSYC may use Fahasa book-cover
+  images on its own WooCommerce listings, pre-order listings included. Only the
+  cover of the candidate's own MATCH Fahasa product page qualifies, after the
+  provenance, same-book/volume, quality (>= 400 px) and visual-review gates in
+  `image_rules.evaluate_fahasa_cover_authorization`; it is then SUPPLIER_APPROVED
+  without per-image owner approval. Never other Fahasa images, other sites, or
+  other uses; failing covers are isolated for review, never edited.
 
 ## WooCommerce policy
 - Create drafts only.

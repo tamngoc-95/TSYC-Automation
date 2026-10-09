@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from src.domain.decisions import DecisionResult, Outcome
 from src.domain.identity_status import MatchDecision
@@ -39,11 +40,14 @@ from src.domain.reference_sources import REFERENCE_SOURCE_PRIORITY
 from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES, RightsStatus
 from src.domain.rules.identity_rules import (
     calculate_similarity,
+    is_multi_volume_listing,
     looks_like_valid_isbn,
     normalize_isbn,
     normalize_text,
     publishers_conflict,
     reference_business_conflict_reason,
+    sellable_unit_conflicts,
+    volume_numbers,
 )
 
 # --- rule codes ----------------------------------------------------
@@ -657,6 +661,151 @@ def select_primary_candidate_image(
                 (image.get("image_id"), rights_status)
                 for image, rights_status in gallery
             ),
+        },
+    )
+
+
+# --- owner-authorized Fahasa book covers (CLAUDE.md 14.8) -----------------
+#
+# Explicit shop-owner business authorization, 2026-10-09: TSYC may use
+# Fahasa book-cover images on its own WooCommerce website for product
+# listings (pre-order listings included). Scope is exactly that: the cover
+# image of the Fahasa product page that IS this candidate's MATCH identity
+# reference, used on the shop's own Woo drafts. It never covers other
+# Fahasa images, other sites, or any other use, and it never replaces the
+# relevance/quality checks below.
+IMAGE_FAHASA_COVER_AUTHORIZED = "IMAGE_FAHASA_COVER_AUTHORIZED"
+IMAGE_FAHASA_COVER_NOT_ELIGIBLE = "IMAGE_FAHASA_COVER_NOT_ELIGIBLE"
+
+FAHASA_COVER_AUTHORIZATION = MappingProxyType(
+    {
+        "policy": "OWNER_AUTHORIZED_FAHASA_COVER",
+        "adopted": "2026-10-09",
+        "granted_by": "TSYC shop owner",
+        "scope": "Fahasa book-cover images on TSYC's own WooCommerce product listings, including pre-order listings",
+        "rights_status": RightsStatus.SUPPLIER_APPROVED,
+    }
+)
+# Below this edge length a cover is not a usable storefront image.
+FAHASA_COVER_MIN_EDGE_PIXELS = 400
+_FAHASA_PAGE_HOSTS = ("www.fahasa.com", "fahasa.com")
+_FAHASA_IMAGE_HOST_SUFFIX = ".fahasa.com"
+_UNUSABLE_IMAGE_STATUSES = frozenset({ImageStatus.REJECTED, ImageStatus.FAILED})
+
+
+def _host(url: str | None) -> str:
+    return (urlsplit(str(url or "")).hostname or "").lower()
+
+
+def _path(url: str | None) -> str:
+    """Asset path only: the same Fahasa file is served from cdn0/cdn1
+    hosts and with or without cache-busting query strings."""
+    return urlsplit(str(url or "")).path
+
+
+def _fahasa_cover_review(candidate: Mapping[str, Any], image_url: str | None) -> Mapping[str, Any] | None:
+    """The persisted visual review of exactly this cover URL, if any
+    (product_candidates.source_evidence.fahasa_cover_review)."""
+    review = (candidate.get("source_evidence") or {}).get("fahasa_cover_review")
+    if isinstance(review, Mapping) and image_url and _path(review.get("image_url")) == _path(image_url):
+        return review
+    return None
+
+
+def evaluate_fahasa_cover_authorization(
+    image: Mapping[str, Any],
+    reference: Mapping[str, Any] | None,
+    candidate: Mapping[str, Any],
+) -> DecisionResult:
+    """
+    AUTO_PASS (rights_status SUPPLIER_APPROVED, with the authorization
+    provenance in evidence) only when every gate holds:
+
+      provenance  image.source_type == FAHASA, linked (reference_id) to a
+                  FAHASA product_reference of THIS candidate with
+                  match_decision == MATCH, page on fahasa.com, asset on the
+                  Fahasa CDN, image URL == the reference's own cover URL
+      identity    reference title/volume agree with the candidate (same
+                  volume numbers; no combo-vs-single sellable-unit gap)
+      quality     not REJECTED/FAILED, stored (storage_path), both pixel
+                  dimensions recorded and >= FAHASA_COVER_MIN_EDGE_PIXELS
+      label       no persisted visual review saying a retailer price
+                  label or a misleading transformation is visible
+
+    Anything else is REVIEW_REQUIRED with the failing gates named -- the
+    image is isolated, never silently approved. Pure; no I/O.
+    """
+    failures: list[str] = []
+    reference = reference or {}
+    candidate_title = candidate.get("verified_title") or candidate.get("extracted_title")
+
+    if image.get("source_type") != "FAHASA":
+        failures.append("image source_type is not FAHASA")
+    if not reference or str(image.get("reference_id") or "") != str(reference.get("reference_id") or ""):
+        failures.append("image is not linked to the evaluated reference")
+    if reference.get("source_type") != "FAHASA":
+        failures.append("reference source_type is not FAHASA")
+    if str(reference.get("candidate_id") or "") != str(candidate.get("candidate_id") or ""):
+        failures.append("reference belongs to another candidate")
+    if reference.get("match_decision") != MatchDecision.MATCH:
+        failures.append("reference is not this candidate's MATCH identity reference")
+    if _host(reference.get("source_url")) not in _FAHASA_PAGE_HOSTS:
+        failures.append("reference page is not on fahasa.com")
+    if not _host(image.get("source_url")).endswith(_FAHASA_IMAGE_HOST_SUFFIX):
+        failures.append("image asset is not served by Fahasa")
+    if reference.get("reference_image_url") and _path(image.get("source_url")) != _path(reference.get("reference_image_url")):
+        failures.append("image is not the reference page's own cover image")
+
+    if volume_numbers(candidate_title) != volume_numbers(reference.get("reference_title")):
+        failures.append("series volume differs between candidate and reference")
+    if sellable_unit_conflicts(candidate.get("candidate_type"), reference.get("reference_title")) or (
+        candidate.get("candidate_type") == "SINGLE_BOOK" and is_multi_volume_listing(reference.get("reference_title"))
+    ):
+        failures.append("sellable unit differs between candidate and reference")
+
+    if image.get("image_status") in _UNUSABLE_IMAGE_STATUSES:
+        failures.append(f"image_status is {image.get('image_status')}")
+    if not image.get("storage_path"):
+        failures.append("image is not stored")
+    width, height = image.get("width_pixels"), image.get("height_pixels")
+    if not width or not height:
+        failures.append("image dimensions were not recorded")
+    elif min(int(width), int(height)) < FAHASA_COVER_MIN_EDGE_PIXELS:
+        failures.append(f"image is too small ({width}x{height})")
+
+    review = _fahasa_cover_review(candidate, image.get("source_url"))
+    if review and review.get("price_label_visible") is True:
+        failures.append("visual review found a retailer price label")
+    if review and review.get("misleading_transformation") is True:
+        failures.append("visual review found a misleading image transformation")
+    if review and review.get("depicts_candidate") is False:
+        failures.append("visual review found the image does not depict this book")
+
+    evidence = {
+        "image_id": image.get("image_id"),
+        "reference_id": reference.get("reference_id"),
+        "image_source_url": image.get("source_url"),
+        "reference_page_url": reference.get("source_url"),
+        "visual_review": dict(review) if review else None,
+    }
+    if failures:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=IMAGE_FAHASA_COVER_NOT_ELIGIBLE,
+            reason="Fahasa cover is not eligible under the owner authorization: " + "; ".join(failures) + ".",
+            evidence={**evidence, "failures": failures},
+        )
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=IMAGE_FAHASA_COVER_AUTHORIZED,
+        reason=(
+            "Cover image of this candidate's own MATCH Fahasa reference page; "
+            "authorized by the shop owner for TSYC's own Woo listings (2026-10-09)."
+        ),
+        evidence={
+            **evidence,
+            "rights_status": FAHASA_COVER_AUTHORIZATION["rights_status"],
+            "authorization": dict(FAHASA_COVER_AUTHORIZATION),
         },
     )
 
