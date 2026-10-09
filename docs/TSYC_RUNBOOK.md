@@ -91,6 +91,25 @@ WooCommerce products are always created `status = draft`, with no
 entry are shop-owner decisions made later, outside this automation, and are
 never performed by any script in this repository.
 
+## 11. Fahasa new-book discovery (read-only)
+```
+.venv/Scripts/python.exe scripts/discover_fahasa_new_books.py --max-listings 30
+.venv/Scripts/python.exe scripts/discover_fahasa_new_books.py --max-listings 30 --reclassify data/output/fahasa_discovery/<report>.json
+```
+Reads one newest-first Fahasa listing (default: children's books), parses
+each product page with the shared Fahasa parser, and classifies every book
+against the unified identity index (all Woo statuses incl. trash, Woo sync
+records incl. owner-removed products, internal products, candidates, MATCH
+references, the Facebook history export): `NEW_CONFIRMED`,
+`EXISTING_PRODUCT`, `POSSIBLE_DUPLICATE`, `DISTINCT_EDITION`,
+`FACEBOOK_COVERAGE_UNKNOWN`, `REMOTE_REMOVED`. A new volume of a series the
+shop already sells is `POSSIBLE_DUPLICATE` (sellable-unit decision).
+Writes only `data/output/fahasa_discovery/discovery_<UTC>.json` and the
+first-seen ledger; never Supabase, Woo, images or prices. Fahasa images are
+recorded `RIGHTS_UNKNOWN` (the 14.7 auto-authorization is FB-HIST only).
+`--reclassify` re-applies the current rules to an earlier report without
+contacting Fahasa. A live run takes ~20 s per book; run it in the background.
+
 ## Git discipline
 `git status`, `git diff --check`, review the exact diff, run relevant tests
 before every commit.
