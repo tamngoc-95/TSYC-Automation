@@ -279,6 +279,19 @@ Fahasa-discovered candidates (FAHASA-<batch>-CAN-NNNN):
 created only from NEW_CONFIRMED discoveries re-checked against a fresh unified identity index (scripts/import_fahasa_candidates.py)
 live pipeline: IDENTITY_VERIFIED required; WooCommerce drafts need bounded owner authorization (--allow-woo-draft)
 supply status PREORDER_PENDING_SUPPLY_CONFIRMATION in source_evidence; no price ever recorded
+Fahasa pre-order inventory (owner request 2026-10-16, src/domain/rules/preorder_inventory_rules.py):
+only for a FAHASA- candidate still PREORDER_PENDING_SUPPLY_CONFIRMATION
+new drafts: manage_stock=true, stock_quantity=0, backorders="yes"; stock_status never sent (WooCommerce derives "onbackorder")
+existing drafts: scripts/apply_preorder_inventory.py (exact --product-code, --max-products, dry run unless --confirm-update) writes only those three fields, re-reads and verifies, never retries an uncertain PUT
+never written: published/trashed/pending/private products, priced drafts, owner-changed inventory, products without the _tsyc_internal_product_id meta
+no price, no publish, no delivery date or availability promise; an unpriced product is not purchasable, so checkout stays closed
+no pre-order plugin is installed (checked 2026-10-16)
+Fahasa supplementary images (gallery, previews, sample spreads), 2026-10-16:
+recorded with provenance and role in product_references.raw_metadata.page_images (image_rules.classify_fahasa_page_images)
+OTHER_PRODUCT (configurable-item swatch = another volume's cover) → BLOCKED; Fahasa series galleries are mostly these
+SUPPLEMENTARY → REVIEW_REQUIRED: the 2026-10-09 authorization covers the cover only; never registered as publishable or put in a Woo gallery automatically
+Woo galleries curated by the owner are never replaced (content/inventory updates never send images)
+Author presentation (owner request 2026-10-16): the author is the WooCommerce "Tác giả" attribute (src/domain/rules/woo_presentation.py), never a metadata line/sentence in VI/EN/DE descriptions (storefront_text AUTHOR_METADATA); new content must also pass content_rules.evaluate_description_quality
 Rights approval does not prove product relevance.
 Both are required:
 rights acceptable

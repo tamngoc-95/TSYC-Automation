@@ -60,7 +60,7 @@ Nguyên tắc ổn định, được minh chứng rõ trong hội thoại:
 
 Cấu trúc lặp lại nhất quán qua ~25 ví dụ trong hội thoại (hướng dẫn cho mọi loại sách trừ khi ghi chú khác ở mục 9):
 
-1. **Tiêu đề dòng đầu:** `Tên sách (tên gốc nếu có) – Tác giả`
+1. ~~Tiêu đề dòng đầu: `Tên sách – Tác giả`~~ — **bỏ** (quyết định của chủ tiệm 2026-10-16, xem mục 7a). Mô tả bắt đầu thẳng bằng đoạn mở.
 2. **Đoạn mở:** giới thiệu tác phẩm, tác giả, vị trí trong sự nghiệp/series/giải thưởng, dịch giả, lần tái bản (nếu có).
 3. **Đoạn nội dung:** tóm tắt cốt truyện hoặc nội dung chính.
 4. **Đoạn điểm nổi bật:** phong cách viết, chủ đề tư tưởng, điều làm tác phẩm khác biệt.
@@ -71,6 +71,24 @@ Cấu trúc lặp lại nhất quán qua ~25 ví dụ trong hội thoại (hư�
 - Ưu tiên mạch văn tự nhiên và dễ đọc hơn là đủ số đoạn.
 - Mô tả ngắn hơn là chấp nhận được khi nguồn thông tin xác thực hạn chế (VD ví dụ đã duyệt `examples/dung-dinh-trang-di.md` chỉ có 3 đoạn).
 - Không được thêm chi tiết bịa đặt để kéo dài cho đủ độ dài/số đoạn mục tiêu.
+
+## 7a. Author Presentation & Description Quality (owner decision 2026-10-16)
+
+**Tác giả chỉ xuất hiện một lần dưới dạng dữ liệu.** Tác giả được lưu trong `internal_products.author` / `product_details` và hiển thị trên WooCommerce dưới dạng thuộc tính sản phẩm **"Tác giả"** (tab "Thông tin bổ sung"). Các thông tin xác thực khác (NXB, số trang, kích thước...) cũng là thuộc tính. Vì vậy mô tả (VI/EN/DE) **không** chứa:
+- dòng nhãn `Tác giả: X` / `Author: X` / `Autor(in): X`;
+- câu mẫu chỉ nhắc lại tác giả: *"Tác giả của ấn phẩm là X."*, *"The author of this book is X."*, *"Dieses Buch stammt von X."*;
+- dòng tiêu đề `Tên sách – Tác giả`, mục "Thông tin sản phẩm" lặp lại tác giả/NXB/ISBN.
+
+**Được giữ:** nhắc tên tác giả tự nhiên trong đoạn mở (*"… là tác phẩm kinh điển của nhà văn X"*) và thông tin tác giả có giá trị biên tập đã xác thực (giải thưởng, bối cảnh sáng tác). Không lặp tên tác giả quá nhiều trong một mô tả.
+
+**Mô tả tốt** (cổng tự động `content_rules.evaluate_description_quality`, áp dụng khi duyệt):
+- đoạn mở mạnh dựa trên thông tin đã xác thực, rồi nội dung/câu chuyện/chủ đề cụ thể, rồi trải nghiệm người đọc; chia đoạn rõ (mô tả dài ≥ 700 ký tự không để thành một khối);
+- tối đa một câu kết kiểu "phù hợp cho…"; không chồng nhiều cụm bán hàng ("tuyệt vời", "hấp dẫn", "vô cùng", "món quà ý nghĩa"…);
+- không dùng siêu ngữ không kiểm chứng ("hay nhất mọi thời đại", "bán chạy nhất", "bestseller") trừ khi nguồn xác thực nói vậy;
+- không đưa độ tuổi khuyến nghị ("từ 6 tuổi trở lên", "ages 4–8", "ab 3 Jahren") nếu nguồn xác thực không nêu;
+- không chép nguyên văn mô tả của nhà bán lẻ (Fahasa…): đọc nguồn làm dữ kiện rồi viết lại bằng lời của Tiệm (từ 40 từ liên tiếp trùng nguồn trở lên bị chặn, trừ chính sách FB-HIST draft-safe).
+
+Các vi phạm được báo cho người vận hành (REVIEW_REQUIRED kèm mã lỗi), không bao giờ tự sửa bằng cách bịa thêm nội dung.
 
 ## 8. Short Description Structure
 
@@ -151,7 +169,8 @@ Tra và giữ tên chính thức đã xuất bản ở ngôn ngữ đích.
 ## 15. Quality Checklist
 
 **CONTENT**
-- [ ] Đoạn mở nêu tác giả + bối cảnh tác phẩm?
+- [ ] Không có dòng/câu tác giả dạng siêu dữ liệu ("Tác giả: X", "Tác giả của ấn phẩm là X.") — tác giả là thuộc tính (mục 7a)?
+- [ ] Đoạn mở nêu tác giả (một cách tự nhiên) + bối cảnh tác phẩm?
 - [ ] Có tóm tắt nội dung/cốt truyện rõ ràng?
 - [ ] Có đoạn nêu điểm nổi bật/phong cách?
 - [ ] Có đoạn kết nêu giá trị + đối tượng đọc?
