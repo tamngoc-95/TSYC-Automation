@@ -177,5 +177,7 @@ def test_excerpt_only_repair_uses_verified_title_line_for_summary():
     }
     plan = ppc.plan_storefront_repair(existing, {"title": "Thương Nhớ Mười Hai", "author": "Vũ Bằng"}, {}, [])
     assert plan["outcome"] == ppc.REPAIR_OUTCOME_REPAIRABLE
-    assert plan["content"]["short_description"] == "“Thương Nhớ Mười Hai” – Vũ Bằng."
+    # The title line no longer appends "– Author" (2026-10-16: the author is
+    # the "Tác giả" attribute, never metadata-style text in a summary).
+    assert plan["content"]["short_description"] == "“Thương Nhớ Mười Hai”."
     assert plan["content"]["long_description"] == EXCERPT  # nothing invented to replace it

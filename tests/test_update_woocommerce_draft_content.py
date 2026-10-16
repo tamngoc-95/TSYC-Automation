@@ -73,7 +73,7 @@ def patched_local(monkeypatch):
         }
 
     monkeypatch.setattr(uwd, "load_local_target", fake_load)
-    monkeypatch.setattr(uwd, "build_update_payload", lambda content: dict(NEW))
+    monkeypatch.setattr(uwd, "build_update_payload", lambda content, product=None: dict(NEW))
 
 
 @pytest.mark.parametrize(

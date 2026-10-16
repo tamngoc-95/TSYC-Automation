@@ -810,6 +810,101 @@ def evaluate_fahasa_cover_authorization(
     )
 
 
+# --- Fahasa supplementary images (gallery / previews), 2026-10-16 -------
+#
+# A Fahasa product page shows more than its cover: a gallery swiper and,
+# for a series, the "configurable item" swatches -- which are the COVERS OF
+# OTHER VOLUMES (read live 2026-10-16 on "Tủ Sách Vàng Cho Con - Khu Vườn Bí
+# Mật": all 16 gallery images were sibling titles such as Hoàng Tử Bé and
+# Bạch Tuyết, none an interior page). So a gallery image is not evidence of
+# THIS product, and the owner authorization (FAHASA_COVER_AUTHORIZATION)
+# covers the cover only. Every non-cover image is therefore recorded with
+# its provenance and isolated for an owner decision -- never registered as
+# publishable, never placed in the Woo gallery automatically.
+FAHASA_IMAGE_ROLE_COVER = "COVER"
+FAHASA_IMAGE_ROLE_OTHER_PRODUCT = "OTHER_PRODUCT"
+FAHASA_IMAGE_ROLE_SUPPLEMENTARY = "SUPPLEMENTARY"
+IMAGE_FAHASA_SUPPLEMENTARY_NOT_AUTHORIZED = "IMAGE_FAHASA_SUPPLEMENTARY_NOT_AUTHORIZED"
+IMAGE_FAHASA_OTHER_PRODUCT = "IMAGE_FAHASA_OTHER_PRODUCT"
+_FAHASA_PRODUCT_ASSET_PREFIX = "/media/catalog/product/"
+
+
+def classify_fahasa_page_images(
+    cover_url: str | None,
+    gallery_urls: Sequence[str | None],
+    other_product_urls: Sequence[str | None] = (),
+) -> list[dict[str, Any]]:
+    """
+    One entry per distinct Fahasa product asset (deduplicated by asset path:
+    the same file is served from cdn0/cdn1, with or without a query), in
+    page order, cover first:
+      COVER          the page's own cover (reference_image_url)
+      OTHER_PRODUCT  a configurable-item swatch = another product's cover
+      SUPPLEMENTARY  any other product asset in the page gallery (a
+                     possible interior preview / sample spread -- unproven)
+    Non-product assets (logos, banners) and non-Fahasa hosts are dropped.
+    """
+    cover_path = _path(cover_url)
+    other_paths = {_path(url) for url in other_product_urls if url}
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for url in [cover_url, *gallery_urls]:
+        if not url:
+            continue
+        path = _path(url)
+        if (
+            not path.startswith(_FAHASA_PRODUCT_ASSET_PREFIX)
+            or not _host(url).endswith(_FAHASA_IMAGE_HOST_SUFFIX)
+            or path in seen
+        ):
+            continue
+        seen.add(path)
+        if path == cover_path:
+            role = FAHASA_IMAGE_ROLE_COVER
+        elif path in other_paths:
+            role = FAHASA_IMAGE_ROLE_OTHER_PRODUCT
+        else:
+            role = FAHASA_IMAGE_ROLE_SUPPLEMENTARY
+        entries.append({"url": url, "asset_path": path, "role": role})
+    return entries
+
+
+def evaluate_fahasa_supplementary_image(entry: Mapping[str, Any]) -> DecisionResult:
+    """
+    Rights/relevance decision for one non-cover Fahasa page image:
+      OTHER_PRODUCT -> BLOCKED (it depicts another book; never usable)
+      SUPPLEMENTARY -> REVIEW_REQUIRED (not covered by the 2026-10-09 cover
+                       authorization, and nothing proves it shows THIS
+                       edition) -- an owner decision, never auto-approved
+    The cover itself is decided by evaluate_fahasa_cover_authorization on
+    the stored image, not here.
+    """
+    evidence = {"url": entry.get("url"), "asset_path": entry.get("asset_path"), "role": entry.get("role")}
+    if entry.get("role") == FAHASA_IMAGE_ROLE_OTHER_PRODUCT:
+        return DecisionResult(
+            outcome=Outcome.BLOCKED,
+            rule_code=IMAGE_FAHASA_OTHER_PRODUCT,
+            reason="Fahasa configurable-item image is another product's cover, not this candidate.",
+            evidence=evidence,
+        )
+    if entry.get("role") == FAHASA_IMAGE_ROLE_COVER:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=IMAGE_FAHASA_COVER_NOT_ELIGIBLE,
+            reason="The cover is decided by evaluate_fahasa_cover_authorization on the stored image.",
+            evidence=evidence,
+        )
+    return DecisionResult(
+        outcome=Outcome.REVIEW_REQUIRED,
+        rule_code=IMAGE_FAHASA_SUPPLEMENTARY_NOT_AUTHORIZED,
+        reason=(
+            "Supplementary Fahasa image (gallery/preview): the owner authorization of 2026-10-09 covers "
+            "the book cover only, and its depiction of this exact edition is unproven -- owner decision required."
+        ),
+        evidence=evidence,
+    )
+
+
 # --- product-match check ------------------------------------------------
 
 

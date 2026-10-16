@@ -20,7 +20,7 @@ from src.cli_bootstrap import configure_utf8_console
 from src.domain.content_status import ContentStatus, InternalProductContentStatus
 from src.domain.image_status import ImageStatus, InternalProductImageStatus
 from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
-from src.domain.rules import content_rules
+from src.domain.rules import content_rules, preorder_inventory_rules, storefront_text, woo_presentation
 from src.domain.woocommerce_status import WooCommerceStatus, WooCommerceSyncStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
@@ -28,7 +28,7 @@ configure_utf8_console()
 
 
 CREATOR_NAME = "woocommerce_draft_creator"
-CREATOR_VERSION = "1.3.0"
+CREATOR_VERSION = "1.4.0"
 
 VALID_CONFIRMATIONS = {
     "UPLOAD_AND_CREATE",
@@ -535,6 +535,26 @@ def assert_uploaded_image_set_matches_current(
         )
 
 
+def get_candidate_origin(
+    repository: SupabaseRepository,
+    candidate_id: str,
+) -> dict[str, Any] | None:
+    """candidate_code + source_evidence of the product's candidate (the
+    pre-order inventory policy is decided from these, never inferred)."""
+    rows = (
+        repository.client
+        .table("product_candidates")
+        .select("candidate_id,candidate_code,source_evidence")
+        .eq("candidate_id", candidate_id)
+        .limit(2)
+        .execute()
+        .data
+        or []
+    )
+
+    return rows[0] if len(rows) == 1 else None
+
+
 def get_existing_sync(
     repository: SupabaseRepository,
     internal_product_id: str,
@@ -593,7 +613,17 @@ def text_to_html_paragraphs(
 def build_description(
     content: dict[str, Any],
 ) -> str:
-    """Build the WooCommerce long description."""
+    """
+    Build the WooCommerce long description: the prose only.
+
+    The author is never repeated here (2026-10-16 owner request): it is
+    the "Tác giả" attribute (woo_presentation.build_attributes). A
+    metadata-only author_summary ("Tác giả của ấn phẩm là X.") is
+    therefore not rendered; a substantive author note (verified editorial
+    context) still is. Verified details become attributes too; only a
+    details value that is not a plain "Label: value" list stays here, as a
+    list without its author line.
+    """
     sections: list[str] = []
 
     long_description = text_to_html_paragraphs(
@@ -608,24 +638,17 @@ def build_description(
         or ""
     ).strip()
 
-    if author_summary:
+    if author_summary and not storefront_text.is_metadata_only_author_summary(author_summary):
         sections.append(
             "<h3>Tác giả</h3>"
             f"<p>{html.escape(author_summary)}</p>"
         )
 
-    product_details = (
+    detail_lines = woo_presentation.description_detail_lines(
         content.get("product_details")
-        or ""
-    ).strip()
+    )
 
-    if product_details:
-        detail_lines = [
-            line.strip()
-            for line in product_details.splitlines()
-            if line.strip()
-        ]
-
+    if detail_lines:
         detail_items = "".join(
             f"<li>{html.escape(line)}</li>"
             for line in detail_lines
@@ -1546,8 +1569,16 @@ def build_woocommerce_payload(
     product: dict[str, Any],
     content: dict[str, Any],
     uploaded_media: list[dict[str, Any]],
+    preorder: bool = False,
 ) -> dict[str, Any]:
-    """Build the WooCommerce product draft payload."""
+    """
+    Build the WooCommerce product draft payload.
+
+    preorder=True (a TSYC Fahasa pre-order product, preorder_inventory_
+    rules.is_fahasa_preorder_candidate) sends managed stock 0 with
+    backorders "yes" instead of manage_stock=false; stock_status is left
+    to WooCommerce ("onbackorder"). Never a price, never "publish".
+    """
     image_payload = [
         {
             "id": int(
@@ -1577,6 +1608,10 @@ def build_woocommerce_payload(
         "manage_stock": False,
         "catalog_visibility": "visible",
         "images": image_payload,
+        "attributes": woo_presentation.build_attributes(
+            product,
+            content,
+        ),
         "meta_data": [
             {
                 "key": "_tsyc_internal_product_id",
@@ -1610,6 +1645,17 @@ def build_woocommerce_payload(
             },
         ],
     }
+
+    if preorder:
+        payload.update(
+            preorder_inventory_rules.build_inventory_payload()
+        )
+
+    if "stock_status" in payload:
+        raise RuntimeError(
+            "Safety guard failed: stock_status is derived by WooCommerce "
+            "and must never be sent."
+        )
 
     if payload.get("status") != "draft":
         raise RuntimeError(
@@ -2428,6 +2474,12 @@ def main() -> None:
             product=product,
             content=content,
             uploaded_media=uploaded_media,
+            preorder=preorder_inventory_rules.is_fahasa_preorder_candidate(
+                get_candidate_origin(
+                    repository=repository,
+                    candidate_id=product["candidate_id"],
+                )
+            ),
         )
 
         save_request_payload(

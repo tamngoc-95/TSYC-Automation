@@ -295,6 +295,194 @@ def evaluate_description_substance(content: Mapping[str, Any]) -> DecisionResult
     )
 
 
+# --- storefront description quality (2026-10-16 owner request) -------------
+#
+# TSYC_CONTENT_GUIDE.md sections 3/7/11/14: a description is the shop's own
+# informative prose about the book -- not a copy of a retailer page, not a
+# string of sales phrases, not an age recommendation the sources never made,
+# and not the author's name repeated as metadata. Detection only: nothing
+# here rewrites text (a fix is a REVISE decision from verified facts).
+CONTENT_DESCRIPTION_QUALITY = "CONTENT_DESCRIPTION_QUALITY"
+
+QUALITY_AUTHOR_REPETITION = "AUTHOR_REPETITION"
+QUALITY_SALES_LANGUAGE = "REPETITIVE_SALES_LANGUAGE"
+QUALITY_EXAGGERATED_CLAIM = "EXAGGERATED_CLAIM"
+QUALITY_UNVERIFIED_AGE = "UNVERIFIED_AGE_RECOMMENDATION"
+QUALITY_VERBATIM_COPY = "VERBATIM_SOURCE_COPY"
+QUALITY_WALL_OF_TEXT = "WALL_OF_TEXT"
+
+# The structured author's name more often than this in one long
+# description reads as metadata repetition, not narrative. Calibrated on
+# the 345 stored rows (2026-10-16): 4-5 mentions occur in legitimate
+# author-centred descriptions; retailer blurbs repeat the name 6-24 times.
+MAX_AUTHOR_MENTIONS_IN_DESCRIPTION = 5
+# Generic sales/closing phrases: more than this many in one description is
+# repetitive sales language (one closing "phù hợp cho ..." is the guide's
+# own recommended ending, section 13).
+MAX_SALES_PHRASES = 3
+# This many consecutive words shared with a source description is copying,
+# not a summary written from verified facts.
+MAX_VERBATIM_RUN_WORDS = 40
+# A long description at least this long must be split into paragraphs.
+SINGLE_PARAGRAPH_MAX_LENGTH = 700
+
+_SALES_PHRASE_RE = re.compile(
+    r"\b(?:phù hợp (?:cho|với)|món quà (?:ý nghĩa|tuyệt vời)|tuyệt vời|hấp dẫn|đáng đọc|cực kỳ|vô cùng|"
+    r"perfect (?:for|gift)|must[- ]have|wonderful|amazing|great choice|ideal for|"
+    r"perfekt für|ideal für|wunderbar|ein muss)\b",
+    re.IGNORECASE,
+)
+# Unverifiable superlatives: never storefront prose unless a source says so.
+_EXAGGERATION_RE = re.compile(
+    r"\b(?:hay nhất mọi thời đại|tuyệt vời nhất|số một thế giới|bán chạy nhất|"
+    r"best(?:-selling)? (?:book|story) ever|of all time|bestsell(?:er|ing)|"
+    r"beste[sn]? (?:buch|aller zeiten)|meistverkauft\w*)\b",
+    re.IGNORECASE,
+)
+# An age recommendation: "0-6 tuổi", "từ 3 tuổi", "3+", "ages 4-8",
+# "4 years and up", "ab 3 Jahren", "3 bis 6 Jahre".
+_AGE_EXPRESSION_RE = re.compile(
+    r"(?:\b\d{1,2}\s*(?:[-–]|đến|tới|to|bis)\s*\d{1,2}\s*(?:tuổi|years?|jahren?|j\.)"
+    r"|\b(?:từ|trên|dưới)\s*\d{1,2}\s*tuổi"
+    r"|\b\d{1,2}\s*tuổi\s*(?:trở lên|trở xuống)"
+    r"|\bages?\s*\d{1,2}(?:\s*[-–+]\s*\d{0,2})?"
+    r"|\b\d{1,2}\s*(?:years?|jahren?)\s*(?:and up|or older|und älter)"
+    r"|\bab\s*\d{1,2}\s*jahren?"
+    r"|\b\d{1,2}\+)",
+    re.IGNORECASE,
+)
+_WORD_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _age_number_sets(text: str) -> list[frozenset[str]]:
+    return [frozenset(re.findall(r"\d{1,2}", match.group(0))) for match in _AGE_EXPRESSION_RE.finditer(text)]
+
+
+def _longest_common_word_run(first: str, second: str) -> int:
+    """Length of the longest run of consecutive words (case-insensitive)
+    shared by both texts. O(n*m) over words -- descriptions are short."""
+    a = [word.lower() for word in _WORD_TOKEN_RE.findall(first)]
+    b = [word.lower() for word in _WORD_TOKEN_RE.findall(second)]
+    if not a or not b:
+        return 0
+    best = 0
+    previous = [0] * (len(b) + 1)
+    for word in a:
+        current = [0] * (len(b) + 1)
+        for index, other in enumerate(b, start=1):
+            if word == other:
+                current[index] = previous[index - 1] + 1
+                if current[index] > best:
+                    best = current[index]
+        previous = current
+    return best
+
+
+def find_description_quality_issues(
+    content: Mapping[str, Any],
+    product: Mapping[str, Any] | None = None,
+    source_texts: Sequence[str | None] | None = None,
+    enforce_originality: bool = False,
+) -> dict[str, str]:
+    """
+    {issue code: detail} for one content row (any language).
+
+    source_texts are the verified factual inputs (reference descriptions,
+    product metadata). When None the source-dependent checks (age, copy,
+    superlative evidence) are skipped -- unknown is not evidence either
+    way; an empty list means "no source", so any age claim is unverified.
+    enforce_originality turns on the verbatim-copy check (live pipeline;
+    the FB-HIST draft-safe policy deliberately reuses a normalized
+    reference description, CLAUDE.md 6.2).
+    """
+    issues: dict[str, str] = {}
+    long_description = str(content.get("long_description") or "")
+    short_description = str(content.get("short_description") or "")
+    product_name = str(content.get("product_name") or (product or {}).get("title") or "")
+    # The product's own title may contain "Hay Nhất", "Tuyệt Vời", "3+".
+    prose = f"{short_description}\n\n{long_description}"
+    if product_name.strip():
+        prose = re.sub(re.escape(product_name.strip()), " ", prose, flags=re.IGNORECASE)
+    title = str((product or {}).get("title") or "").strip()
+    if title:
+        prose = re.sub(re.escape(title), " ", prose, flags=re.IGNORECASE)
+
+    names = author_rules.split_person_names((product or {}).get("author"))
+    for name in names:
+        mentions = len(re.findall(re.escape(name), long_description, flags=re.IGNORECASE))
+        if mentions > MAX_AUTHOR_MENTIONS_IN_DESCRIPTION:
+            issues[QUALITY_AUTHOR_REPETITION] = (
+                f"author {name!r} is named {mentions} times in long_description "
+                f"(maximum {MAX_AUTHOR_MENTIONS_IN_DESCRIPTION})"
+            )
+            break
+
+    sales = [match.group(0).lower() for match in _SALES_PHRASE_RE.finditer(prose)]
+    if len(sales) > MAX_SALES_PHRASES:
+        issues[QUALITY_SALES_LANGUAGE] = f"{len(sales)} sales phrases ({', '.join(sorted(set(sales)))})"
+
+    sources = [str(text) for text in (source_texts or []) if text]
+    source_blob = "\n".join(sources)
+
+    exaggerations = [match.group(0) for match in _EXAGGERATION_RE.finditer(prose)]
+    unsupported = [
+        phrase for phrase in exaggerations
+        if source_texts is None or phrase.lower() not in source_blob.lower()
+    ]
+    if unsupported:
+        issues[QUALITY_EXAGGERATED_CLAIM] = "unverifiable superlative: " + ", ".join(sorted(set(unsupported)))
+
+    if source_texts is not None:
+        source_ages = _age_number_sets(source_blob + "\n" + title + "\n" + product_name)
+        for numbers in _age_number_sets(prose):
+            if not any(numbers <= verified for verified in source_ages):
+                issues[QUALITY_UNVERIFIED_AGE] = (
+                    f"age recommendation {sorted(numbers)} is not stated by any verified source"
+                )
+                break
+
+    if enforce_originality and sources:
+        longest = max(_longest_common_word_run(long_description, source) for source in sources)
+        if longest >= MAX_VERBATIM_RUN_WORDS:
+            issues[QUALITY_VERBATIM_COPY] = (
+                f"long_description copies {longest} consecutive words from a source description "
+                f"(maximum {MAX_VERBATIM_RUN_WORDS - 1})"
+            )
+
+    paragraphs = [p for p in storefront_text.normalize_paragraphs(long_description).split("\n\n") if p]
+    if len(paragraphs) == 1 and len(paragraphs[0]) >= SINGLE_PARAGRAPH_MAX_LENGTH:
+        issues[QUALITY_WALL_OF_TEXT] = (
+            f"long_description is one {len(paragraphs[0])}-character paragraph "
+            f"(split at {SINGLE_PARAGRAPH_MAX_LENGTH}+)"
+        )
+
+    return issues
+
+
+def evaluate_description_quality(
+    content: Mapping[str, Any],
+    product: Mapping[str, Any] | None = None,
+    source_texts: Sequence[str | None] | None = None,
+    enforce_originality: bool = False,
+) -> DecisionResult:
+    """REVIEW_REQUIRED when find_description_quality_issues finds any
+    issue; the codes name the exact REVISE target."""
+    issues = find_description_quality_issues(content, product, source_texts, enforce_originality)
+    if issues:
+        return DecisionResult(
+            outcome=Outcome.REVIEW_REQUIRED,
+            rule_code=CONTENT_DESCRIPTION_QUALITY,
+            reason="Description quality: " + "; ".join(f"{code}: {detail}" for code, detail in sorted(issues.items())),
+            evidence={"issues": issues},
+        )
+    return DecisionResult(
+        outcome=Outcome.AUTO_PASS,
+        rule_code=CONTENT_DESCRIPTION_QUALITY,
+        reason="Description is natural storefront prose (no copy, hype, unverified age or author repetition).",
+        evidence={"issues": {}},
+    )
+
+
 def evaluate_unsupported_claims(
     claimed_facts: Mapping[str, Any],
     verifiable_facts: Mapping[str, Any],

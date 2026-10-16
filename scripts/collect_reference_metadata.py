@@ -26,7 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.cli_bootstrap import configure_utf8_console
 from src.domain.reference_sources import REFERENCE_SOURCE_PRIORITY, SourceType
-from src.domain.rules import author_rules, identity_rules, storefront_text
+from src.domain.rules import author_rules, identity_rules, image_rules, storefront_text
 from src.repositories.supabase_repository import SupabaseRepository
 
 configure_utf8_console()
@@ -1277,6 +1277,36 @@ def extract_weight_grams(
     return int(value)
 
 
+_FAHASA_GALLERY_IMAGE_SELECTOR = "img.include-in-gallery, img.swiper-lazy, .product-view-image img"
+_FAHASA_OTHER_PRODUCT_IMAGE_SELECTOR = "img.image-configurable-item"
+
+
+def _image_sources(page: Page, selector: str) -> list[str]:
+    try:
+        values = page.eval_on_selector_all(
+            selector,
+            "els => els.map(e => e.getAttribute('data-src') || e.currentSrc || e.src || '')",
+        )
+    except Exception:  # page chrome varies; no images is a valid answer
+        return []
+    return [str(value) for value in values if value]
+
+
+def extract_fahasa_page_images(
+    page: Page,
+    cover_url: str | None,
+) -> list[dict[str, Any]]:
+    """Every distinct product image on a Fahasa page with its role (cover /
+    another product's swatch / unproven supplementary), for provenance.
+    Recording is not approval: image_rules.evaluate_fahasa_supplementary_
+    image isolates every non-cover image for an owner decision."""
+    return image_rules.classify_fahasa_page_images(
+        cover_url,
+        _image_sources(page, _FAHASA_GALLERY_IMAGE_SELECTOR),
+        _image_sources(page, _FAHASA_OTHER_PRODUCT_IMAGE_SELECTOR),
+    )
+
+
 def parse_fahasa_metadata(
     page: Page,
     body_text: str,
@@ -1346,6 +1376,10 @@ def parse_fahasa_metadata(
             "Fahasa is used only as a metadata, image, dimensions, "
             "weight, and cover-price reference source."
         ),
+        # Provenance only (2026-10-16): gallery/preview images are not
+        # covered by the owner's cover authorization and are never used
+        # automatically.
+        "page_images": extract_fahasa_page_images(page, image_url),
     }
 
     return {

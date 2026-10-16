@@ -417,11 +417,11 @@ def build_safe_draft(product: dict[str, Any]) -> dict[str, Any]:
         "số trang, kích thước và các dữ liệu hiện có."
     )
 
-    author_summary = (
-        f"Tác giả của ấn phẩm là {author}."
-        if author
-        else None
-    )
+    # No generated author_summary: "Tác giả của ấn phẩm là X." only
+    # restated internal_products.author, which reaches WooCommerce as the
+    # "Tác giả" attribute (2026-10-16 owner request -- no duplicated
+    # author metadata in descriptions).
+    author_summary = None
 
     seo_title = f"{title} – {author}" if author else title
     seo_description = (
@@ -508,11 +508,15 @@ def is_generic_safe_draft(
 
     Generic safe drafts are useful for SAVE/PREVIEW but must never be approved
     automatically because they contain no verified thematic book description.
+
+    author_summary is deliberately not compared: older drafts carry the
+    retired generated "Tác giả của ấn phẩm là X." while build_safe_draft no
+    longer generates one, and the descriptive fields alone decide whether
+    the draft is still untouched (ignoring it can only widen detection).
     """
     fields = (
         "short_description",
         "long_description",
-        "author_summary",
         "seo_description",
     )
 
@@ -528,6 +532,7 @@ def validate_approval_content(
     content: dict[str, Any],
     generated: dict[str, Any],
     product: dict[str, Any] | None = None,
+    description_quality: dict[str, Any] | None = None,
 ) -> None:
     """
     Reject approval when content validation does not pass.
@@ -581,6 +586,61 @@ def validate_approval_content(
         substance = content_rules.evaluate_description_substance(content)
         if not substance.is_auto_pass:
             raise RuntimeError(f"[{substance.rule_code}] {substance.reason}")
+
+        # Natural storefront prose: no retailer copy, sales-phrase
+        # stacking, unverifiable superlatives/age claims or repeated
+        # author naming (2026-10-16). Only for new text being approved
+        # (description_quality_inputs); REPAIR passes None.
+        if description_quality is not None:
+            quality = content_rules.evaluate_description_quality(
+                content,
+                product,
+                source_texts=description_quality.get("source_texts"),
+                enforce_originality=bool(description_quality.get("enforce_originality")),
+            )
+            if not quality.is_auto_pass:
+                raise RuntimeError(f"[{quality.rule_code}] {quality.reason}")
+
+
+_QUALITY_SOURCE_MATCH_DECISIONS = frozenset({"MATCH", "POSSIBLE_MATCH", "MANUAL_REVIEW"})
+
+
+def description_quality_inputs(
+    repository: SupabaseRepository,
+    product: dict[str, Any],
+) -> dict[str, Any]:
+    """The verified factual inputs a new description is checked against:
+    the candidate's reference descriptions and its own source post text.
+    Originality (no long verbatim copy) is enforced for every candidate
+    except FB-HIST, whose draft-safe policy reuses a normalized reference
+    description by design (CLAUDE.md 6.2)."""
+    source_texts: list[str] = []
+    candidate_id = product.get("candidate_id")
+    if candidate_id:
+        source_texts.extend(
+            reference.get("reference_description")
+            for reference in get_references_for_candidate(repository, candidate_id)
+            if reference.get("reference_description")
+            and reference.get("match_decision") in _QUALITY_SOURCE_MATCH_DECISIONS
+        )
+        candidates = (
+            repository.client.table("product_candidates")
+            .select("raw_page_id").eq("candidate_id", candidate_id).limit(1).execute().data
+            or []
+        )
+        raw_page_id = candidates[0].get("raw_page_id") if candidates else None
+        if raw_page_id:
+            pages = (
+                repository.client.table("raw_pages")
+                .select("cleaned_text").eq("raw_page_id", raw_page_id).limit(1).execute().data
+                or []
+            )
+            if pages and pages[0].get("cleaned_text"):
+                source_texts.append(pages[0]["cleaned_text"])
+    return {
+        "source_texts": source_texts,
+        "enforce_originality": "FB-HIST-" not in str(product.get("product_code") or ""),
+    }
 
 
 def restore_existing_content(
@@ -814,6 +874,7 @@ def attempt_content_approval(
             content=content,
             generated=generated,
             product=product,
+            description_quality=description_quality_inputs(repository, product),
         )
     except RuntimeError as error:
         if not non_interactive:
@@ -1296,8 +1357,11 @@ def get_references_for_candidate(
 
 
 def _title_sentence(title: str, author: str | None) -> str:
-    """Minimal verified-metadata summary: “Title” – Author. (no prose)."""
-    return f"“{title}”" + (f" – {author}." if author else ".")
+    """Minimal verified-metadata summary: “Title”. (no prose). The author
+    is deliberately not appended: it is the "Tác giả" attribute, and a
+    "Title – Author" summary is metadata-style author repetition."""
+    del author
+    return f"“{title}”."
 
 
 def build_historical_enrichment_content(
@@ -1409,7 +1473,7 @@ def classify_storefront_defects(findings: dict[str, list[str]]) -> str | None:
         groups.add(REPAIR_CATEGORY_TYPOGRAPHY)
     if storefront_text.INVALID_ISBN in codes:
         groups.add(REPAIR_CATEGORY_INVALID_ISBN)
-    if storefront_text.THIRD_PARTY_SECTION in codes:
+    if codes & {storefront_text.THIRD_PARTY_SECTION, storefront_text.AUTHOR_METADATA}:
         groups.add(REPAIR_CATEGORY_STOCK_OR_BOILERPLATE)
 
     return groups.pop() if len(groups) == 1 else REPAIR_CATEGORY_MULTIPLE
@@ -1543,6 +1607,8 @@ def plan_storefront_repair(
         long_description = storefront_text.drop_cross_sell_tail(long_description)
         # A table of contents / praise / press block goes as a unit.
         long_description = storefront_text.drop_third_party_sections(long_description)
+        # A "Tác giả: X" line / author-only template sentence goes whole.
+        long_description = storefront_text.remove_author_metadata(long_description)
         repaired["long_description"] = _clean_prose_field(long_description)
         for field in ("short_description", "seo_description"):
             # A summary that opens with a quoted book passage is rebuilt
@@ -1552,7 +1618,7 @@ def plan_storefront_repair(
                 if storefront_text.starts_with_quoted_excerpt(
                     existing.get(field), titles=[existing.get("product_name"), title]
                 )
-                else _clean_prose_field(existing.get(field))
+                else _clean_prose_field(storefront_text.remove_author_metadata(existing.get(field)))
             )
 
         if not repaired["long_description"]:
@@ -2100,12 +2166,49 @@ def evaluate_translation_for_product(
             candidate_id=product["candidate_id"],
         ).get("candidate_type")
 
-    return translation_rules.evaluate_translation(
+    decision = translation_rules.evaluate_translation(
         language=language,
         translation=translation,
         vi_content=vi_content,
         product=product,
         candidate_type=candidate_type,
+    )
+    return with_translation_presentation_checks(decision, translation, product)
+
+
+def with_translation_presentation_checks(
+    decision: DecisionResult,
+    translation: dict[str, Any],
+    product: dict[str, Any],
+) -> DecisionResult:
+    """
+    Add the language-independent presentation checks to an en/de decision:
+    no metadata-style author line/sentence in the prose fields, and the
+    description-quality gate (sales-phrase stacking, superlatives, author
+    repetition, wall of text). Source-dependent checks (age, copy) are not
+    re-run here -- facts are already bound to the APPROVED vi text by
+    translation_rules and the cross-language consistency gate.
+    """
+    extra: list[str] = []
+    author_lines = {
+        field: storefront_text.find_author_metadata(translation.get(field))
+        for field in storefront_text.PROSE_FIELDS
+    }
+    for field, hits in sorted(author_lines.items()):
+        if hits:
+            extra.append(f"{storefront_text.AUTHOR_METADATA} in {field!r}: {hits[0]!r}.")
+    quality = content_rules.evaluate_description_quality(translation, product)
+    if not quality.is_auto_pass:
+        extra.append(quality.reason)
+    if not extra:
+        return decision
+    failures = tuple((decision.evidence or {}).get("failures") or ()) + tuple(extra)
+    reason = "; ".join(extra) if decision.is_auto_pass else f"{decision.reason}; {'; '.join(extra)}"
+    return DecisionResult(
+        outcome=Outcome.REVIEW_REQUIRED,
+        rule_code=decision.rule_code,
+        reason=reason,
+        evidence={**(decision.evidence or {}), "failures": failures},
     )
 
 
@@ -2637,6 +2740,7 @@ def plan_replace_approved(
             content=plans["vi"]["content"],
             generated=build_safe_draft(product),
             product=product,
+            description_quality=description_quality_inputs(repository, product),
         )
 
     effective_vi = plans["vi"]["content"] if "vi" in plans else existing_rows["vi"]

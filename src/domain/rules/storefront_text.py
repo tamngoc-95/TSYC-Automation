@@ -63,6 +63,15 @@ THIRD_PARTY_SECTION = "THIRD_PARTY_SECTION"
 # is repairable without new text.
 FIRST_PERSON_SOURCE = "FIRST_PERSON_SOURCE"
 THIN_DESCRIPTION = "THIN_DESCRIPTION"
+# Metadata-style author repetition inside prose (2026-10-16 owner
+# request): a labelled "Tác giả: X" / "Author: X" / "Autor: X" line or a
+# template sentence that only restates the author ("Tác giả của ấn phẩm
+# là X."). The author belongs in internal_products.author and the
+# WooCommerce "Tác giả" attribute. Repairable: the line/sentence is
+# dropped whole; a narrative mention ("... của nhà văn X") never matches.
+# Checked on the prose fields only (find_content_defects) --
+# product_details is the structured list the attribute is built from.
+AUTHOR_METADATA = "AUTHOR_METADATA"
 
 ALL_DEFECT_CODES = (
     HTML_ENTITY,
@@ -79,6 +88,7 @@ ALL_DEFECT_CODES = (
     CITATION_MARKER,
     INVALID_ISBN,
     THIRD_PARTY_SECTION,
+    AUTHOR_METADATA,
 )
 
 TYPOGRAPHY_DEFECT_CODES = frozenset({DOUBLED_QUOTE, MALFORMED_PUNCTUATION, CITATION_MARKER})
@@ -260,6 +270,129 @@ def has_third_party_section(text: str | None) -> bool:
         _THIRD_PARTY_HEADING_RE.match(paragraph)
         for paragraph in normalize_paragraphs(text).split("\n\n")
     )
+
+
+# --- metadata-style author repetition (AUTHOR_METADATA) -------------
+
+_AUTHOR_LABEL_LINE_RE = re.compile(
+    r"^\s*(?:tác giả|đồng tác giả|author|authors|autor|autorin|autoren|verfasser|verfasserin)\s*[:：]\s*\S",
+    re.IGNORECASE,
+)
+# A sentence whose only content is "the author is X" (vi/en/de). The name
+# may contain initials ("L. Frank Baum"): a period is part of the name
+# only right after a one-letter token; any other period ends the sentence.
+_AUTHOR_NAME = r"(?:[^.!?\n]|(?<!\w\w)\.){1,120}[.!]?$"
+_AUTHOR_TEMPLATE_SENTENCE_RES = (
+    re.compile(
+        r"^tác giả của (?:ấn phẩm|cuốn sách|quyển sách|sách|bộ sách|tác phẩm)(?: này)? là " + _AUTHOR_NAME,
+        re.IGNORECASE,
+    ),
+    re.compile(r"^the author of (?:this|the) (?:book|publication|title|work) is " + _AUTHOR_NAME, re.IGNORECASE),
+    re.compile(
+        r"^(?:der autor|die autorin) (?:dieses|des) (?:buches|bandes|werkes|werks|titels) ist " + _AUTHOR_NAME,
+        re.IGNORECASE,
+    ),
+    re.compile(r"^dieses buch stammt von " + _AUTHOR_NAME, re.IGNORECASE),
+    re.compile(r"^written by " + _AUTHOR_NAME, re.IGNORECASE),
+)
+_INITIAL_END_RE = re.compile(r"(?:^|\s)\w\.$")
+
+
+def _split_sentences_keep_initials(line: str) -> list[str]:
+    """split_sentences, re-joining a piece that ends on a name initial."""
+    merged: list[str] = []
+    for piece in split_sentences(line):
+        if merged and _INITIAL_END_RE.search(merged[-1]):
+            merged[-1] = f"{merged[-1]} {piece}"
+        else:
+            merged.append(piece)
+    return merged
+
+
+# A bare "Tác giả: <name>" line: the value is a name list, not prose. A
+# labelled line that runs on into prose ("Tác giả: X Câu chuyện kể về...")
+# is still detected, but never removed: where the name ends cannot be
+# decided deterministically, so it goes to human review instead.
+_MAX_BARE_AUTHOR_VALUE_LENGTH = 80
+
+
+def _is_bare_author_label_line(line: str) -> bool:
+    if not _AUTHOR_LABEL_LINE_RE.match(line):
+        return False
+    value = line.split(":", 1)[-1] if ":" in line else line.split("：", 1)[-1]
+    value = value.strip().rstrip(".")
+    return len(value) <= _MAX_BARE_AUTHOR_VALUE_LENGTH and not re.search(r"[.!?…]\s", value)
+
+
+def is_author_metadata_sentence(sentence: str | None) -> bool:
+    """True for a labelled author line or an author-only template sentence."""
+    if not sentence:
+        return False
+    stripped = _normalize_paragraph(str(sentence))
+    if _AUTHOR_LABEL_LINE_RE.match(stripped):
+        return True
+    return any(pattern.match(stripped) for pattern in _AUTHOR_TEMPLATE_SENTENCE_RES)
+
+
+def _is_removable_author_metadata(sentence: str) -> bool:
+    stripped = _normalize_paragraph(sentence)
+    if _AUTHOR_LABEL_LINE_RE.match(stripped):
+        return _is_bare_author_label_line(stripped)
+    return is_author_metadata_sentence(stripped)
+
+
+def _author_metadata_units(text: str) -> list[tuple[str, list[str]]]:
+    """[(line, sentences)] -- a labelled line is one unit, never split."""
+    units = []
+    for line in str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        stripped = _normalize_paragraph(line)
+        if stripped:
+            is_metadata_line = is_author_metadata_sentence(stripped)
+            units.append((stripped, [] if is_metadata_line else _split_sentences_keep_initials(stripped)))
+    return units
+
+
+def find_author_metadata(text: str | None) -> list[str]:
+    """Every author-metadata line/sentence in a prose value."""
+    if not text:
+        return []
+    hits: list[str] = []
+    for line, sentences in _author_metadata_units(text):
+        if not sentences:
+            hits.append(line)
+            continue
+        hits.extend(sentence for sentence in sentences if is_author_metadata_sentence(sentence))
+    return hits
+
+
+def remove_author_metadata(text: str | None) -> str:
+    """Drop removable author-metadata lines/sentences; keep every other
+    sentence verbatim (paragraph breaks preserved). Never edits inside a
+    sentence, so a narrative author mention is always kept, and a labelled
+    line that runs on into prose is kept whole (still a detected defect)."""
+    if not text:
+        return ""
+    paragraphs: list[str] = []
+    for paragraph in str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n\n"):
+        lines: list[str] = []
+        for line, sentences in _author_metadata_units(paragraph):
+            if not sentences:
+                if not _is_removable_author_metadata(line):
+                    lines.append(line)
+                continue
+            kept = [sentence for sentence in sentences if not _is_removable_author_metadata(sentence)]
+            if kept:
+                lines.append(" ".join(kept))
+        if lines:
+            paragraphs.append("\n".join(lines))
+    return "\n\n".join(paragraphs)
+
+
+def is_metadata_only_author_summary(text: str | None) -> bool:
+    """True when every sentence of an author_summary only restates the
+    author (the generated "Tác giả của ấn phẩm là X."): such a summary
+    duplicates the author attribute and is never rendered."""
+    return bool(text and str(text).strip()) and not remove_author_metadata(text).strip()
 
 
 def is_first_person_source(text: str | None) -> bool:
@@ -750,6 +883,8 @@ def find_content_defects(
             defects.add(QUOTED_EXCERPT)
         if field == "long_description" and value and has_third_party_section(str(value)):
             defects.add(THIRD_PARTY_SECTION)
+        if field in PROSE_FIELDS and find_author_metadata(value):  # type: ignore[arg-type]
+            defects.add(AUTHOR_METADATA)
         if defects:
             findings[field] = sorted(defects)
     return findings

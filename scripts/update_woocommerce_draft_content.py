@@ -17,10 +17,13 @@ Bounded follow-up to the FT-BATCH-9-2026-10-01 storefront-content repair
      still be what TSYC originally sent (sync request_payload) or already
      the new content -- a shop-owner edit made in WooCommerce is never
      overwritten
-  4. PUT only {"description", "short_description"}. Never status, never
-     regular_price/sale_price/price, never any other field.
-  5. re-GET and verify: content applied, status unchanged, prices and
-     other manually maintained store fields (PRESERVED_FIELDS) unchanged.
+  4. PUT only {"description", "short_description", "attributes"} (the
+     verified author/details as product attributes, 2026-10-16; protected
+     by the same manual-edit rule). Never status, never regular_price/
+     sale_price/price, never stock or images, never any other field.
+  5. re-GET and verify: content applied, status unchanged, prices, stock,
+     images and other manually maintained store fields (PRESERVED_FIELDS)
+     unchanged.
 
 An uncertain PUT (timeout/connection error) is never retried: the product
 is re-read once to reconcile; if the new content is not provably present
@@ -52,7 +55,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 import create_woocommerce_draft as cwd  # noqa: E402
 from src.cli_bootstrap import configure_utf8_console  # noqa: E402
-from src.domain.rules import storefront_text  # noqa: E402
+from src.domain.rules import storefront_text, woo_presentation  # noqa: E402
 from src.domain.woocommerce_status import WooCommerceStatus  # noqa: E402
 from src.repositories.supabase_repository import SupabaseRepository  # noqa: E402
 
@@ -75,9 +78,26 @@ VERIFY_FAILED = "POST_UPDATE_VERIFICATION_FAILED"
 
 PRICE_FIELDS = ("regular_price", "sale_price", "price")
 UPDATABLE_FIELDS = ("description", "short_description")
+# Sent only when the local product is known (2026-10-16: the verified
+# author/details are the "Tác giả"/... attributes, no longer description
+# text). Protected exactly like the text fields: the remote value must
+# still be what TSYC sent (or already the new value).
+OPTIONAL_UPDATABLE_FIELDS = ("attributes",)
 # Verified unchanged after every PUT (prices plus manually maintained
 # store fields that a description update must never touch).
-PRESERVED_FIELDS = PRICE_FIELDS + ("name", "slug", "stock_status", "stock_quantity", "catalog_visibility")
+PRESERVED_FIELDS = PRICE_FIELDS + (
+    "name", "slug", "stock_status", "stock_quantity", "manage_stock", "backorders", "catalog_visibility",
+)
+
+
+def _field_value(field: str, value: Any) -> Any:
+    if field == "attributes":
+        return woo_presentation.comparable_attributes(value)
+    return comparable_text(value)
+
+
+def _image_ids(product: dict[str, Any]) -> list[Any]:
+    return [image.get("id") for image in product.get("images") or [] if isinstance(image, dict)]
 
 
 def comparable_text(value: str | None) -> str:
@@ -125,30 +145,37 @@ def classify_remote(
         return NOT_DRAFT
 
     if all(
-        comparable_text(remote.get(field)) == comparable_text(new_payload[field])
-        for field in UPDATABLE_FIELDS
+        _field_value(field, remote.get(field)) == _field_value(field, new_payload[field])
+        for field in new_payload
     ):
         return NO_OP
 
-    for field in UPDATABLE_FIELDS:
-        remote_text = comparable_text(remote.get(field))
-        if remote_text in {
-            comparable_text(original_payload.get(field)),
-            comparable_text(new_payload[field]),
-        }:
+    for field in new_payload:
+        remote_value = _field_value(field, remote.get(field))
+        if remote_value in (
+            _field_value(field, original_payload.get(field)),
+            _field_value(field, new_payload[field]),
+        ):
             continue
         return MANUAL_EDIT
 
     return None
 
 
-def build_update_payload(content: dict[str, Any]) -> dict[str, str]:
-    """Exactly the two customer-facing content fields -- nothing else."""
-    payload = {
+def build_update_payload(
+    content: dict[str, Any],
+    product: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The two customer-facing content fields, plus the verified-metadata
+    attributes when the local product is given -- nothing else (never
+    status, price, stock or images)."""
+    payload: dict[str, Any] = {
         "description": cwd.build_description(content),
         "short_description": cwd.build_short_description(content),
     }
-    assert set(payload) == set(UPDATABLE_FIELDS)
+    if product is not None:
+        payload["attributes"] = woo_presentation.build_attributes(product, content)
+    assert set(UPDATABLE_FIELDS) <= set(payload) <= set(UPDATABLE_FIELDS) | set(OPTIONAL_UPDATABLE_FIELDS)
     return payload
 
 
@@ -171,8 +198,10 @@ def verify_after_update(
     for field in PRESERVED_FIELDS:
         if (before.get(field) or "") != (after.get(field) or ""):
             problems.append(f"{field} changed")
-    for field in UPDATABLE_FIELDS:
-        if comparable_text(after.get(field)) != comparable_text(new_payload[field]):
+    if _image_ids(before) != _image_ids(after):
+        problems.append("images changed")
+    for field in new_payload:
+        if _field_value(field, after.get(field)) != _field_value(field, new_payload[field]):
             problems.append(f"{field} not applied")
     return problems
 
@@ -206,9 +235,11 @@ class WooClient:
         response.raise_for_status()
         return response.json()
 
-    def update(self, product_id: int | str, payload: dict[str, str]) -> dict[str, Any]:
-        if set(payload) != set(UPDATABLE_FIELDS):
-            raise RuntimeError(f"Refusing to send fields other than {UPDATABLE_FIELDS}.")
+    def update(self, product_id: int | str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not set(UPDATABLE_FIELDS) <= set(payload) <= set(UPDATABLE_FIELDS) | set(OPTIONAL_UPDATABLE_FIELDS):
+            raise RuntimeError(
+                f"Refusing to send fields other than {UPDATABLE_FIELDS + OPTIONAL_UPDATABLE_FIELDS}."
+            )
         response = requests.put(
             self._url(product_id),
             auth=self.auth,
@@ -223,7 +254,7 @@ class WooClient:
 def load_local_target(repository: SupabaseRepository, product_code: str) -> dict[str, Any]:
     products = (
         repository.client.table("internal_products")
-        .select("internal_product_id, product_code, candidate_id, woocommerce_status")
+        .select("internal_product_id, product_code, candidate_id, woocommerce_status, author")
         .eq("product_code", product_code)
         .execute()
         .data
@@ -275,7 +306,7 @@ def run_update(
     product_id = sync["woocommerce_product_id"]
     sku = str(sync["product_sku"])
     report["woocommerce_product_id"] = product_id
-    new_payload = build_update_payload(local["content"])
+    new_payload = build_update_payload(local["content"], local["product"])
     original_payload = sync.get("request_payload") or {}
 
     allowed = allowed_remote_statuses(allow_published, local["product"].get("woocommerce_status"))
