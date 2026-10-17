@@ -734,7 +734,7 @@ def measure_image_dimensions(
     """
     {width_pixels, height_pixels} of the downloaded image, or {} when the
     bytes cannot be decoded. Recorded so image-quality gates (e.g.
-    image_rules.evaluate_fahasa_cover_authorization's minimum edge) decide
+    image_rules.evaluate_fahasa_image_authorization's minimum edge) decide
     on persisted evidence; an unmeasurable image simply fails those gates.
     """
     import io

@@ -665,24 +665,31 @@ def select_primary_candidate_image(
     )
 
 
-# --- owner-authorized Fahasa book covers (CLAUDE.md 14.8) -----------------
+# --- owner-authorized Fahasa product images (CLAUDE.md 14.8) --------------
 #
-# Explicit shop-owner business authorization, 2026-10-09: TSYC may use
-# Fahasa book-cover images on its own WooCommerce website for product
-# listings (pre-order listings included). Scope is exactly that: the cover
-# image of the Fahasa product page that IS this candidate's MATCH identity
-# reference, used on the shop's own Woo drafts. It never covers other
-# Fahasa images, other sites, or any other use, and it never replaces the
-# relevance/quality checks below.
+# Explicit shop-owner business authorization: covers since 2026-10-09,
+# extended 2026-10-17 to every relevant image of the verified book on its
+# Fahasa product page -- front/back covers, gallery images, interior pages
+# and illustrations, previews/sample pages -- for TSYC's own WooCommerce
+# listings (pre-order listings included). Scope is exactly the images of
+# the Fahasa page that IS this candidate's MATCH identity reference. It
+# never covers another product's images (a series page's configurable-item
+# swatches are other volumes' covers), other sites, or any other use, and
+# it never replaces the relevance/quality checks below.
 IMAGE_FAHASA_COVER_AUTHORIZED = "IMAGE_FAHASA_COVER_AUTHORIZED"
 IMAGE_FAHASA_COVER_NOT_ELIGIBLE = "IMAGE_FAHASA_COVER_NOT_ELIGIBLE"
 
-FAHASA_COVER_AUTHORIZATION = MappingProxyType(
+FAHASA_IMAGE_AUTHORIZATION = MappingProxyType(
     {
-        "policy": "OWNER_AUTHORIZED_FAHASA_COVER",
-        "adopted": "2026-10-09",
+        "policy": "OWNER_AUTHORIZED_FAHASA_PRODUCT_IMAGES",
+        "adopted": "2026-10-17",
+        "cover_policy_adopted": "2026-10-09",
         "granted_by": "TSYC shop owner",
-        "scope": "Fahasa book-cover images on TSYC's own WooCommerce product listings, including pre-order listings",
+        "scope": (
+            "Images of the verified book on its Fahasa product page -- front/back cover, gallery, "
+            "interior pages and illustrations, previews/sample pages -- on TSYC's own WooCommerce "
+            "product listings, including pre-order listings"
+        ),
         "rights_status": RightsStatus.SUPPLIER_APPROVED,
     }
 )
@@ -703,34 +710,61 @@ def _path(url: str | None) -> str:
     return urlsplit(str(url or "")).path
 
 
-def _fahasa_cover_review(candidate: Mapping[str, Any], image_url: str | None) -> Mapping[str, Any] | None:
-    """The persisted visual review of exactly this cover URL, if any
-    (product_candidates.source_evidence.fahasa_cover_review)."""
-    review = (candidate.get("source_evidence") or {}).get("fahasa_cover_review")
-    if isinstance(review, Mapping) and image_url and _path(review.get("image_url")) == _path(image_url):
-        return review
+def _fahasa_image_review(candidate: Mapping[str, Any], image_url: str | None) -> Mapping[str, Any] | None:
+    """The persisted visual review of exactly this image URL, if any:
+    product_candidates.source_evidence.fahasa_cover_review (the cover) or
+    one entry of source_evidence.fahasa_image_reviews (any other image)."""
+    if not image_url:
+        return None
+    source_evidence = candidate.get("source_evidence") or {}
+    reviews = [source_evidence.get("fahasa_cover_review"), *(source_evidence.get("fahasa_image_reviews") or [])]
+    for review in reviews:
+        if isinstance(review, Mapping) and _path(review.get("image_url")) == _path(image_url):
+            return review
     return None
 
 
-def evaluate_fahasa_cover_authorization(
+def _fahasa_image_role(image_url: str | None, reference: Mapping[str, Any]) -> str | None:
+    """COVER for the reference page's own cover (or when the page recorded
+    no cover URL), otherwise the role recorded for this asset in
+    product_references.raw_metadata.page_images; None when the image is not
+    one of the page's recorded images."""
+    cover_url = reference.get("reference_image_url")
+    if not cover_url or _path(image_url) == _path(cover_url):
+        return FAHASA_IMAGE_ROLE_COVER
+    page_images = (reference.get("raw_metadata") or {}).get("page_images") or []
+    for entry in page_images:
+        if isinstance(entry, Mapping) and _path(entry.get("url")) == _path(image_url):
+            return entry.get("role")
+    return None
+
+
+def evaluate_fahasa_image_authorization(
     image: Mapping[str, Any],
     reference: Mapping[str, Any] | None,
     candidate: Mapping[str, Any],
 ) -> DecisionResult:
     """
     AUTO_PASS (rights_status SUPPLIER_APPROVED, with the authorization
-    provenance in evidence) only when every gate holds:
+    provenance and evidence["image_role"]) only when every gate holds:
 
       provenance  image.source_type == FAHASA, linked (reference_id) to a
                   FAHASA product_reference of THIS candidate with
                   match_decision == MATCH, page on fahasa.com, asset on the
-                  Fahasa CDN, image URL == the reference's own cover URL
+                  Fahasa CDN, image == the reference page's own cover or a
+                  SUPPLEMENTARY image recorded in its raw_metadata.
+                  page_images (never an OTHER_PRODUCT swatch)
       identity    reference title/volume agree with the candidate (same
                   volume numbers; no combo-vs-single sellable-unit gap)
       quality     not REJECTED/FAILED, stored (storage_path), both pixel
                   dimensions recorded and >= FAHASA_COVER_MIN_EDGE_PIXELS
       label       no persisted visual review saying a retailer price
                   label or a misleading transformation is visible
+      relevance   a non-cover image additionally needs a persisted visual
+                  review that explicitly confirms it depicts this book and
+                  shows no price label / misleading transformation --
+                  Fahasa galleries often hold other volumes' covers, so a
+                  gallery position alone proves nothing
 
     Anything else is REVIEW_REQUIRED with the failing gates named -- the
     image is isolated, never silently approved. Pure; no I/O.
@@ -753,8 +787,11 @@ def evaluate_fahasa_cover_authorization(
         failures.append("reference page is not on fahasa.com")
     if not _host(image.get("source_url")).endswith(_FAHASA_IMAGE_HOST_SUFFIX):
         failures.append("image asset is not served by Fahasa")
-    if reference.get("reference_image_url") and _path(image.get("source_url")) != _path(reference.get("reference_image_url")):
-        failures.append("image is not the reference page's own cover image")
+    role = _fahasa_image_role(image.get("source_url"), reference) if reference else None
+    if role == FAHASA_IMAGE_ROLE_OTHER_PRODUCT:
+        failures.append("image is another product's cover on the reference page")
+    elif role not in (FAHASA_IMAGE_ROLE_COVER, FAHASA_IMAGE_ROLE_SUPPLEMENTARY):
+        failures.append("image is not one of the reference page's own recorded images")
 
     if volume_numbers(candidate_title) != volume_numbers(reference.get("reference_title")):
         failures.append("series volume differs between candidate and reference")
@@ -773,39 +810,48 @@ def evaluate_fahasa_cover_authorization(
     elif min(int(width), int(height)) < FAHASA_COVER_MIN_EDGE_PIXELS:
         failures.append(f"image is too small ({width}x{height})")
 
-    review = _fahasa_cover_review(candidate, image.get("source_url"))
+    review = _fahasa_image_review(candidate, image.get("source_url"))
     if review and review.get("price_label_visible") is True:
         failures.append("visual review found a retailer price label")
     if review and review.get("misleading_transformation") is True:
         failures.append("visual review found a misleading image transformation")
     if review and review.get("depicts_candidate") is False:
         failures.append("visual review found the image does not depict this book")
+    if role == FAHASA_IMAGE_ROLE_SUPPLEMENTARY and not (
+        review
+        and review.get("depicts_candidate") is True
+        and review.get("price_label_visible") is False
+        and review.get("misleading_transformation") is False
+    ):
+        failures.append("no visual review confirms this non-cover image depicts this book without a price label")
 
     evidence = {
         "image_id": image.get("image_id"),
         "reference_id": reference.get("reference_id"),
         "image_source_url": image.get("source_url"),
         "reference_page_url": reference.get("source_url"),
+        "image_role": role,
         "visual_review": dict(review) if review else None,
     }
     if failures:
         return DecisionResult(
             outcome=Outcome.REVIEW_REQUIRED,
             rule_code=IMAGE_FAHASA_COVER_NOT_ELIGIBLE,
-            reason="Fahasa cover is not eligible under the owner authorization: " + "; ".join(failures) + ".",
+            reason="Fahasa image is not eligible under the owner authorization: " + "; ".join(failures) + ".",
             evidence={**evidence, "failures": failures},
         )
+    described = "Cover image" if role == FAHASA_IMAGE_ROLE_COVER else "Visually confirmed gallery/preview image"
     return DecisionResult(
         outcome=Outcome.AUTO_PASS,
         rule_code=IMAGE_FAHASA_COVER_AUTHORIZED,
         reason=(
-            "Cover image of this candidate's own MATCH Fahasa reference page; "
-            "authorized by the shop owner for TSYC's own Woo listings (2026-10-09)."
+            f"{described} of this candidate's own MATCH Fahasa reference page; authorized by "
+            "the shop owner for TSYC's own Woo listings (CLAUDE.md 14.8)."
         ),
         evidence={
             **evidence,
-            "rights_status": FAHASA_COVER_AUTHORIZATION["rights_status"],
-            "authorization": dict(FAHASA_COVER_AUTHORIZATION),
+            "rights_status": FAHASA_IMAGE_AUTHORIZATION["rights_status"],
+            "authorization": dict(FAHASA_IMAGE_AUTHORIZATION),
         },
     )
 
@@ -816,11 +862,12 @@ def evaluate_fahasa_cover_authorization(
 # for a series, the "configurable item" swatches -- which are the COVERS OF
 # OTHER VOLUMES (read live 2026-10-16 on "Tủ Sách Vàng Cho Con - Khu Vườn Bí
 # Mật": all 16 gallery images were sibling titles such as Hoàng Tử Bé and
-# Bạch Tuyết, none an interior page). So a gallery image is not evidence of
-# THIS product, and the owner authorization (FAHASA_COVER_AUTHORIZATION)
-# covers the cover only. Every non-cover image is therefore recorded with
-# its provenance and isolated for an owner decision -- never registered as
-# publishable, never placed in the Woo gallery automatically.
+# Bạch Tuyết, none an interior page). So a gallery position is not evidence
+# of THIS product. Since 2026-10-17 the owner authorization
+# (FAHASA_IMAGE_AUTHORIZATION, CLAUDE.md 14.8) covers the rights of every
+# image of the verified book, but relevance must still be proven: a
+# SUPPLEMENTARY image is usable only once stored and confirmed by a visual
+# review (evaluate_fahasa_image_authorization); OTHER_PRODUCT never is.
 FAHASA_IMAGE_ROLE_COVER = "COVER"
 FAHASA_IMAGE_ROLE_OTHER_PRODUCT = "OTHER_PRODUCT"
 FAHASA_IMAGE_ROLE_SUPPLEMENTARY = "SUPPLEMENTARY"
@@ -871,12 +918,14 @@ def classify_fahasa_page_images(
 
 def evaluate_fahasa_supplementary_image(entry: Mapping[str, Any]) -> DecisionResult:
     """
-    Rights/relevance decision for one non-cover Fahasa page image:
+    Page-level decision for one recorded, not-yet-stored Fahasa page image:
       OTHER_PRODUCT -> BLOCKED (it depicts another book; never usable)
-      SUPPLEMENTARY -> REVIEW_REQUIRED (not covered by the 2026-10-09 cover
-                       authorization, and nothing proves it shows THIS
-                       edition) -- an owner decision, never auto-approved
-    The cover itself is decided by evaluate_fahasa_cover_authorization on
+      SUPPLEMENTARY -> REVIEW_REQUIRED (rights are owner-authorized by
+                       CLAUDE.md 14.8, but nothing yet proves it shows THIS
+                       edition: it must be stored and visually confirmed;
+                       evaluate_fahasa_image_authorization then decides it
+                       without a per-image owner approval)
+    The cover itself is decided by evaluate_fahasa_image_authorization on
     the stored image, not here.
     """
     evidence = {"url": entry.get("url"), "asset_path": entry.get("asset_path"), "role": entry.get("role")}
@@ -891,15 +940,15 @@ def evaluate_fahasa_supplementary_image(entry: Mapping[str, Any]) -> DecisionRes
         return DecisionResult(
             outcome=Outcome.REVIEW_REQUIRED,
             rule_code=IMAGE_FAHASA_COVER_NOT_ELIGIBLE,
-            reason="The cover is decided by evaluate_fahasa_cover_authorization on the stored image.",
+            reason="The cover is decided by evaluate_fahasa_image_authorization on the stored image.",
             evidence=evidence,
         )
     return DecisionResult(
         outcome=Outcome.REVIEW_REQUIRED,
         rule_code=IMAGE_FAHASA_SUPPLEMENTARY_NOT_AUTHORIZED,
         reason=(
-            "Supplementary Fahasa image (gallery/preview): the owner authorization of 2026-10-09 covers "
-            "the book cover only, and its depiction of this exact edition is unproven -- owner decision required."
+            "Supplementary Fahasa image (gallery/preview): rights are owner-authorized (CLAUDE.md 14.8), "
+            "but its depiction of this exact book is unproven until it is stored and visually confirmed."
         ),
         evidence=evidence,
     )

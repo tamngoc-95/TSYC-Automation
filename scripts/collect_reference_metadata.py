@@ -1298,8 +1298,9 @@ def extract_fahasa_page_images(
 ) -> list[dict[str, Any]]:
     """Every distinct product image on a Fahasa page with its role (cover /
     another product's swatch / unproven supplementary), for provenance.
-    Recording is not approval: image_rules.evaluate_fahasa_supplementary_
-    image isolates every non-cover image for an owner decision."""
+    Recording is not approval: a supplementary image is usable only once
+    stored and visually confirmed (image_rules.evaluate_fahasa_image_
+    authorization, CLAUDE.md 14.8); a swatch never is."""
     return image_rules.classify_fahasa_page_images(
         cover_url,
         _image_sources(page, _FAHASA_GALLERY_IMAGE_SELECTOR),

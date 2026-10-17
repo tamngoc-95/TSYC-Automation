@@ -106,10 +106,13 @@ references, the Facebook history export): `NEW_CONFIRMED`,
 shop already sells is `POSSIBLE_DUPLICATE` (sellable-unit decision).
 Writes only `data/output/fahasa_discovery/discovery_<UTC>.json` and the
 first-seen ledger; never Supabase, Woo, images or prices. Discovery records
-Fahasa covers as `RIGHTS_UNKNOWN`; rights are decided later, per candidate, by
-the owner-authorized Fahasa-cover policy (CLAUDE.md 14.8,
-`image_rules.evaluate_fahasa_cover_authorization`) once the cover is stored
-against the candidate's MATCH Fahasa reference.
+Fahasa images as `RIGHTS_UNKNOWN`; rights are decided later, per candidate, by
+the owner-authorized Fahasa product-image policy (CLAUDE.md 14.8,
+`image_rules.evaluate_fahasa_image_authorization`) once each image is stored
+against the candidate's MATCH Fahasa reference. The cover is the main image;
+a gallery/preview image joins the Woo gallery only with a stored visual review
+in `source_evidence.fahasa_image_reviews` (`image_url`, `depicts_candidate`,
+`price_label_visible`, `misleading_transformation`).
 `--reclassify` re-applies the current rules to an earlier report without
 contacting Fahasa. A live run takes ~20 s per book; run it in the background.
 Discovery takes the newest book pages first, so to reach books past an

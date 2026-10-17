@@ -268,13 +268,15 @@ STORE_OWNED → allowed
 PUBLISHER_APPROVED → allowed
 SUPPLIER_APPROVED → allowed
 unknown/unconfigured → human review
-Owner-authorized Fahasa covers (CLAUDE.md 14.8, adopted 2026-10-09):
+Owner-authorized Fahasa product images (CLAUDE.md 14.8; covers 2026-10-09, extended 2026-10-17):
 applies to historical, Fahasa-discovered (FAHASA-) and live candidates
-only the cover of the candidate's own MATCH Fahasa product page
+covers (front/back), gallery, interior pages/illustrations, previews/sample pages of the candidate's own MATCH Fahasa product page
 → SUPPLIER_APPROVED automatically, no per-image owner approval
-gates (image_rules.evaluate_fahasa_cover_authorization): FAHASA provenance + MATCH reference of this candidate, same volume/sellable unit, stored, >= 400 px edges, no persisted price-label / misleading-transformation / wrong-book visual verdict
-failing cover → RIGHTS_REVIEW_REQUIRED (isolate, continue); never edited automatically
-never applies to other Fahasa images, other sites, or other uses
+gates (image_rules.evaluate_fahasa_image_authorization): FAHASA provenance + MATCH reference of this candidate, image is the page's cover or a recorded SUPPLEMENTARY page image, same volume/sellable unit, stored, >= 400 px edges, no persisted price-label / misleading-transformation / wrong-book visual verdict
+non-cover image additionally needs an explicit positive visual review (source_evidence.fahasa_image_reviews)
+main image = the authorized cover; gallery/preview images are gallery-only; duplicates dropped
+failing image → isolated (RIGHTS_REVIEW_REQUIRED when no cover passes); never edited automatically
+never applies to other products' images (swatches), other sites, or other uses
 Fahasa-discovered candidates (FAHASA-<batch>-CAN-NNNN):
 created only from NEW_CONFIRMED discoveries re-checked against a fresh unified identity index (scripts/import_fahasa_candidates.py)
 live pipeline: IDENTITY_VERIFIED required; WooCommerce drafts need bounded owner authorization (--allow-woo-draft)
@@ -289,7 +291,7 @@ no pre-order plugin is installed (checked 2026-10-16)
 Fahasa supplementary images (gallery, previews, sample spreads), 2026-10-16:
 recorded with provenance and role in product_references.raw_metadata.page_images (image_rules.classify_fahasa_page_images)
 OTHER_PRODUCT (configurable-item swatch = another volume's cover) → BLOCKED; Fahasa series galleries are mostly these
-SUPPLEMENTARY → REVIEW_REQUIRED: the 2026-10-09 authorization covers the cover only; never registered as publishable or put in a Woo gallery automatically
+SUPPLEMENTARY → rights owner-authorized (CLAUDE.md 14.8, 2026-10-17), but usable only once stored and visually confirmed as this book; until then REVIEW_REQUIRED
 Woo galleries curated by the owner are never replaced (content/inventory updates never send images)
 Author presentation (owner request 2026-10-16): the author is the WooCommerce "Tác giả" attribute (src/domain/rules/woo_presentation.py), never a metadata line/sentence in VI/EN/DE descriptions (storefront_text AUTHOR_METADATA); new content must also pass content_rules.evaluate_description_quality
 Rights approval does not prove product relevance.

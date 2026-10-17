@@ -42,13 +42,26 @@ Public reference sites are never purchase-price sources.
   - PUBLISHER_APPROVED
   - SUPPLIER_APPROVED
 - REFERENCE_ONLY and RIGHTS_UNKNOWN are not publishable.
-- Owner-authorized Fahasa covers (2026-10-09): TSYC may use Fahasa book-cover
-  images on its own WooCommerce listings, pre-order listings included. Only the
-  cover of the candidate's own MATCH Fahasa product page qualifies, after the
-  provenance, same-book/volume, quality (>= 400 px) and visual-review gates in
-  `image_rules.evaluate_fahasa_cover_authorization`; it is then SUPPLIER_APPROVED
-  without per-image owner approval. Never other Fahasa images, other sites, or
-  other uses; failing covers are isolated for review, never edited.
+- Owner-authorized Fahasa product images (CLAUDE.md 14.8; covers 2026-10-09,
+  extended 2026-10-17): TSYC may use the images of the verified book on its
+  Fahasa product page -- front/back covers, gallery images, interior pages and
+  illustrations, previews/sample pages -- on its own WooCommerce listings,
+  pre-order listings included, for FB-HIST-, FAHASA- and other verified
+  candidates. Only images of the candidate's own MATCH Fahasa product page
+  qualify, after the provenance, same-book/volume/sellable-unit, quality
+  (>= 400 px) and price-label/visual-review gates in
+  `image_rules.evaluate_fahasa_image_authorization`; they are then
+  SUPPLIER_APPROVED without per-image owner approval.
+  - The main image is always the verified cover; gallery/preview images are
+    gallery-only and each needs a visual review confirming it depicts this
+    book with no price label or misleading transformation (Fahasa series
+    galleries often show other volumes' covers).
+  - Other products' images (configurable-item swatches), other sites and
+    other uses are never covered; duplicates are dropped; failing images are
+    isolated as REVIEW_REQUIRED with the reason, never edited.
+  - Existing Woo products: owner-curated galleries and descriptions are never
+    overwritten, published products are never changed automatically, and
+    REMOTE_REMOVED products are never recreated.
 
 ## WooCommerce policy
 - Create drafts only.

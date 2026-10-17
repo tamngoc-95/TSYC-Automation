@@ -265,8 +265,9 @@ AUTOMATABLE_DISPATCH: dict[str, DispatchEntry] = {
         ),
     ),
     # The approval state is reached only after image_rules.
-    # evaluate_fahasa_cover_authorization() passed every provenance,
-    # identity, quality and visual-review gate for the selected image.
+    # evaluate_fahasa_image_authorization() passed every provenance,
+    # identity, quality and visual-review gate for the main cover and for
+    # each gallery image (CLAUDE.md 14.8).
     "IMAGE_APPROVAL_PENDING_FAHASA_COVER": DispatchEntry(
         script="review_product_images.py",
         build_args=lambda state: [

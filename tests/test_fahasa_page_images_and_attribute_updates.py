@@ -1,9 +1,9 @@
 """Fahasa supplementary images and Woo attribute updates (2026-10-16).
 
 Protects: multiple Fahasa page images are recorded with provenance and a
-role, deduplicated across CDN hosts; only the cover is ever covered by the
-owner authorization -- sibling-volume covers are blocked and unproven
-gallery/preview images go to an owner decision; the draft content updater
+role, deduplicated across CDN hosts; sibling-volume covers are blocked and
+gallery/preview images, although owner-authorized (CLAUDE.md 14.8), are not
+usable until stored and visually confirmed; the draft content updater
 syncs the author attribute but never over an owner's attribute edit, and
 never touches images. Offline.
 """
@@ -51,7 +51,9 @@ def test_sibling_volume_cover_is_blocked():
     assert decision.rule_code == image_rules.IMAGE_FAHASA_OTHER_PRODUCT
 
 
-def test_supplementary_image_is_not_auto_authorized():
+def test_unstored_supplementary_image_is_not_yet_usable():
+    # Rights are owner-authorized (CLAUDE.md 14.8), but relevance is proven
+    # only on the stored, visually reviewed image.
     decision = image_rules.evaluate_fahasa_supplementary_image(
         {"url": SUPPLEMENTARY, "asset_path": "/y", "role": image_rules.FAHASA_IMAGE_ROLE_SUPPLEMENTARY}
     )
@@ -61,8 +63,11 @@ def test_supplementary_image_is_not_auto_authorized():
     assert "rights_status" not in decision.evidence
 
 
-def test_cover_authorization_scope_is_unchanged():
-    assert "cover" in image_rules.FAHASA_COVER_AUTHORIZATION["scope"].lower()
+def test_image_authorization_scope_covers_all_product_images():
+    scope = image_rules.FAHASA_IMAGE_AUTHORIZATION["scope"].lower()
+    for kind in ("cover", "gallery", "interior", "preview"):
+        assert kind in scope
+    assert image_rules.FAHASA_IMAGE_AUTHORIZATION["rights_status"] == "SUPPLIER_APPROVED"
 
 
 # --- updater: attributes protected like the text fields ---------------------------

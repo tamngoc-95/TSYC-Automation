@@ -1,5 +1,6 @@
-"""Regression tests for the owner-authorized Fahasa cover policy
-(CLAUDE.md 14.8, adopted 2026-10-09) and the Fahasa-origin candidate path."""
+"""Regression tests for the owner-authorized Fahasa image policy
+(CLAUDE.md 14.8: covers 2026-10-09, all product images of the verified book
+2026-10-17) and the Fahasa-origin candidate path."""
 from __future__ import annotations
 
 import io
@@ -86,16 +87,18 @@ def _image(**overrides: Any) -> dict[str, Any]:
 
 
 def test_matching_fahasa_cover_is_authorized_with_provenance():
-    decision = image_rules.evaluate_fahasa_cover_authorization(_image(), _reference(), _candidate())
+    decision = image_rules.evaluate_fahasa_image_authorization(_image(), _reference(), _candidate())
     assert decision.outcome == Outcome.AUTO_PASS
     assert decision.evidence["rights_status"] == RightsStatus.SUPPLIER_APPROVED
-    assert decision.evidence["authorization"]["adopted"] == "2026-10-09"
+    assert decision.evidence["authorization"]["adopted"] == "2026-10-17"
+    assert decision.evidence["authorization"]["cover_policy_adopted"] == "2026-10-09"
     assert decision.evidence["reference_page_url"] == PAGE
+    assert decision.evidence["image_role"] == image_rules.FAHASA_IMAGE_ROLE_COVER
 
 
 def test_cdn_host_or_query_difference_is_still_the_same_cover():
     image = _image(source_url=COVER.replace("cdn1", "cdn0") + "?v=2")
-    decision = image_rules.evaluate_fahasa_cover_authorization(image, _reference(), _candidate())
+    decision = image_rules.evaluate_fahasa_image_authorization(image, _reference(), _candidate())
     assert decision.outcome == Outcome.AUTO_PASS
 
 
@@ -108,7 +111,7 @@ def test_cdn_host_or_query_difference_is_still_the_same_cover():
         ({}, {"candidate_id": "someone-else"}, {}, "another candidate"),
         ({}, {"source_url": "https://www.netabooks.vn/x"}, {}, "not on fahasa.com"),
         ({"source_url": "https://evil.example/cover.jpg"}, {}, {}, "not served by Fahasa"),
-        ({"source_url": "https://cdn1.fahasa.com/other.jpg"}, {}, {}, "own cover image"),
+        ({"source_url": "https://cdn1.fahasa.com/other.jpg"}, {}, {}, "not one of the reference page's own recorded images"),
         ({"width_pixels": 300, "height_pixels": 600}, {}, {}, "too small"),
         ({"width_pixels": None}, {}, {}, "dimensions were not recorded"),
         ({"storage_path": None}, {}, {}, "not stored"),
@@ -118,7 +121,7 @@ def test_cdn_host_or_query_difference_is_still_the_same_cover():
     ],
 )
 def test_each_gate_isolates_the_image(image_overrides, reference_overrides, candidate_overrides, expected):
-    decision = image_rules.evaluate_fahasa_cover_authorization(
+    decision = image_rules.evaluate_fahasa_image_authorization(
         _image(**image_overrides), _reference(**reference_overrides), _candidate(**candidate_overrides)
     )
     assert decision.outcome == Outcome.REVIEW_REQUIRED
@@ -136,14 +139,88 @@ def test_each_gate_isolates_the_image(image_overrides, reference_overrides, cand
 def test_visual_review_failures_isolate_the_image(field, value, expected):
     review = dict(_candidate()["source_evidence"]["fahasa_cover_review"], **{field: value})
     candidate = _candidate(source_evidence={"fahasa_cover_review": review})
-    decision = image_rules.evaluate_fahasa_cover_authorization(_image(), _reference(), candidate)
+    decision = image_rules.evaluate_fahasa_image_authorization(_image(), _reference(), candidate)
     assert decision.outcome == Outcome.REVIEW_REQUIRED
     assert expected in decision.reason
 
 
 def test_missing_reference_is_never_authorized():
-    decision = image_rules.evaluate_fahasa_cover_authorization(_image(), None, _candidate())
+    decision = image_rules.evaluate_fahasa_image_authorization(_image(), None, _candidate())
     assert decision.outcome == Outcome.REVIEW_REQUIRED
+
+
+# --- gallery / preview images (CLAUDE.md 14.8, 2026-10-17) -----------------------
+
+GALLERY = "https://cdn1.fahasa.com/media/catalog/product/b/i/biet_doi_cho_bay_ruot_1.jpg"
+SWATCH = "https://cdn1.fahasa.com/media/catalog/product/h/o/hoang_tu_be.jpg"
+PAGE_IMAGES = [
+    {"url": COVER, "asset_path": "/media/catalog/product/b/i/biet_doi_cho_bay_bia.jpg", "role": "COVER"},
+    {"url": GALLERY, "asset_path": "/media/catalog/product/b/i/biet_doi_cho_bay_ruot_1.jpg", "role": "SUPPLEMENTARY"},
+    {"url": SWATCH, "asset_path": "/media/catalog/product/h/o/hoang_tu_be.jpg", "role": "OTHER_PRODUCT"},
+]
+GALLERY_REVIEW = {
+    "image_url": GALLERY,
+    "price_label_visible": False,
+    "misleading_transformation": False,
+    "depicts_candidate": True,
+}
+
+
+def _gallery_candidate(*reviews: dict[str, Any]) -> dict[str, Any]:
+    evidence = dict(_candidate()["source_evidence"], fahasa_image_reviews=list(reviews))
+    return _candidate(source_evidence=evidence)
+
+
+def _gallery_reference() -> dict[str, Any]:
+    return _reference(raw_metadata={"page_images": PAGE_IMAGES})
+
+
+def test_visually_confirmed_gallery_image_is_authorized():
+    decision = image_rules.evaluate_fahasa_image_authorization(
+        _image(image_id="img-2", source_url=GALLERY), _gallery_reference(), _gallery_candidate(GALLERY_REVIEW)
+    )
+    assert decision.outcome == Outcome.AUTO_PASS
+    assert decision.evidence["image_role"] == image_rules.FAHASA_IMAGE_ROLE_SUPPLEMENTARY
+    assert decision.evidence["rights_status"] == RightsStatus.SUPPLIER_APPROVED
+    assert decision.evidence["image_source_url"] == GALLERY  # provenance preserved
+
+
+@pytest.mark.parametrize(
+    "review",
+    [
+        None,
+        dict(GALLERY_REVIEW, depicts_candidate=None),
+        dict(GALLERY_REVIEW, price_label_visible=None),
+        dict(GALLERY_REVIEW, misleading_transformation=None),
+        dict(GALLERY_REVIEW, depicts_candidate=False),
+        dict(GALLERY_REVIEW, price_label_visible=True),
+    ],
+)
+def test_gallery_image_without_an_explicit_positive_review_is_isolated(review):
+    candidate = _gallery_candidate(review) if review else _gallery_candidate()
+    decision = image_rules.evaluate_fahasa_image_authorization(
+        _image(image_id="img-2", source_url=GALLERY), _gallery_reference(), candidate
+    )
+    assert decision.outcome == Outcome.REVIEW_REQUIRED
+    assert decision.evidence["failures"]
+
+
+def test_other_product_swatch_is_never_authorized_even_with_a_review():
+    review = dict(GALLERY_REVIEW, image_url=SWATCH)
+    decision = image_rules.evaluate_fahasa_image_authorization(
+        _image(image_id="img-3", source_url=SWATCH), _gallery_reference(), _gallery_candidate(review)
+    )
+    assert decision.outcome == Outcome.REVIEW_REQUIRED
+    assert "another product's cover" in decision.reason
+
+
+def test_unrecorded_fahasa_image_is_not_authorized():
+    review = dict(GALLERY_REVIEW, image_url="https://cdn1.fahasa.com/media/catalog/product/x/y.jpg")
+    decision = image_rules.evaluate_fahasa_image_authorization(
+        _image(image_id="img-4", source_url=review["image_url"]), _gallery_reference(), _gallery_candidate(review)
+    )
+    assert decision.outcome == Outcome.REVIEW_REQUIRED
+    assert "not one of the reference page's own recorded images" in decision.reason
 
 
 # --- state machine ---------------------------------------------------------------
@@ -192,6 +269,31 @@ def test_authorized_cover_routes_to_automatic_approval():
     assert state.derived_state == "IMAGE_APPROVAL_PENDING_FAHASA_COVER"
     assert state.auto_main_image_id == "img-1"
     assert state.auto_rights_status == RightsStatus.SUPPLIER_APPROVED
+
+
+def test_cover_is_main_and_confirmed_gallery_images_join_the_gallery():
+    images = [
+        _image(image_id="img-2", source_url=GALLERY, created_at="2026-10-09T09:00:00+00:00"),
+        _image(),
+        _image(image_id="img-dup", source_url=GALLERY.replace("cdn1", "cdn0"), created_at="2026-10-09T11:00:00+00:00"),
+        _image(image_id="img-3", source_url=SWATCH),
+    ]
+    state = _state(_gallery_candidate(GALLERY_REVIEW), images=images, references=[_gallery_reference()])
+    assert state.derived_state == "IMAGE_APPROVAL_PENDING_FAHASA_COVER"
+    assert state.auto_main_image_id == "img-1"  # the cover, although the gallery image is older
+    assert state.auto_gallery_images == (("img-2", RightsStatus.SUPPLIER_APPROVED),)  # no duplicate, no swatch
+
+
+def test_gallery_images_without_an_authorized_cover_stay_at_review():
+    images = [_image(), _image(image_id="img-2", source_url=GALLERY)]
+    candidate = _gallery_candidate(GALLERY_REVIEW)
+    candidate["source_evidence"]["fahasa_cover_review"] = dict(
+        candidate["source_evidence"]["fahasa_cover_review"], price_label_visible=True
+    )
+    state = _state(candidate, images=images, references=[_gallery_reference()])
+    assert state.derived_state == "RIGHTS_REVIEW_REQUIRED"
+    assert state.human_gate is True
+    assert "no authorized Fahasa cover" in state.human_gate_reason
 
 
 def test_failing_cover_stays_at_rights_review_with_reason():

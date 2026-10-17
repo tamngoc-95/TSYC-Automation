@@ -29,6 +29,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -1055,36 +1056,49 @@ def _derive_image_content_state(
         fahasa_cover_failure: str | None = None
 
         if not has_publishable_rights and not is_historical:
-            # Owner-authorized Fahasa covers (CLAUDE.md 14.8), live
+            # Owner-authorized Fahasa product images (CLAUDE.md 14.8), live
             # candidates: each image is checked against its own linked
-            # reference by image_rules.evaluate_fahasa_cover_authorization
+            # reference by image_rules.evaluate_fahasa_image_authorization
             # (provenance, identity/volume, quality, visual-review gates).
             # Only images that pass every gate are approved; anything else
             # stays isolated at RIGHTS_REVIEW_REQUIRED with the reason.
+            # The main image is always an authorized cover; visually
+            # confirmed gallery/preview images only join the gallery, and
+            # a repeated asset (same file on another CDN host) is dropped.
             reference_by_id = {
                 str(reference["reference_id"]): reference
                 for reference in bundle["references"]
                 if reference.get("reference_id")
             }
-            fahasa_eligible: list[tuple[dict[str, Any], str]] = []
+            fahasa_covers: list[tuple[dict[str, Any], str]] = []
+            fahasa_supplementary: list[tuple[dict[str, Any], str]] = []
             fahasa_failures: list[str] = []
+            seen_asset_paths: set[str] = set()
 
             for image in images:
                 if image.get("source_type") != "FAHASA":
                     continue
-                decision = image_rules.evaluate_fahasa_cover_authorization(
+                decision = image_rules.evaluate_fahasa_image_authorization(
                     image,
                     reference_by_id.get(str(image.get("reference_id") or "")),
                     candidate,
                 )
-                if decision.outcome == Outcome.AUTO_PASS:
-                    fahasa_eligible.append((image, decision.evidence["rights_status"]))
-                else:
+                if decision.outcome != Outcome.AUTO_PASS:
                     fahasa_failures.append(decision.reason)
+                    continue
+                asset_path = urlsplit(str(image.get("source_url") or "")).path
+                if asset_path in seen_asset_paths:
+                    continue
+                seen_asset_paths.add(asset_path)
+                pair = (image, decision.evidence["rights_status"])
+                if decision.evidence["image_role"] == image_rules.FAHASA_IMAGE_ROLE_COVER:
+                    fahasa_covers.append(pair)
+                else:
+                    fahasa_supplementary.append(pair)
 
-            if fahasa_eligible:
+            if fahasa_covers:
                 primary_decision = image_rules.select_primary_candidate_image(
-                    fahasa_eligible
+                    fahasa_covers
                 )
 
                 return CandidateState(
@@ -1103,8 +1117,18 @@ def _derive_image_content_state(
                         for image_id, rights_status in primary_decision.evidence[
                             "gallery"
                         ]
+                    )
+                    + tuple(
+                        (str(image["image_id"]), rights_status)
+                        for image, rights_status in fahasa_supplementary
                     ),
                     warnings=warnings,
+                )
+
+            if fahasa_supplementary:
+                fahasa_failures.append(
+                    "Authorized Fahasa gallery/preview images exist, but no "
+                    "authorized Fahasa cover is available as the main image."
                 )
 
             if fahasa_failures:
