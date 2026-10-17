@@ -300,6 +300,12 @@ Rights approval does not prove product relevance.
 Both are required:
 rights acceptable
 candidate relevance supported
+Editorial content pipeline (2026-10-17, scripts/run_content_editorial.py; docs/content_style/EDITORIAL_REFERENCE.md):
+evidence ledger per book: VERIFIED_FACT / SOURCE_SUPPORTED_SUMMARY / EDITORIAL_INTERPRETATION / UNKNOWN; text-source anchors must occur in the cited source; preview/cover evidence must cite an APPROVED, READABLE reviewed image
+DRAFT → at most 3 EDIT revisions; every version scored (content_quality_score: specificity 30, natural language 25, structure 20, reader relevance 15, originality 10; target 85) and preserved (editorial_audit file + process_logs)
+hard gates are never overridden by the score: existing approval validators + unsupported names/numbers/benefits/UNKNOWN facts
+EN/DE: same translation_rules gate as TRANSLATE + multilingual_consistency, checked before any write; then the official REVISE/APPROVE/TRANSLATE writers
+INSUFFICIENT evidence → isolate (no invented depth); approved/published content never overwritten
 Multilingual Content Strategy
 9.1 Canonical language
 Vietnamese is the default semantic source of truth.

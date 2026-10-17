@@ -126,6 +126,25 @@ Then, for the exact NEW_CONFIRMED indexes chosen:
 FAHASA- candidates are live-pipeline candidates: Woo drafts need the owner's
 bounded authorization on exact codes (`--allow-woo-draft`).
 
+## Editorial content pipeline (VI/EN/DE)
+Read `docs/content_style/TSYC_CONTENT_GUIDE.md` and `docs/content_style/EDITORIAL_REFERENCE.md` first. Then write
+`data/processed/editorial_packages/<product_code>.json`, which holds:
+- the evidence ledger (`src/domain/content_evidence.py`);
+- the Vietnamese DRAFT plus at most 3 EDIT revisions;
+- the EN/DE localizations.
+
+Evaluate first (dry run, no write), then apply:
+```
+.venv/Scripts/python.exe scripts/run_content_editorial.py --product-code <code> ... --max-products K --non-interactive
+.venv/Scripts/python.exe scripts/run_content_editorial.py --product-code <code> ... --max-products K --non-interactive --confirm-apply
+```
+What the runner checks and does:
+- **Versions:** every version is scored (`content_quality_score`, target 85) and kept in `data/processed/editorial_audit/` and process_logs. The last version must pass every hard gate.
+- **Translations:** the EN/DE texts must pass the same `translation_rules` gate TRANSLATE applies, plus `multilingual_consistency`.
+- **Writes:** it writes only through `prepare_product_content.py`: REVISE (AI_ASSISTED) and APPROVE, then EXPORT_PACKAGE (or a refill of the existing package) and TRANSLATE.
+- **Never written:** APPROVED Vietnamese text (VI_ALREADY_APPROVED), published products, Woo, prices.
+- **Isolation:** INSUFFICIENT evidence, a failing final version, or a failing localization isolates that product with its defects. Revise the package and re-run.
+
 ## Fahasa gallery and preview images (CLAUDE.md 14.8)
 Every writer below takes exact codes plus a max, and is a dry run unless
 confirmed. Run them serially:
