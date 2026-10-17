@@ -1064,7 +1064,8 @@ def _derive_image_content_state(
             # stays isolated at RIGHTS_REVIEW_REQUIRED with the reason.
             # The main image is always an authorized cover; visually
             # confirmed gallery/preview images only join the gallery, and
-            # a repeated asset (same file on another CDN host) is dropped.
+            # a repeated asset (same content hash, or the same file on
+            # another CDN host) is dropped.
             reference_by_id = {
                 str(reference["reference_id"]): reference
                 for reference in bundle["references"]
@@ -1086,10 +1087,10 @@ def _derive_image_content_state(
                 if decision.outcome != Outcome.AUTO_PASS:
                     fahasa_failures.append(decision.reason)
                     continue
-                asset_path = urlsplit(str(image.get("source_url") or "")).path
-                if asset_path in seen_asset_paths:
+                asset_key = image.get("image_hash") or urlsplit(str(image.get("source_url") or "")).path
+                if asset_key in seen_asset_paths:
                     continue
-                seen_asset_paths.add(asset_path)
+                seen_asset_paths.add(asset_key)
                 pair = (image, decision.evidence["rights_status"])
                 if decision.evidence["image_role"] == image_rules.FAHASA_IMAGE_ROLE_COVER:
                     fahasa_covers.append(pair)

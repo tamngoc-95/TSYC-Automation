@@ -752,7 +752,7 @@ def evaluate_fahasa_image_authorization(
                   FAHASA product_reference of THIS candidate with
                   match_decision == MATCH, page on fahasa.com, asset on the
                   Fahasa CDN, image == the reference page's own cover or a
-                  SUPPLEMENTARY image recorded in its raw_metadata.
+                  SUPPLEMENTARY/PREVIEW image recorded in its raw_metadata.
                   page_images (never an OTHER_PRODUCT swatch)
       identity    reference title/volume agree with the candidate (same
                   volume numbers; no combo-vs-single sellable-unit gap)
@@ -762,7 +762,8 @@ def evaluate_fahasa_image_authorization(
                   label or a misleading transformation is visible
       relevance   a non-cover image additionally needs a persisted visual
                   review that explicitly confirms it depicts this book and
-                  shows no price label / misleading transformation --
+                  edition and shows no price label / misleading
+                  transformation (a PREVIEW also relevant content) --
                   Fahasa galleries often hold other volumes' covers, so a
                   gallery position alone proves nothing
 
@@ -790,7 +791,7 @@ def evaluate_fahasa_image_authorization(
     role = _fahasa_image_role(image.get("source_url"), reference) if reference else None
     if role == FAHASA_IMAGE_ROLE_OTHER_PRODUCT:
         failures.append("image is another product's cover on the reference page")
-    elif role not in (FAHASA_IMAGE_ROLE_COVER, FAHASA_IMAGE_ROLE_SUPPLEMENTARY):
+    elif role not in (FAHASA_IMAGE_ROLE_COVER, *_FAHASA_NON_COVER_ROLES):
         failures.append("image is not one of the reference page's own recorded images")
 
     if volume_numbers(candidate_title) != volume_numbers(reference.get("reference_title")):
@@ -817,13 +818,24 @@ def evaluate_fahasa_image_authorization(
         failures.append("visual review found a misleading image transformation")
     if review and review.get("depicts_candidate") is False:
         failures.append("visual review found the image does not depict this book")
-    if role == FAHASA_IMAGE_ROLE_SUPPLEMENTARY and not (
+    if review and review.get("edition_matches") is False:
+        failures.append("visual review found a different edition, volume or sellable unit")
+    if review and review.get("relevant_preview") is False:
+        failures.append("visual review found the preview content irrelevant")
+    if review and review.get("visual_duplicate") is True:
+        failures.append("visual review found the image repeats another image of this product")
+    if role in _FAHASA_NON_COVER_ROLES and not (
         review
         and review.get("depicts_candidate") is True
+        and review.get("edition_matches") is True
         and review.get("price_label_visible") is False
         and review.get("misleading_transformation") is False
     ):
-        failures.append("no visual review confirms this non-cover image depicts this book without a price label")
+        failures.append(
+            "no visual review confirms this non-cover image depicts this edition without a price label"
+        )
+    if role == FAHASA_IMAGE_ROLE_PREVIEW and not (review and review.get("relevant_preview") is True):
+        failures.append("no visual review confirms the preview content is relevant")
 
     evidence = {
         "image_id": image.get("image_id"),
@@ -871,9 +883,14 @@ def evaluate_fahasa_image_authorization(
 FAHASA_IMAGE_ROLE_COVER = "COVER"
 FAHASA_IMAGE_ROLE_OTHER_PRODUCT = "OTHER_PRODUCT"
 FAHASA_IMAGE_ROLE_SUPPLEMENTARY = "SUPPLEMENTARY"
+# "Đọc thử" sample pages (read live 2026-10-17): served from the page's own
+# flashmagazine folder, full resolution despite the "-390x510" file suffix.
+FAHASA_IMAGE_ROLE_PREVIEW = "PREVIEW"
+_FAHASA_NON_COVER_ROLES = (FAHASA_IMAGE_ROLE_SUPPLEMENTARY, FAHASA_IMAGE_ROLE_PREVIEW)
 IMAGE_FAHASA_SUPPLEMENTARY_NOT_AUTHORIZED = "IMAGE_FAHASA_SUPPLEMENTARY_NOT_AUTHORIZED"
 IMAGE_FAHASA_OTHER_PRODUCT = "IMAGE_FAHASA_OTHER_PRODUCT"
 _FAHASA_PRODUCT_ASSET_PREFIX = "/media/catalog/product/"
+_FAHASA_PREVIEW_ASSET_PREFIX = "/media/flashmagazine/images/page_images/"
 
 
 def classify_fahasa_page_images(
@@ -884,12 +901,14 @@ def classify_fahasa_page_images(
     """
     One entry per distinct Fahasa product asset (deduplicated by asset path:
     the same file is served from cdn0/cdn1, with or without a query), in
-    page order, cover first:
+    page order, cover first, each with its 1-based source "position":
       COVER          the page's own cover (reference_image_url)
       OTHER_PRODUCT  a configurable-item swatch = another product's cover
-      SUPPLEMENTARY  any other product asset in the page gallery (a
-                     possible interior preview / sample spread -- unproven)
-    Non-product assets (logos, banners) and non-Fahasa hosts are dropped.
+      SUPPLEMENTARY  any other product asset in the page gallery (back
+                     cover, spread, ... -- unproven until reviewed)
+      PREVIEW        a "Đọc thử" sample page from the page's preview viewer
+    Non-product assets (logos, banners, loaders) and non-Fahasa hosts are
+    dropped.
     """
     cover_path = _path(cover_url)
     other_paths = {_path(url) for url in other_product_urls if url}
@@ -899,8 +918,9 @@ def classify_fahasa_page_images(
         if not url:
             continue
         path = _path(url)
+        is_preview = path.startswith(_FAHASA_PREVIEW_ASSET_PREFIX)
         if (
-            not path.startswith(_FAHASA_PRODUCT_ASSET_PREFIX)
+            not (is_preview or path.startswith(_FAHASA_PRODUCT_ASSET_PREFIX))
             or not _host(url).endswith(_FAHASA_IMAGE_HOST_SUFFIX)
             or path in seen
         ):
@@ -910,9 +930,11 @@ def classify_fahasa_page_images(
             role = FAHASA_IMAGE_ROLE_COVER
         elif path in other_paths:
             role = FAHASA_IMAGE_ROLE_OTHER_PRODUCT
+        elif is_preview:
+            role = FAHASA_IMAGE_ROLE_PREVIEW
         else:
             role = FAHASA_IMAGE_ROLE_SUPPLEMENTARY
-        entries.append({"url": url, "asset_path": path, "role": role})
+        entries.append({"url": url, "asset_path": path, "role": role, "position": len(entries) + 1})
     return entries
 
 
@@ -952,6 +974,125 @@ def evaluate_fahasa_supplementary_image(entry: Mapping[str, Any]) -> DecisionRes
         ),
         evidence=evidence,
     )
+
+
+# --- per-image review record (CLAUDE.md 14.8.2) ---------------------------
+#
+# Every collected Fahasa image gets one machine-readable record with a
+# three-way classification. REJECTED is reserved for a confirmed "no"
+# (another product, wrong book/edition, price label, misleading overlay,
+# duplicate, too small, failed asset); anything merely unproven -- no
+# visual verdict yet, verdict fields unknown, not stored -- is
+# REVIEW_REQUIRED, never a silent approval.
+FAHASA_REVIEW_APPROVED = "APPROVED"
+FAHASA_REVIEW_REQUIRED = "REVIEW_REQUIRED"
+FAHASA_REVIEW_REJECTED = "REJECTED"
+FAHASA_REVIEW_RULE_VERSION = "fahasa-image-review/1"
+# Storefront image kinds a visual review may assign (product_images.image_role).
+FAHASA_REVIEW_IMAGE_KINDS = frozenset({"FRONT_COVER", "BACK_COVER", "INSIDE_PAGE", "OTHER"})
+_DEFAULT_IMAGE_KIND_BY_ROLE = {
+    FAHASA_IMAGE_ROLE_COVER: "FRONT_COVER",
+    FAHASA_IMAGE_ROLE_PREVIEW: "INSIDE_PAGE",
+    FAHASA_IMAGE_ROLE_SUPPLEMENTARY: "OTHER",
+}
+
+
+def review_fahasa_image(
+    image: Mapping[str, Any],
+    reference: Mapping[str, Any] | None,
+    candidate: Mapping[str, Any],
+    duplicate_of: str | None = None,
+) -> dict[str, Any]:
+    """
+    The review record of one stored (or attempted) Fahasa image:
+      classification  APPROVED / REVIEW_REQUIRED / REJECTED
+      reasons         every failed check, explicitly
+      image_kind      FRONT_COVER / BACK_COVER / INSIDE_PAGE / OTHER (the
+                      visual verdict's, else the default for the page role)
+      main_eligible   True only for an APPROVED page cover that the review
+                      did not identify as an interior page -- an interior
+                      or preview page is never the featured image
+    `duplicate_of` is the image_id of an earlier image with the same
+    content hash (the caller computes it across the candidate's images).
+    APPROVED means evaluate_fahasa_image_authorization AUTO_PASSed. Pure.
+    """
+    decision = evaluate_fahasa_image_authorization(image, reference, candidate)
+    evidence = decision.evidence
+    role = evidence.get("image_role")
+    review = evidence.get("visual_review") or {}
+    kind = review.get("image_kind")
+    image_kind = kind if kind in FAHASA_REVIEW_IMAGE_KINDS else _DEFAULT_IMAGE_KIND_BY_ROLE.get(role, "OTHER")
+
+    rejections: list[str] = []
+    if duplicate_of:
+        rejections.append(f"duplicate of image {duplicate_of}")
+    if role == FAHASA_IMAGE_ROLE_OTHER_PRODUCT:
+        rejections.append("another product's cover on the reference page")
+    if image.get("image_status") in _UNUSABLE_IMAGE_STATUSES:
+        rejections.append(f"image_status is {image.get('image_status')}")
+    width, height = image.get("width_pixels"), image.get("height_pixels")
+    if width and height and min(int(width), int(height)) < FAHASA_COVER_MIN_EDGE_PIXELS:
+        rejections.append(f"image is too small ({width}x{height})")
+    for field, expected, reason in (
+        ("depicts_candidate", False, "visual review: does not depict this book"),
+        ("edition_matches", False, "visual review: different edition, volume or sellable unit"),
+        ("price_label_visible", True, "visual review: retailer price label visible"),
+        ("misleading_transformation", True, "visual review: misleading promotional overlay or transformation"),
+        ("relevant_preview", False, "visual review: preview content is not relevant"),
+        ("visual_duplicate", True, "visual review: repeats another image of this product (e.g. the cover again)"),
+    ):
+        if review.get(field) is expected:
+            rejections.append(reason)
+
+    if rejections:
+        classification, reasons = FAHASA_REVIEW_REJECTED, rejections
+    elif decision.outcome == Outcome.AUTO_PASS:
+        classification, reasons = FAHASA_REVIEW_APPROVED, []
+    else:
+        classification, reasons = FAHASA_REVIEW_REQUIRED, list(evidence.get("failures") or [decision.reason])
+
+    return {
+        "image_id": image.get("image_id"),
+        "image_url": image.get("source_url"),
+        "image_hash": image.get("image_hash"),
+        "page_role": role,
+        "image_kind": image_kind,
+        "classification": classification,
+        "reasons": reasons,
+        "main_eligible": (
+            classification == FAHASA_REVIEW_APPROVED
+            and role == FAHASA_IMAGE_ROLE_COVER
+            and image_kind != "INSIDE_PAGE"
+        ),
+        "rights_status": evidence.get("rights_status") if classification == FAHASA_REVIEW_APPROVED else None,
+        "visual_review": dict(review) if review else None,
+        "rule_version": FAHASA_REVIEW_RULE_VERSION,
+    }
+
+
+def find_duplicate_images(images: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    """{image_id: earlier image_id} for every image whose content hash (or,
+    without a hash, asset path) repeats an earlier one. The selected main
+    image always counts as the earliest, so it is never the duplicate."""
+    ordered = sorted(
+        images,
+        key=lambda image: (
+            not image.get("is_selected_main_image"),
+            str(image.get("created_at") or ""),
+            str(image.get("image_id") or ""),
+        ),
+    )
+    first_by_key: dict[str, str] = {}
+    duplicates: dict[str, str] = {}
+    for image in ordered:
+        key = image.get("image_hash") or _path(image.get("source_url"))
+        if not key:
+            continue
+        if key in first_by_key:
+            duplicates[str(image.get("image_id"))] = first_by_key[key]
+        else:
+            first_by_key[key] = str(image.get("image_id"))
+    return duplicates
 
 
 # --- product-match check ------------------------------------------------

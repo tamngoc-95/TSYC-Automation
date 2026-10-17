@@ -273,7 +273,8 @@ applies to historical, Fahasa-discovered (FAHASA-) and live candidates
 covers (front/back), gallery, interior pages/illustrations, previews/sample pages of the candidate's own MATCH Fahasa product page
 → SUPPLIER_APPROVED automatically, no per-image owner approval
 gates (image_rules.evaluate_fahasa_image_authorization): FAHASA provenance + MATCH reference of this candidate, image is the page's cover or a recorded SUPPLEMENTARY page image, same volume/sellable unit, stored, >= 400 px edges, no persisted price-label / misleading-transformation / wrong-book visual verdict
-non-cover image additionally needs an explicit positive visual review (source_evidence.fahasa_image_reviews)
+non-cover image additionally needs an explicit positive visual review (source_evidence.fahasa_image_reviews): depicts the book, edition matches, no price label/overlay; a PREVIEW also relevant_preview
+pipeline (docs/TSYC_RUNBOOK.md "Fahasa gallery and preview images"): collect_fahasa_gallery_images.py → review_fahasa_gallery_images.py (APPROVED / REVIEW_REQUIRED / REJECTED records, main cover never touched) → apply_fahasa_gallery_to_woo_drafts.py (TSYC-owned drafts only, images field only, owner-curated galleries isolated)
 main image = the authorized cover; gallery/preview images are gallery-only; duplicates dropped
 failing image → isolated (RIGHTS_REVIEW_REQUIRED when no cover passes); never edited automatically
 never applies to other products' images (swatches), other sites, or other uses
@@ -291,7 +292,8 @@ no pre-order plugin is installed (checked 2026-10-16)
 Fahasa supplementary images (gallery, previews, sample spreads), 2026-10-16:
 recorded with provenance and role in product_references.raw_metadata.page_images (image_rules.classify_fahasa_page_images)
 OTHER_PRODUCT (configurable-item swatch = another volume's cover) → BLOCKED; Fahasa series galleries are mostly these
-SUPPLEMENTARY → rights owner-authorized (CLAUDE.md 14.8, 2026-10-17), but usable only once stored and visually confirmed as this book; until then REVIEW_REQUIRED
+SUPPLEMENTARY / PREVIEW ("Đọc thử" pages, /media/flashmagazine/) → rights owner-authorized (CLAUDE.md 14.8, 2026-10-17), but usable only once stored and visually confirmed as this book; until then REVIEW_REQUIRED
+the SUPPLEMENTARY image on Fahasa pages is often the same front cover again at higher resolution → visual_duplicate → REJECTED (gallery must not repeat the cover)
 Woo galleries curated by the owner are never replaced (content/inventory updates never send images)
 Author presentation (owner request 2026-10-16): the author is the WooCommerce "Tác giả" attribute (src/domain/rules/woo_presentation.py), never a metadata line/sentence in VI/EN/DE descriptions (storefront_text AUTHOR_METADATA); new content must also pass content_rules.evaluate_description_quality
 Rights approval does not prove product relevance.

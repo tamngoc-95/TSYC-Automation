@@ -160,6 +160,7 @@ PAGE_IMAGES = [
 ]
 GALLERY_REVIEW = {
     "image_url": GALLERY,
+    "edition_matches": True,
     "price_label_visible": False,
     "misleading_transformation": False,
     "depicts_candidate": True,

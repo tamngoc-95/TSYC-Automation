@@ -111,8 +111,7 @@ the owner-authorized Fahasa product-image policy (CLAUDE.md 14.8,
 `image_rules.evaluate_fahasa_image_authorization`) once each image is stored
 against the candidate's MATCH Fahasa reference. The cover is the main image;
 a gallery/preview image joins the Woo gallery only with a stored visual review
-in `source_evidence.fahasa_image_reviews` (`image_url`, `depicts_candidate`,
-`price_label_visible`, `misleading_transformation`).
+(see "Fahasa gallery and preview images" below).
 `--reclassify` re-applies the current rules to an earlier report without
 contacting Fahasa. A live run takes ~20 s per book; run it in the background.
 Discovery takes the newest book pages first, so to reach books past an
@@ -126,6 +125,51 @@ Then, for the exact NEW_CONFIRMED indexes chosen:
 ```
 FAHASA- candidates are live-pipeline candidates: Woo drafts need the owner's
 bounded authorization on exact codes (`--allow-woo-draft`).
+
+## Fahasa gallery and preview images (CLAUDE.md 14.8)
+Every writer below takes exact codes plus a max, and is a dry run unless
+confirmed. Run them serially:
+```
+.venv/Scripts/python.exe scripts/collect_fahasa_gallery_images.py --candidate-code <code> ... --max-candidates K --non-interactive --confirm-collect
+.venv/Scripts/python.exe scripts/review_fahasa_gallery_images.py --candidate-code <code> ... --max-candidates K --visual-reviews data/output/fahasa_gallery/visual_reviews_<date>.json --non-interactive --confirm-apply
+.venv/Scripts/python.exe scripts/apply_fahasa_gallery_to_woo_drafts.py --product-code TSYC-<code> ... --max-products K --non-interactive --confirm-update
+```
+1. **Collect** reads the candidate's single FAHASA MATCH page. Its roles are
+   COVER, SUPPLEMENTARY, PREVIEW (the "Đọc thử" pages under
+   `/media/flashmagazine/`, full resolution despite the `-390x510` name) and
+   OTHER_PRODUCT (another volume's cover).
+   - OTHER_PRODUCT images are recorded but never downloaded.
+   - Every other image is downloaded, SHA-256 deduplicated and registered
+     PENDING / RIGHTS_UNKNOWN. A hash already registered for another
+     candidate is never relinked.
+   - It writes the per-image manifest to
+     `product_references.raw_metadata.page_images`. A failed download fails
+     only that image.
+2. **Visual review** is done by looking at each image (a Claude Code visual
+   review). It writes one verdict per image to a JSON list:
+   `candidate_code, image_url, depicts_candidate, edition_matches,
+   price_label_visible, misleading_transformation, relevant_preview,
+   visual_duplicate, image_kind, reviewed_by, reviewed_at, notes`.
+3. **Review** stores the verdicts in `source_evidence.fahasa_image_reviews`.
+   It writes a record for every image to
+   `source_evidence.fahasa_image_review_records` (`image_rules.review_fahasa_image`):
+   - APPROVED images become VALIDATED, SUPPLIER_APPROVED gallery images.
+   - REJECTED images (another product, wrong book or edition, price label,
+     overlay, duplicate, irrelevant preview, too small) become REJECTED.
+   - REVIEW_REQUIRED images stay PENDING. This covers any unknown verdict
+     field.
+   - The main cover is never touched. A rejected main cover means
+     MAIN_COVER_FAILED, and no gallery change is made.
+   - A preview or interior page is never main-eligible.
+4. **Woo enrichment** applies only to a still-DRAFT_CREATED Fahasa pre-order
+   draft whose remote images are exactly what TSYC last applied. An
+   owner-curated gallery or a published, trashed or foreign product is
+   isolated.
+   - It sends only `images`, and the re-read proves status, prices, inventory
+     and text are unchanged.
+   - An uncertain PUT is never retried.
+   - New drafts need no enrichment: `create_woocommerce_draft.py` already
+     includes every VALIDATED, publish-eligible gallery image.
 
 ## Git discipline
 `git status`, `git diff --check`, review the exact diff, run relevant tests
