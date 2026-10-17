@@ -37,12 +37,11 @@ Public reference sites are never purchase-price sources.
 - Images begin non-publishable.
 - Rights must be explicit.
 - Exactly one main image may be selected.
-- Publishable rights:
+- Publishable rights (canonical values, `src/domain/rights_status.py`):
   - STORE_OWNED
-  - PUBLISHER_AUTHORIZED
-  - SUPPLIER_AUTHORIZED
-  - LICENSED
-- RIGHTS_UNKNOWN and DO_NOT_USE are not publishable.
+  - PUBLISHER_APPROVED
+  - SUPPLIER_APPROVED
+- REFERENCE_ONLY and RIGHTS_UNKNOWN are not publishable.
 - Owner-authorized Fahasa covers (2026-10-09): TSYC may use Fahasa book-cover
   images on its own WooCommerce listings, pre-order listings included. Only the
   cover of the candidate's own MATCH Fahasa product page qualifies, after the

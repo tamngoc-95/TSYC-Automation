@@ -171,7 +171,12 @@ _FACT_CATEGORIES: tuple[tuple[str, tuple[str, ...], re.Pattern[str], tuple[str, 
 _COMBO_CANDIDATE_TYPES = frozenset({"BOOK_COMBO", "BOOK_SET"})
 # "tập N" alone means "volume N" (an individual volume), so it is
 # deliberately not a combo marker.
-_VI_COMBO_MARKERS = ("combo", "trọn bộ", "bộ sách", "bộ ", "set ")
+_VI_COMBO_MARKERS = ("combo", "trọn bộ", "bộ sách", "set ")
+# A bare "bộ " is also an ordinary noun ("Bộ Quần Áo Mới Của Hoàng Đế" --
+# a suit of clothes), so it only signals a combo when the sellable unit is
+# not already known to be a single book.
+_VI_WEAK_COMBO_MARKER = "bộ "
+_SINGLE_CANDIDATE_TYPES = frozenset({"SINGLE_BOOK"})
 
 # The shop's own (Vietnamese) name legitimately appears in localized prose.
 _SHOP_NAME = "tiệm sách yêu con"
@@ -243,8 +248,10 @@ def is_combo(
 ) -> bool:
     if candidate_type in _COMBO_CANDIDATE_TYPES:
         return True
-    name = _normalize(vi_content.get("product_name"))
-    return any(marker in f"{name} " for marker in _VI_COMBO_MARKERS)
+    name = f"{_normalize(vi_content.get('product_name'))} "
+    if any(marker in name for marker in _VI_COMBO_MARKERS):
+        return True
+    return candidate_type not in _SINGLE_CANDIDATE_TYPES and _VI_WEAK_COMBO_MARKER in name
 
 
 def evaluate_translation(

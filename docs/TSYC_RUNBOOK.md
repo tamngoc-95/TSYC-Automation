@@ -105,10 +105,24 @@ references, the Facebook history export): `NEW_CONFIRMED`,
 `FACEBOOK_COVERAGE_UNKNOWN`, `REMOTE_REMOVED`. A new volume of a series the
 shop already sells is `POSSIBLE_DUPLICATE` (sellable-unit decision).
 Writes only `data/output/fahasa_discovery/discovery_<UTC>.json` and the
-first-seen ledger; never Supabase, Woo, images or prices. Fahasa images are
-recorded `RIGHTS_UNKNOWN` (the 14.7 auto-authorization is FB-HIST only).
+first-seen ledger; never Supabase, Woo, images or prices. Discovery records
+Fahasa covers as `RIGHTS_UNKNOWN`; rights are decided later, per candidate, by
+the owner-authorized Fahasa-cover policy (CLAUDE.md 14.8,
+`image_rules.evaluate_fahasa_cover_authorization`) once the cover is stored
+against the candidate's MATCH Fahasa reference.
 `--reclassify` re-applies the current rules to an earlier report without
 contacting Fahasa. A live run takes ~20 s per book; run it in the background.
+Discovery takes the newest book pages first, so to reach books past an
+earlier run raise `--max-listings` (<= 60) rather than re-reading the same
+head of the listing.
+
+Then, for the exact NEW_CONFIRMED indexes chosen:
+```
+.venv/Scripts/python.exe scripts/import_fahasa_candidates.py --discovery-report <report>.json --cover-reviews <reviews>.json --discovery-index N ... --max-candidates K --batch-code FAHASA-2026-NNN --execute
+.venv/Scripts/python.exe scripts/run_batch.py --batch-code FAHASA-2026-NNN --candidate-codes <codes> --max-candidates K --non-interactive
+```
+FAHASA- candidates are live-pipeline candidates: Woo drafts need the owner's
+bounded authorization on exact codes (`--allow-woo-draft`).
 
 ## Git discipline
 `git status`, `git diff --check`, review the exact diff, run relevant tests

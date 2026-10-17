@@ -247,6 +247,18 @@ class TestEvaluateTranslation:
         assert not result.is_auto_pass
         assert "combo/set" in result.reason
 
+    def test_bare_bo_in_single_book_title_is_not_a_combo(self):
+        # "Bộ Quần Áo Mới Của Hoàng Đế" (The Emperor's New Clothes): "bộ"
+        # is "a suit of clothes", not a book set.
+        name = {"product_name": "Cổ Tích Thế Giới Hay Nhất - Bộ Quần Áo Mới Của Hoàng Đế"}
+        assert not translation_rules.is_combo(name, "SINGLE_BOOK")
+        # Unknown sellable unit: a bare "bộ " still conservatively signals a combo.
+        assert translation_rules.is_combo(name, None)
+
+    def test_strong_combo_markers_apply_even_to_single_book_type(self):
+        for product_name in ("Combo Ehon 3 cuốn", "Trọn bộ Pippi", "Bộ sách Montessori", "Set 4 cuốn"):
+            assert translation_rules.is_combo({"product_name": product_name}, "SINGLE_BOOK"), product_name
+
     def test_padded_plot_is_rejected_by_length_ratio(self):
         padding = " The little bear looks out of the window at the moon with its mother." * 4
         translation = {**EN_GOOD, "long_description": EN_GOOD["long_description"] + padding}
