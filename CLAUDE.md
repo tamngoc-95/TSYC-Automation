@@ -468,6 +468,100 @@ An image downloaded from an already-approved reference `source_type` is automati
 An image from any other/unconfigured source is NOT automatically approved and still requires human rights review (`RIGHTS_UNKNOWN` / `REVIEW_REQUIRED`), exactly as section 14.3/14.4 already require for everything outside an established policy basis.
 This auto-authorization never substitutes for the separate, still-mandatory candidate-relevance/ownership check -- an auto-authorized-rights image must still be confirmed to actually depict this candidate before it can be selected as the main image (section 14.5/14.6 unchanged).
 ---
+## 14.8 Owner-Authorized Fahasa Product Images
+
+**Adopted:** 2026-10-17  
+**Authorization:** Explicit TSYC shop-owner authorization.
+
+### 14.8.1 Scope of Authorization
+
+The TSYC shop owner confirms authorization to use relevant images obtained from Fahasa product pages on TSYC's own WooCommerce website.
+
+This authorization covers:
+
+- Front and back book covers.
+- Product gallery images.
+- Interior book pages and illustrations.
+- Preview images and sample reading pages.
+- Additional product images belonging to the verified book.
+
+This is owner-provided authorization for the stated website use, not independent verification of third-party intellectual property rights.
+
+The authorization applies to:
+
+- Historical Facebook-derived products (`FB-HIST-`).
+- New Fahasa-discovered products (`FAHASA-`).
+- Other verified TSYC candidates referencing the same Fahasa product.
+
+No additional per-image owner approval is required when all validation gates pass.
+
+### 14.8.2 Mandatory Image Validation
+
+Every image must:
+
+1. Originate from the verified Fahasa product listing.
+2. Match the correct book, edition, series volume and sellable unit.
+3. Have its original source URL and provenance recorded.
+4. Meet the existing TSYC image-quality requirements.
+5. Be checked for misleading price labels or promotional overlays.
+6. Avoid duplicate or unrelated images.
+
+The main product image should be the best verified cover.
+
+Suitable additional images may be added to the WooCommerce product gallery.
+
+Interior and preview images may also be used as supporting evidence for content preparation.
+
+Images failing validation must be isolated as `REVIEW_REQUIRED`, with the specific reason recorded.
+
+### 14.8.3 Automation Authorization
+
+For qualifying Fahasa images, Claude Code and the TSYC automation pipeline are authorized to:
+
+- Discover and retrieve images through permitted access methods.
+- Validate and classify images.
+- Store image metadata and provenance.
+- Prepare images for the WooCommerce product gallery.
+- Associate approved images with the correct product.
+- Reuse validated images in future authorized processing.
+- Automatically continue without requesting routine per-image confirmations.
+
+Do not require repeated owner approval for images already covered by this policy.
+
+### 14.8.4 Existing Product Protection
+
+For existing WooCommerce products:
+
+- Preserve owner-maintained images and product descriptions.
+- Reconcile WooCommerce product IDs and SKUs before updates.
+- Do not overwrite manually curated galleries.
+- Update only authorized automation-owned drafts.
+- Do not modify published products automatically.
+- Never recreate `REMOTE_REMOVED` products.
+
+### 14.8.5 Unchanged Business Restrictions
+
+This section does not authorize:
+
+- Automatic publishing.
+- Automatic selling-price changes.
+- Unverified ISBNs or fabricated product information.
+- Duplicate product creation.
+- Automatic changes to owner-maintained published content.
+- Unverified supplier commitments or delivery dates.
+- Use of unrelated third-party images outside the approved scope.
+
+Existing duplicate-prevention, product-identity, content-quality, WooCommerce draft-authorization and final owner-approval rules remain in effect.
+
+### 14.8.6 Policy Implementation
+
+The TSYC automation must align its image validation, database ingestion, WooCommerce gallery handling, tests and runbooks with this section.
+
+The policy applies to future Fahasa discovery batches without requiring repeated owner confirmation.
+
+Any material change to the scope of authorization must be approved by the shop owner.
+------
+
 15. Content Workflow
 Official content lifecycle:
 PENDING
