@@ -223,6 +223,36 @@ reference, then record them before the Woo draft is created:
 - Co-authors whose roles the cover does not distinguish stay AUTHOR. Never
   guess an illustrator.
 
+## Published-product repair packages (owner-authorized only)
+Published products are owner-maintained. A repair package
+(`data/processed/orchestration/published_repair_package_<date>/package_vN.json`,
+gitignored because it holds live store text) is built read-only. It is applied
+only after the owner authorizes the exact Woo IDs:
+```
+.venv/Scripts/python.exe scripts/apply_published_repair_package.py --package <package_vN.json> \
+    --woo-id <id> [--woo-id ...] --max-products <n>                          (dry run)
+... --non-interactive --confirm-apply
+... --rollback --confirm-apply                                               (restore one product)
+```
+- Before writing, the script checks that the product still matches the
+  package baseline: exact id, SKU, name, status `publish`, the rendered
+  description's sha256, `date_modified` and the attributes. Any owner edit
+  since the baseline isolates the product.
+- The package fragments are *rendered* HTML (wpautop). The raw content has no
+  `<p>` wrapper and uses CRLF and indentation, so the script matches whole
+  raw lines, and each fragment must match exactly once.
+- A versioned rollback record (`rollback/<id>_<utc>.json`) is written before
+  every PUT. The PUT carries only `description` and `attributes`.
+- After the write, the script reads the product back and verifies three
+  things: the raw text is exactly as expected, the rendered sha256 equals
+  `after_sha256`, and status, prices, stock, images, categories, SKU, slug and
+  short description are unchanged.
+- `apply_checkpoint_vN.json` makes the batch resumable. An uncertain PUT is
+  re-read and never retried. `--rollback` refuses to run if the product was
+  edited after the repair.
+- 2026-10-19: package v2 was applied to the 12 published FAHASA-2026-001
+  products (#4765–#4789 odd, excluding the trashed #4773).
+
 ## Git discipline
 `git status`, `git diff --check`, review the exact diff, run relevant tests
 before every commit.
