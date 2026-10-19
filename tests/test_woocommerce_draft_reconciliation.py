@@ -255,7 +255,10 @@ def test_internal_product_status_updated():
 # ---------------------------------------------------------------------------
 
 
-def test_reconciliation_is_idempotent_on_rerun():
+def test_reconciliation_is_idempotent_on_rerun(monkeypatch):
+    # Pin the clock: the rows carry utc_now() timestamps, and two real calls
+    # only compared equal when they fell inside the same OS clock tick.
+    monkeypatch.setattr(woo, "utc_now", lambda: "2026-01-01T00:00:00+00:00")
     repository = make_repository_with_uncertain_sync()
     product = make_product()
     existing_sync = get_sync_row(repository)
