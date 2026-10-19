@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping
 
-from src.domain.rules import author_rules, storefront_text
+from src.domain.rules import author_rules, contributor_roles, storefront_text
 
 AUTHOR_ATTRIBUTE_NAME = "Tác giả"
 _AUTHOR_LABELS = frozenset({"tác giả", "đồng tác giả", "author", "authors", "autor", "autorin", "autoren"})
@@ -77,7 +77,9 @@ def build_attributes(
 ) -> list[dict[str, Any]]:
     """
     WooCommerce product attributes (custom, visible, not for variations):
-    "Tác giả" from the verified internal_products.author, then -- only
+    "Tác giả" from the verified internal_products.author -- or, when
+    product_metadata.contributor_roles holds verified roles, one attribute
+    per role ("Tác giả", "Người kể lại", "Minh họa", ...) -- then -- only
     when the details value is a plain attribute list -- every other
     details line in its stored order. Never invents a value: an absent
     author or detail simply produces no attribute.
@@ -89,13 +91,22 @@ def build_attributes(
             {"name": name, "position": len(attributes), "visible": True, "variation": False, "options": options}
         )
 
-    names = author_names(product.get("author"))
-    if names:
-        add(AUTHOR_ATTRIBUTE_NAME, names)
+    seen = {AUTHOR_ATTRIBUTE_NAME.casefold()}
+    roles = contributor_roles.verified_contributors(product.get("product_metadata"))
+    if roles:
+        # Verified roles replace the merged author field: a reteller or
+        # illustrator is never presented as "Tác giả".
+        for label, role_names in contributor_roles.attribute_groups(roles):
+            add(label, role_names)
+            seen.add(label.casefold())
+        names = [name for name, _role in roles]
+    else:
+        names = author_names(product.get("author"))
+        if names:
+            add(AUTHOR_ATTRIBUTE_NAME, names)
 
     details = content.get("product_details")
     if details_are_attribute_list(details):
-        seen = {AUTHOR_ATTRIBUTE_NAME.casefold()}
         for line in _detail_lines(details):
             label, value = parse_detail_line(line)  # type: ignore[misc]
             if label.casefold() in _AUTHOR_LABELS:

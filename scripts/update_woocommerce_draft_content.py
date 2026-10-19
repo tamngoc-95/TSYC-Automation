@@ -254,7 +254,7 @@ class WooClient:
 def load_local_target(repository: SupabaseRepository, product_code: str) -> dict[str, Any]:
     products = (
         repository.client.table("internal_products")
-        .select("internal_product_id, product_code, candidate_id, woocommerce_status, author")
+        .select("internal_product_id, product_code, candidate_id, woocommerce_status, author, product_metadata")
         .eq("product_code", product_code)
         .execute()
         .data
