@@ -189,6 +189,39 @@ confirmed. Run them serially:
    - An uncertain PUT is never retried.
    - New drafts need no enrichment: `create_woocommerce_draft.py` already
      includes every VALIDATED, publish-eligible gallery image.
+5. **Main-cover review record.** A COVER_TEXT evidence item in an editorial
+   package needs the cover's review record. If a candidate has no gallery
+   images to review, run `review_fahasa_gallery_images.py` once without
+   `--visual-reviews` so that the record exists.
+
+## Contributor roles (author, reteller, illustrator, translator)
+Fahasa's author field often merges distinct roles. For example,
+"Hiếu Minh, Cloud Pillow Studio" stands for a cover that reads
+"Hiếu Minh kể lại | Cloud Pillow Studio minh họa". Never present a merged
+field as one "Tác giả" list. Read the roles from the cover or the
+reference, then record them before the Woo draft is created:
+```
+.venv/Scripts/python.exe scripts/record_contributor_roles.py --product-code TSYC-<code> \
+    --contributor "RETELLER=Hiếu Minh" --contributor "ILLUSTRATOR=Cloud Pillow Studio" \
+    --evidence-url <registered reference URL> --evidence-image-url <cover URL> \
+    --credit-text "Hiếu Minh kể lại | Cloud Pillow Studio minh họa"            (dry run)
+... --confirm-record
+```
+- The script writes only `internal_products.product_metadata.contributor_roles`.
+  The verified `author` column is never rewritten.
+- Woo attributes become one entry per role: Tác giả / Nguyên tác /
+  Người kể lại / Người dịch / Minh họa (`woo_presentation.build_attributes`).
+- Every name must appear in the recorded credit text.
+  - AUTHOR and RETELLER must already be in the author field.
+  - TRANSLATOR, ILLUSTRATOR and ORIGINAL_AUTHOR may come from outside the
+    author field. A TRANSLATOR must match the reference's recorded
+    translator.
+- The script never drops an author-field name and never overwrites an
+  existing different record.
+- Add an original author (e.g. Andersen) only when the edition itself
+  credits them. One Vietnamese title can name different tales.
+- Co-authors whose roles the cover does not distinguish stay AUTHOR. Never
+  guess an illustrator.
 
 ## Git discipline
 `git status`, `git diff --check`, review the exact diff, run relevant tests
