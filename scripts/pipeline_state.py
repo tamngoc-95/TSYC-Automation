@@ -40,7 +40,7 @@ from prepare_product_content import (  # noqa: E402
     build_safe_draft,
     is_generic_safe_draft,
 )
-from src.domain import woo_remote_lifecycle
+from src.domain import woo_catalog_identity, woo_remote_lifecycle
 from src.domain.candidate_origin import is_fahasa_discovery_candidate_code
 from src.domain.content_status import InternalProductContentStatus
 from src.domain.decisions import DecisionResult, Outcome
@@ -90,6 +90,10 @@ ACCEPTED_WARNING_CODES = {
     # by exact id + SKU checks and recorded as an intentional terminal
     # state (src.domain.woo_remote_lifecycle). Never recreated.
     "REMOTE_WOO_PRODUCT_REMOVED",
+    # The mandatory pre-create catalog check (src.domain.woo_catalog_identity)
+    # proved the book is already an existing WooCommerce product. Terminal:
+    # never created a second time.
+    "EXISTING_WOO_PRODUCT",
 }
 
 # The full named state machine from the Phase C plan. run_batch.py's
@@ -135,6 +139,8 @@ RECOVERY_STATES = {
 
 TERMINAL_OR_MANUAL_STATES = {
     "DUPLICATE_REJECTED",
+    "EXISTING_WOO_PRODUCT",
+    "CATALOG_DUPLICATE_REVIEW",
     "IDENTITY_CONFLICT",
     "CONTENT_REVIEW_REQUIRED",
     "IMAGE_REVIEW_REQUIRED",
@@ -663,6 +669,13 @@ def derive_sync_recovery_state(
                 "media_upload_completed"
             ):
                 return ("RECOVERY_REVIEW_REQUIRED", "MEDIA_UPLOAD_INCOMPLETE")
+
+            # An uncertain create resolved as "never recreated: the book is
+            # an existing Woo product" (recover_historical_woo_create.py)
+            # stops being a recovery condition only with a consistent
+            # resolution record AND the product's terminal catalog marker.
+            if woo_catalog_identity.create_outcome_resolved(sync, internal_product):
+                return None
 
             return ("RECOVERY_REVIEW_REQUIRED", "CREATE_RESULT_UNCERTAIN")
 
@@ -1757,6 +1770,39 @@ def derive_candidate_state(
         )
 
     woocommerce_status = internal_product.get("woocommerce_status")
+
+    catalog_marker = woo_catalog_identity.blocking_marker(internal_product)
+
+    if catalog_marker is not None and woocommerce_status not in (
+        WooCommerceStatus.DRAFT_CREATED,
+        WooCommerceStatus.READY_TO_PUBLISH,
+        WooCommerceStatus.PUBLISHED,
+    ):
+        # The mandatory pre-create catalog check found this book already
+        # represented (create_woocommerce_draft.py). Never dispatched again.
+        if catalog_marker.get("terminal"):
+            return CandidateState(
+                candidate_code=candidate_code,
+                candidate_id=candidate_id,
+                product_code=product_code,
+                derived_state="EXISTING_WOO_PRODUCT",
+                terminal=True,
+                warnings=warnings + ["EXISTING_WOO_PRODUCT"],
+            )
+
+        return CandidateState(
+            candidate_code=candidate_code,
+            candidate_id=candidate_id,
+            product_code=product_code,
+            derived_state="CATALOG_DUPLICATE_REVIEW",
+            human_gate=True,
+            human_gate_reason=(
+                f"Catalog identity check {catalog_marker.get('classification')}: "
+                f"{catalog_marker.get('reason')} Decide whether this is the same "
+                "sellable book before any WooCommerce create."
+            ),
+            warnings=warnings,
+        )
 
     if woocommerce_status in (
         WooCommerceStatus.READY_TO_PUBLISH,

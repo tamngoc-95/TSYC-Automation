@@ -15,8 +15,11 @@ from requests.auth import HTTPBasicAuth
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
+import catalog_identity_loader
 from src.cli_bootstrap import configure_utf8_console
+from src.domain import woo_catalog_identity
 from src.domain.content_status import ContentStatus, InternalProductContentStatus
 from src.domain.image_status import ImageStatus, InternalProductImageStatus
 from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
@@ -28,7 +31,7 @@ configure_utf8_console()
 
 
 CREATOR_NAME = "woocommerce_draft_creator"
-CREATOR_VERSION = "1.4.0"
+CREATOR_VERSION = "1.5.0"
 
 VALID_CONFIRMATIONS = {
     "UPLOAD_AND_CREATE",
@@ -761,6 +764,138 @@ def find_product_by_sku(
     return matches[0]
 
 
+def run_catalog_identity_check(
+    repository: SupabaseRepository,
+    product: dict[str, Any],
+    store_url: str,
+    api_version: str,
+    consumer_key: str,
+    consumer_secret: str,
+    timeout_seconds: int,
+) -> woo_catalog_identity.CreateCheck:
+    """
+    Mandatory catalog identity check before any create (2026-10-22).
+
+    An exact-SKU search cannot prove a book is new: most live products
+    have no SKU. The whole catalog (every status, trash included), TSYC's
+    removal records and other local products are compared by ISBN, title,
+    author, volume, format and sellable unit. Only NEW_CONFIRMED may be
+    created; an incomplete catalog read fails closed.
+    """
+    snapshot = catalog_identity_loader.build_snapshot(
+        repository,
+        product_code=product["product_code"],
+        candidate_id=product["candidate_id"],
+        products_url=build_api_url(store_url=store_url, namespace=api_version, endpoint="products"),
+        auth=HTTPBasicAuth(consumer_key, consumer_secret),
+        headers={"Accept": "application/json", "User-Agent": f"{CREATOR_NAME}/{CREATOR_VERSION}"},
+        timeout=timeout_seconds,
+    )
+
+    try:
+        barcode = catalog_identity_loader.own_barcode(repository, product["candidate_id"])
+    except Exception as error:  # noqa: BLE001 -- fail closed
+        return woo_catalog_identity.CreateCheck(
+            woo_catalog_identity.CATALOG_UNAVAILABLE,
+            f"Own candidate could not be read ({type(error).__name__}); failing closed.",
+        )
+
+    return woo_catalog_identity.check_before_create(
+        woo_catalog_identity.idx.Listing(
+            title=product.get("title") or "",
+            isbn=product.get("isbn"),
+            author=product.get("author"),
+            publisher=product.get("publisher"),
+        ),
+        product_code=product["product_code"],
+        snapshot=snapshot,
+        barcode=barcode,
+    )
+
+
+def record_catalog_identity_block(
+    repository: SupabaseRepository,
+    product: dict[str, Any],
+    check: woo_catalog_identity.CreateCheck,
+) -> None:
+    """Persist a blocking check result on the internal product so the
+    pipeline stops this candidate instead of re-dispatching it. A
+    CATALOG_UNAVAILABLE result is transient and is never persisted."""
+    if check.classification == woo_catalog_identity.CATALOG_UNAVAILABLE:
+        return
+
+    metadata = product.get("product_metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    metadata[woo_catalog_identity.MARKER_KEY] = check.marker(
+        product_code=product["product_code"],
+        checked_at=utc_now(),
+        checked_by=f"{CREATOR_NAME}/{CREATOR_VERSION}",
+    )
+
+    response = (
+        repository.client
+        .table("internal_products")
+        .update({"product_metadata": metadata, "updated_at": utc_now()})
+        .eq("internal_product_id", product["internal_product_id"])
+        .eq("woocommerce_status", WooCommerceStatus.READY_FOR_DRAFT)
+        .execute()
+    )
+
+    if not response.data:
+        raise RuntimeError("Catalog identity result could not be recorded.")
+
+
+def find_trashed_products_by_sku(
+    store_url: str,
+    api_version: str,
+    consumer_key: str,
+    consumer_secret: str,
+    timeout_seconds: int,
+    sku: str,
+) -> list[dict[str, Any]]:
+    """Exact-SKU search in trash (status=any excludes trash). Raises on
+    any uncertain answer."""
+    response = requests.get(
+        build_api_url(store_url=store_url, namespace=api_version, endpoint="products"),
+        auth=HTTPBasicAuth(consumer_key, consumer_secret),
+        params={"sku": sku, "status": "trash", "per_page": 10},
+        headers={"Accept": "application/json", "User-Agent": f"{CREATOR_NAME}/{CREATOR_VERSION}"},
+        timeout=timeout_seconds,
+    )
+    payload = safe_json_response(response)
+
+    if response.status_code != 200 or not isinstance(payload, list):
+        raise RuntimeError(f"WooCommerce trash SKU check failed (HTTP {response.status_code}).")
+
+    return [item for item in payload if isinstance(item, dict) and str(item.get("sku") or "") == sku]
+
+
+def assert_sku_still_absent(
+    store_url: str,
+    api_version: str,
+    consumer_key: str,
+    consumer_secret: str,
+    timeout_seconds: int,
+    sku: str,
+) -> None:
+    """Fresh any+trash SKU re-check immediately before the POST: another
+    writer may have created the product since the catalog check."""
+    lookup = dict(
+        store_url=store_url,
+        api_version=api_version,
+        consumer_key=consumer_key,
+        consumer_secret=consumer_secret,
+        timeout_seconds=timeout_seconds,
+        sku=sku,
+    )
+
+    if find_product_by_sku(**lookup) or find_trashed_products_by_sku(**lookup):
+        raise RuntimeError(
+            f"SKU {sku} appeared in WooCommerce after the catalog check; "
+            "no product was created. Reconcile before any further attempt."
+        )
+
+
 def create_sync_record(
     repository: SupabaseRepository,
     product: dict[str, Any],
@@ -805,13 +940,30 @@ def mark_sync_in_progress(
     repository: SupabaseRepository,
     sync: dict[str, Any],
 ) -> dict[str, Any]:
-    """Mark the synchronization as in progress."""
+    """
+    Reserve the create: mark the synchronization IN_PROGRESS only if the
+    row is still exactly as this process read it (same status, same
+    updated_at, still no remote product ID). A concurrent creator that
+    reserved first changes the row, so this compare-and-set matches
+    nothing and this process stops before any upload or POST. The
+    reservation token is merged into response_payload as evidence.
+    """
     attempt_count = int(
         sync.get("sync_attempt_count")
         or 0
     )
 
-    response = (
+    reserved_at = utc_now()
+    existing_payload = sync.get("response_payload")
+    response_payload = dict(existing_payload) if isinstance(existing_payload, dict) else {}
+    response_payload["create_reservation"] = {
+        "reserved_at": reserved_at,
+        "reserved_by": f"{CREATOR_NAME}/{CREATOR_VERSION}",
+        "pid": os.getpid(),
+        "attempt": attempt_count + 1,
+    }
+
+    query = (
         repository.client
         .table("woocommerce_product_syncs")
         .update(
@@ -820,22 +972,31 @@ def mark_sync_in_progress(
                 "error_code": None,
                 "error_message": None,
                 "sync_attempt_count": attempt_count + 1,
-                "last_attempt_at": utc_now(),
-                "updated_at": utc_now(),
+                "last_attempt_at": reserved_at,
+                "updated_at": reserved_at,
+                "response_payload": response_payload,
             }
         )
         .eq(
             "sync_id",
             sync["sync_id"],
         )
-        .execute()
+        .is_("woocommerce_product_id", "null")
     )
 
-    rows = response.data or []
+    if sync.get("woocommerce_status"):
+        query = query.eq("woocommerce_status", sync["woocommerce_status"])
+
+    if sync.get("updated_at"):
+        query = query.eq("updated_at", sync["updated_at"])
+
+    rows = query.execute().data or []
 
     if not rows:
         raise RuntimeError(
-            "Could not mark WooCommerce sync as in progress."
+            "Could not reserve the WooCommerce create: the sync record "
+            "changed since it was read (another process may be creating "
+            "this product). Nothing was uploaded or created."
         )
 
     return rows[0]
@@ -2413,6 +2574,39 @@ def main() -> None:
 
         return
 
+    catalog_check = run_catalog_identity_check(
+        repository=repository,
+        product=product,
+        store_url=store_url,
+        api_version=api_version,
+        consumer_key=consumer_key,
+        consumer_secret=consumer_secret,
+        timeout_seconds=timeout_seconds,
+    )
+
+    print()
+    print(f"Catalog identity check: {catalog_check.classification}")
+    print(f"Reason: {catalog_check.reason}")
+
+    if not catalog_check.create_allowed:
+        for item in catalog_check.evidence[:10]:
+            print(f"  - {item.get('origin')} {item.get('ref')}: {item.get('reason')} ({item.get('title')!r})")
+
+        if args.confirm_create:
+            record_catalog_identity_block(
+                repository=repository,
+                product=product,
+                check=catalog_check,
+            )
+
+        print()
+        print(
+            "Draft creation stopped: the catalog identity check did not "
+            "confirm a new book. No product, media or sync record was created."
+        )
+
+        sys.exit(3)
+
     print()
 
     if args.confirm_create:
@@ -2510,6 +2704,15 @@ def main() -> None:
             ],
             request_payload=woo_payload,
             uploaded_media=uploaded_media,
+        )
+
+        assert_sku_still_absent(
+            store_url=store_url,
+            api_version=api_version,
+            consumer_key=consumer_key,
+            consumer_secret=consumer_secret,
+            timeout_seconds=timeout_seconds,
+            sku=product["product_code"],
         )
 
         product_response = create_woocommerce_product(

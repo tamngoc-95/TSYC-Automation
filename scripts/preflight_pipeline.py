@@ -555,7 +555,7 @@ def check_recovery_health(
             active_repository.client.table("woocommerce_product_syncs")
             .select(
                 "sync_id, internal_product_id, woocommerce_status, "
-                "woocommerce_product_id, response_payload"
+                "woocommerce_product_id, product_sku, response_payload"
             )
             .execute()
             .data
@@ -564,7 +564,7 @@ def check_recovery_health(
 
         internal_products = (
             active_repository.client.table("internal_products")
-            .select("internal_product_id, product_code, woocommerce_status")
+            .select("internal_product_id, product_code, woocommerce_status, product_metadata")
             .execute()
             .data
             or []

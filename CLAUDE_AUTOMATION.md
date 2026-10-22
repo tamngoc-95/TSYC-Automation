@@ -808,6 +808,7 @@ trash/status search
 sanctioned recovery logic
 human recovery review if uncertainty remains
 Candidate-specific recovery cases must not block unrelated candidates.
+Duplicate prevention (2026-10-22): a missing SKU never proves a new book. Every create runs the mandatory catalog identity check (all Woo statuses incl. trash, removal records, local products, barcodes kept apart from ISBN, Polylang groups as one logical product); only NEW_CONFIRMED creates, an unreadable catalog fails closed (docs/TSYC_RUNBOOK.md 7a). FAILED syncs without a Woo ID are recovered only with scripts/recover_historical_woo_create.py (owner removal or proven existing product; never cleared toward a new create).
 Non-Historical / Live Workflow Protection
 Historical low-touch rules must not silently weaken live/future workflows.
 For non-historical candidates:

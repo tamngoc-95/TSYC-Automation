@@ -72,11 +72,53 @@ product (SKU, status, media) on the next batch pass -- read-only against
 WooCommerce, never a duplicate create. An uncertain remote result stops that
 candidate as `RECOVERY_REQUIRED`; independent candidates continue.
 
+## 7a. Mandatory catalog identity check (every create)
+Most live products have no SKU, so an exact-SKU search never proves that a
+book is new. `create_woocommerce_draft.py` runs a full catalog identity check
+after the SKU check and before any sync reservation, media upload or POST
+(`src/domain/woo_catalog_identity.py`, loader `scripts/catalog_identity_loader.py`).
+
+What it compares:
+- every Woo product, all statuses including trash, with X-WP-Total verified;
+- TSYC removal records, including legacy remote-loss rows;
+- other internal products, candidates and MATCH references;
+- 893 publisher barcodes, kept separate from ISBN;
+- Polylang groups from the catalog-audit cache, so linked copies count once.
+
+What each result does:
+
+| Result | Effect |
+|---|---|
+| `NEW_CONFIRMED` | The only result that creates. |
+| `EXISTING_PRODUCT` | Terminal `EXISTING_WOO_PRODUCT`; never created. |
+| `REMOTE_REMOVED` | Terminal; the owner removed it, so it is never recreated. |
+| `POSSIBLE_DUPLICATE`, `DISTINCT_EDITION`, `LINKED_TRANSLATION`, `IDENTITY_CONFLICT` | Recorded in `product_metadata.catalog_identity_check`; human gate `CATALOG_DUPLICATE_REVIEW`. |
+| `CATALOG_UNAVAILABLE` | Fail closed, exit 3, nothing recorded. |
+
+Two more guards around the POST:
+- The create is reserved by a compare-and-set on the sync row. A concurrent creator loses before uploading anything.
+- A fresh exact-SKU any+trash re-check runs immediately before the POST.
+
 ## 8. Recovery
 `RECOVERY_REQUIRED` means remote state could not be confirmed. Never retry
 draft creation blindly. Reconcile manually with
 `sync_woocommerce_product_status.py`, confirm the real remote state, then
 resume the candidate.
+
+A FAILED sync **without** a Woo ID (the shapes the other tools refuse) goes to
+`recover_historical_woo_create.py`. It is GET-only remotely and a dry run unless
+`--confirm-apply`:
+```
+.venv/Scripts/python.exe scripts/recover_historical_woo_create.py --product-code TSYC-... --max-products N [--confirm-apply --non-interactive]
+```
+It handles two record shapes:
+- **Legacy remote loss**: the old Woo ID sits in `remote_loss_confirmed`.
+  - Requirement: fresh 404 by that ID, and exact SKU any = 0, trash = 0.
+  - Effect: it restores the historical ID and records the standard REMOTE_DELETED marker. The product is never recreated.
+- **Interrupted create**: no Woo ID was ever stored.
+  - Resolved only when exact SKU any = 0, trash = 0, **and** the catalog check proves `EXISTING_PRODUCT`.
+  - The original error stays, and the residual uncertainty is written down.
+  - Any other result keeps the recovery state; `NEW_CONFIRMED` is never cleared toward a new create.
 
 ## 9. Final audit
 ```

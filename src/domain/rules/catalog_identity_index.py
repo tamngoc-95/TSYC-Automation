@@ -252,8 +252,41 @@ def _series_overlap(listing_title: str, other_key: str) -> str | None:
     return None
 
 
+_TRAILING_SEGMENT_RE = re.compile(r"^(?P<title>.+?)\s*[-–—]\s*(?P<tail>[^-–—]+)$")
+
+
+def strip_author_suffix(title: str | None, author: str | None) -> str | None:
+    """The title of an owner-named Woo product "Title – Author" (also
+    "Title -Author"), but only when the trailing segment names exactly the
+    listing's own author(s); otherwise None. Production finding 2026-10-22:
+    Woo #1422 "Blockchain – Khởi Nguồn Cho Một Nền Kinh Tế Mới -Melanie Swan"."""
+    match = _TRAILING_SEGMENT_RE.match(_nfc(title))
+    if not match:
+        return None
+    tail_keys = _author_keys(match.group("tail"))
+    listing_keys = _author_keys(author)
+    if tail_keys and listing_keys and tail_keys <= listing_keys:
+        return match.group("title").strip()
+    return None
+
+
 def match_entry(listing: Listing, entry: IndexEntry) -> EntryMatch | None:
     """How strongly one structured index entry represents the listing."""
+    match = _match_entry(listing, entry)
+    if match is not None and match.strength == MATCH_CERTAIN:
+        return match
+    stripped = strip_author_suffix(entry.title, listing.author)
+    if stripped and folded_title_key(stripped):
+        named = _match_entry(listing, IndexEntry(**{**entry.__dict__, "title": stripped, "author": entry.author or listing.author}))
+        if named is not None and (match is None or _STRENGTH_RANK[named.strength] < _STRENGTH_RANK[match.strength]):
+            return EntryMatch(named.strength, f"{named.reason} (product name carries the author)", entry)
+    return match
+
+
+_STRENGTH_RANK = {MATCH_CERTAIN: 0, MATCH_EDITION: 1, MATCH_POSSIBLE: 2}
+
+
+def _match_entry(listing: Listing, entry: IndexEntry) -> EntryMatch | None:
     listing_isbn = _valid_isbn(listing.isbn)
     entry_isbn = _valid_isbn(entry.isbn)
 

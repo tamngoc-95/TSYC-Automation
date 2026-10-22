@@ -134,6 +134,11 @@ class FakeQueryBuilder:
         self._limit_n = count
         return self
 
+    def range(self, start: int, end: int) -> "FakeQueryBuilder":
+        """Mimic `.range(start, end)` (inclusive) for paged selects."""
+        self._range = (start, end)
+        return self
+
     # -- execution ---------------------------------------------------------
 
     def _passes_filters(self, row: dict[str, Any]) -> bool:
@@ -186,6 +191,10 @@ class FakeQueryBuilder:
 
             if self._limit_n is not None:
                 rows = rows[: self._limit_n]
+
+            if getattr(self, "_range", None) is not None:
+                start, end = self._range
+                rows = rows[start : end + 1]
 
             return FakeResponse(list(rows))
 
