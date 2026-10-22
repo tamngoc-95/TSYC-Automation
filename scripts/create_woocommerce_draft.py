@@ -734,10 +734,31 @@ def find_product_by_sku(
             "WooCommerce SKU check returned an unexpected response."
         )
 
-    if not response_payload:
+    # The REST "sku" filter is exact per WooCommerce docs; re-check anyway.
+    matches = [
+        item
+        for item in response_payload
+        if isinstance(item, dict)
+        and str(item.get("sku") or "") == sku
+    ]
+
+    if not matches:
         return None
 
-    return response_payload[0]
+    # Production already holds Polylang EN/DE copies that share their VI
+    # product's SKU (docs/POLYLANG_WOOCOMMERCE_PLAN.md section 1). Picking
+    # one of several products would let the caller reconcile local state
+    # onto the wrong (e.g. translated) product -- CLAUDE.md 5.2 recovery
+    # ambiguity, so stop instead of guessing.
+    if len(matches) > 1:
+        raise RuntimeError(
+            "WooCommerce SKU check is ambiguous: "
+            f"{len(matches)} remote products share SKU {sku} "
+            f"(ids {[item.get('id') for item in matches]}). "
+            "No product was created or reconciled -- resolve manually."
+        )
+
+    return matches[0]
 
 
 def create_sync_record(

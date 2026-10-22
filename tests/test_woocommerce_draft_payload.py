@@ -364,6 +364,54 @@ def test_find_product_by_sku_detects_duplicate_remote_sku(monkeypatch):
     assert len(calls) == 1
 
 
+def _fake_sku_search(monkeypatch, payload):
+    def fake_get(url, auth, params, headers, timeout):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return payload
+
+        return FakeResponse()
+
+    monkeypatch.setattr(cwd.requests, "get", fake_get)
+
+
+def _find(sku="TSYC-FB-2026-001-CAN-0001"):
+    return cwd.find_product_by_sku(
+        store_url="https://example.com",
+        api_version="wc/v3",
+        consumer_key="ck_test",
+        consumer_secret="cs_test",
+        timeout_seconds=5,
+        sku=sku,
+    )
+
+
+def test_find_product_by_sku_refuses_polylang_translation_copies(monkeypatch):
+    # Regression (2026-10-22): production holds VI/EN/DE copies sharing one
+    # SKU. Returning the first match would reconcile onto a translation.
+    sku = "TSYC-FB-2026-001-CAN-0001"
+    _fake_sku_search(monkeypatch, [
+        {"id": 4014, "sku": sku, "status": "draft"},
+        {"id": 3311, "sku": sku, "status": "draft"},
+        {"id": 4018, "sku": sku, "status": "publish"},
+    ])
+
+    with pytest.raises(RuntimeError, match="ambiguous.*3 remote products"):
+        _find(sku)
+
+
+def test_find_product_by_sku_ignores_non_exact_sku_rows(monkeypatch):
+    sku = "TSYC-FB-2026-001-CAN-0001"
+    _fake_sku_search(monkeypatch, [
+        {"id": 1, "sku": sku + "-OLD", "status": "draft"},
+        {"id": 2, "sku": sku, "status": "draft"},
+    ])
+
+    assert _find(sku)["id"] == 2
+
+
 def test_find_product_by_sku_returns_none_when_no_duplicate(monkeypatch):
     def fake_get(url, auth, params, headers, timeout):
         class FakeResponse:
