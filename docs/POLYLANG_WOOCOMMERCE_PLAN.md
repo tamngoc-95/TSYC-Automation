@@ -51,6 +51,30 @@ backorders, and nothing synchronises them.
   (VI `notify`, EN/DE `yes`).
 - The other 6 groups are consistent today, but only by manual discipline.
 
+Storefront link check 2026-10-22 (`audit_woo_translation_groups.py
+--check-links`; 22 public product pages, unauthenticated GET, nothing
+written):
+- All 8 groups are **already linked as Polylang translations**: every
+  published member's `hreflang` links point exactly at its SKU siblings.
+  There are no foreign links, no missing links and no links to products
+  without the SKU. So installing the add-on would synchronise these trios
+  immediately (section 3a, T10).
+- `TSYC-FB-2026-001-CAN-0003`: EN #4014 and DE #4018 link each other. The VI
+  draft #3311 has no public page, so its link cannot be seen (unverifiable,
+  not assumed). All three carry the same price 9.99, stock 0 and
+  backorders `yes`, and EN/DE are purchasable on backorder today.
+- `TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0022`: same price 13.99 and stock 0;
+  only backorders differ (VI `notify`, last modified 2026-10-07; EN/DE
+  `yes`). With the add-on, whichever copy is saved next would win.
+- Free Polylang exposes no product links over REST (`wp/v2/product` has no
+  `lang`/`translations`), so the storefront hreflang tags are the only
+  read-only evidence. Owner products without a SKU (1,896 of 1,986) are
+  not grouped by this audit.
+- Plugins (`system_status`, 2026-10-22): Polylang 3.8.4 active (3.9.1
+  available, not updated); both `pll-bulk-link-translations` 1.0 and 2.0 are
+  still active, with no author recorded and no REST routes; no other
+  multilingual plugin is installed.
+
 Consequences for TSYC (fixed 2026-10-22):
 - `create_woocommerce_draft.find_product_by_sku()` used to return the first
   of several exact-SKU matches and reconcile local state onto it. It could
@@ -178,6 +202,10 @@ relinks the existing copies. That is an owner decision.
    | T8 | Front end `/en/` and `/de/` product URLs, cart, checkout | work; LiteSpeed purge correct |
    | T9 | Both `pll-bulk-link-translations` states | the kept copy does not relink products |
    | T10 | Existing manual trio (e.g. the CAN-0022 clone, whose backorders differ) after install | add-on behaviour documented; no silent price/stock overwrite on the live-equivalent data |
+
+   Before and after T10, run `audit_woo_translation_groups.py --check-links`
+   against staging: the linked-trio set must be identical, and no
+   `TRANSLATION_LINK_FOREIGN` may appear.
 
    Offline status (2026-10-22): T1–T7 plus repeat-sync, uncertain-create and
    rollback are covered by `tests/test_woo_translation_group.py` against an

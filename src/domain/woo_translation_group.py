@@ -15,7 +15,8 @@ today's manual copies and later drive Polylang for WooCommerce
     (Polylang for WooCommerce). The link is explicit.
   * manual mode: no such fields. The language is inferred from the
     permalink prefix (`/en/`, `/de/`; VI is the unprefixed default). A
-    shared SKU is the only evidence of grouping.
+    shared SKU groups the copies; the storefront's hreflang links show
+    whether Polylang also links them (evaluate_storefront_links).
 
 Nothing in the group may be guessed. An unknown language, two members in
 one language, or a missing VI source is an ERROR, and callers must stop.
@@ -24,10 +25,11 @@ Pure functions only; no network, no database.
 """
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 SOURCE_LANGUAGE = "vi"
 TRANSLATION_LANGUAGES = ("en", "de")
@@ -227,6 +229,106 @@ def select_source_product(sku: str, matches: Sequence[Mapping[str, Any]]) -> dic
     if not group.ok:
         raise ValueError(f"Translation group for {sku} is inconsistent: {[i.code for i in group.errors]}")
     return group.source
+
+
+# --- Polylang links on the public storefront (manual mode) ---------------
+#
+# Free Polylang exposes no translation links over REST (`wc/v3` and
+# `wp/v2/product` carry no `lang`/`translations`). It does print one
+# `<link rel="alternate" hreflang>` per PUBLISHED translation on each
+# product page. That is the only read-only evidence that manual copies are
+# linked. It matters because Polylang for WooCommerce starts synchronising
+# price and stock across linked products once installed (plan section 3a).
+# A draft member has no public page and never appears in its siblings'
+# links, so its link cannot be verified this way.
+
+LINK_FOREIGN = "TRANSLATION_LINK_FOREIGN"
+LINK_MISSING = "TRANSLATION_LINK_MISSING"
+LINK_OUTSIDE_GROUP = "TRANSLATION_LINK_OUTSIDE_SKU_GROUP"
+LINK_UNVERIFIABLE = "TRANSLATION_LINK_UNVERIFIABLE"
+LINKED_BY_POLYLANG = "POLYLANG_LINKED_MANUAL_COPIES"
+
+_LINK_TAG = re.compile(r"<link\b[^>]*>", re.IGNORECASE)
+_TAG_ATTRIBUTE = re.compile(r"""([a-zA-Z_:-]+)\s*=\s*("([^"]*)"|'([^']*)')""")
+
+
+def parse_hreflang_links(page_html: str) -> dict[str, str]:
+    """{language: normalised URL} from a page's rel=alternate hreflang tags."""
+    links: dict[str, str] = {}
+    for tag in _LINK_TAG.findall(page_html or ""):
+        attributes = {
+            match.group(1).lower(): html.unescape(match.group(3) if match.group(3) is not None else match.group(4))
+            for match in _TAG_ATTRIBUTE.finditer(tag)
+        }
+        if "alternate" not in attributes.get("rel", "").lower().split():
+            continue
+        lang = attributes.get("hreflang", "").strip().lower().split("-")[0]
+        href = attributes.get("href", "").strip()
+        if lang and lang != "x" and href:
+            links[lang] = normalise_url(href)
+    return links
+
+
+def normalise_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    path = unquote(parsed.path or "/").rstrip("/") or "/"
+    return f"{parsed.netloc.lower()}{path}" + (f"?{parsed.query}" if parsed.query else "")
+
+
+def evaluate_storefront_links(
+    group: TranslationGroup, page_links: Mapping[str, Mapping[str, str] | None]
+) -> list[GroupIssue]:
+    """Compare each published member's hreflang links with the SKU group.
+
+    page_links: {language: parse_hreflang_links(...) of that member's page,
+    or None when the page could not be read}. Never guesses: a link to a
+    product outside the group is reported, not followed."""
+    issues: list[GroupIssue] = []
+    if len(group.members) < 2:
+        return issues
+    published = {lang: p for lang, p in group.members.items() if p.get("status") == "publish"}
+    expected = {lang: normalise_url(str(p.get("permalink") or "")) for lang, p in published.items()}
+
+    for lang, product in group.members.items():
+        if lang not in published:
+            issues.append(GroupIssue(
+                WARNING, LINK_UNVERIFIABLE,
+                f"#{product['id']} ({lang}) is {product.get('status')!r}: Polylang shows no public link to it."))
+
+    seen_links = False
+    for lang, product in published.items():
+        links = page_links.get(lang)
+        if links is None:
+            issues.append(GroupIssue(
+                WARNING, LINK_UNVERIFIABLE, f"#{product['id']} ({lang}): storefront page could not be read."))
+            continue
+        for other_lang, other_url in expected.items():
+            if other_lang == lang:
+                continue
+            got = links.get(other_lang)
+            if got is None:
+                issues.append(GroupIssue(
+                    WARNING, LINK_MISSING,
+                    f"#{product['id']} ({lang}) does not link {other_lang} #{published[other_lang]['id']}."))
+            elif got != other_url:
+                issues.append(GroupIssue(
+                    ERROR, LINK_FOREIGN,
+                    f"#{product['id']} ({lang}) links {other_lang} to {got}, not group member "
+                    f"#{published[other_lang]['id']}."))
+            else:
+                seen_links = True
+        for other_lang, got in links.items():
+            if other_lang not in group.members and other_lang in SUPPORTED_LANGUAGES:
+                issues.append(GroupIssue(
+                    WARNING, LINK_OUTSIDE_GROUP,
+                    f"#{product['id']} ({lang}) links {other_lang} to {got}, which does not carry this SKU."))
+
+    if seen_links and group.mode == MODE_MANUAL:
+        issues.append(GroupIssue(
+            WARNING, LINKED_BY_POLYLANG,
+            "Copies are linked as Polylang translations: once Polylang for WooCommerce is installed it "
+            "synchronises price and stock from whichever copy is saved next."))
+    return issues
 
 
 # --- Stage 5 planning (add-on mode only; not wired to any writer yet) ---

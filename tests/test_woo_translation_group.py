@@ -295,6 +295,103 @@ def test_audit_refuses_a_partial_catalog():
         audit_script.fetch_all_products(lambda page: [{"id": page}])
 
 
+# --- Polylang links on the storefront (manual mode) ---------------------
+
+def page(*links):
+    """A product page head with Polylang's hreflang tags, as on production."""
+    tags = "".join(f'<link rel="alternate" href="{url}" hreflang="{lang}" />\n' for lang, url in links)
+    return f'<html lang="vi"><head><link rel="profile" href="http://gmpg.org/xfn/11" />{tags}</head></html>'
+
+
+def trio(**vi_fields):
+    return wtg.evaluate_translation_group(SKU, [manual(3780, "vi", **vi_fields), manual(3926, "en"), manual(3927, "de")])
+
+
+def linked_pages(group):
+    links = [(lang, p["permalink"]) for lang, p in group.members.items() if p["status"] == "publish"]
+    return {lang: wtg.parse_hreflang_links(page(*links)) for lang, _ in links}
+
+
+def test_parse_hreflang_links_reads_only_alternates():
+    html_text = page(("de", f"{PROD}/de/product/wie-man/"), ("en", f"{PROD}/en/product/how-to/"),
+                     ("vi", f"{PROD}/product/noi-sao/"), ("x-default", f"{PROD}/product/noi-sao/"))
+    html_text += f"<link rel='alternate' hreflang='en-GB' href='{PROD}/en/product/how%2Dto/?a=1&amp;b=2' />"
+    assert wtg.parse_hreflang_links(html_text) == {
+        "de": "tiemsachyeucon.com/de/product/wie-man",
+        "en": "tiemsachyeucon.com/en/product/how-to?a=1&b=2",
+        "vi": "tiemsachyeucon.com/product/noi-sao",
+    }
+    assert wtg.parse_hreflang_links("") == {}
+
+
+def test_fully_linked_manual_trio_like_can_0022_warns_about_addon_sync():
+    group = trio(backorders="notify")
+    issues = wtg.evaluate_storefront_links(group, linked_pages(group))
+    assert [i.code for i in issues] == [wtg.LINKED_BY_POLYLANG]
+    assert issues[0].severity == wtg.WARNING
+
+
+def test_draft_source_like_can_0003_is_unverifiable_not_guessed():
+    group = trio(status="draft")
+    issues = wtg.evaluate_storefront_links(group, linked_pages(group))
+    assert sorted(i.code for i in issues) == [wtg.LINKED_BY_POLYLANG, wtg.LINK_UNVERIFIABLE]
+    assert "#3780 (vi) is 'draft'" in issues[0].detail
+
+
+def test_link_to_another_product_is_an_error():
+    group = trio()
+    pages = linked_pages(group)
+    pages["en"]["de"] = "tiemsachyeucon.com/de/product/some-other-book"
+    errors = [i for i in wtg.evaluate_storefront_links(group, pages) if i.severity == wtg.ERROR]
+    assert [i.code for i in errors] == [wtg.LINK_FOREIGN]
+    assert "#3926 (en) links de" in errors[0].detail
+
+
+def test_missing_link_unread_page_and_link_outside_the_sku_group():
+    group = wtg.evaluate_translation_group(SKU, [manual(3722, "vi"), manual(4008, "en")])
+    pages = {
+        "vi": wtg.parse_hreflang_links(page(("en", f"{PROD}/en/product/p-4008/"), ("de", f"{PROD}/de/product/no-sku/"))),
+        "en": None,
+    }
+    assert sorted(i.code for i in wtg.evaluate_storefront_links(group, pages)) == sorted([
+        wtg.LINK_OUTSIDE_GROUP, wtg.LINK_UNVERIFIABLE, wtg.LINKED_BY_POLYLANG])
+
+    unlinked = {"vi": {}, "en": {}}
+    assert sorted(i.code for i in wtg.evaluate_storefront_links(group, unlinked)) == [wtg.LINK_MISSING, wtg.LINK_MISSING]
+
+
+def test_single_product_needs_no_link_check():
+    group = wtg.evaluate_translation_group(SKU, [manual(1, "vi")])
+    assert wtg.evaluate_storefront_links(group, {}) == []
+
+
+def test_audit_check_links_reads_only_published_pages_within_budget():
+    import audit_woo_translation_groups as audit_script
+
+    products = [manual(3311, "vi", status="draft"), manual(4014, "en"), manual(4018, "de"),
+                {**manual(10, "vi"), "sku": "TSYC-SINGLE"}]
+    pages_by_url = {p["permalink"]: page(("en", products[1]["permalink"]), ("de", products[2]["permalink"]))
+                    for p in products[1:3]}
+    requested = []
+
+    def read_page(url):
+        requested.append(url)
+        return pages_by_url.get(url)
+
+    report = audit_script.audit(products, "TSYC-", read_page)
+    assert sorted(requested) == sorted(pages_by_url)
+    assert report["storefront_pages_read"] == 2
+    codes_found = [i["code"] for i in report["groups"][0]["issues"]]
+    assert wtg.LINK_UNVERIFIABLE in codes_found and wtg.LINKED_BY_POLYLANG in codes_found
+    assert report["errors"] == 0
+
+    requested.clear()
+    capped = audit_script.audit(products, "TSYC-", read_page, max_link_pages=1)
+    assert len(requested) == 1 and capped["storefront_pages_read"] == 1
+
+    assert audit_script.audit(products, "TSYC-")["storefront_links_checked"] is False
+
+
 def test_audit_script_only_issues_get_requests():
     source = (cwd.PROJECT_ROOT / "scripts" / "audit_woo_translation_groups.py").read_text(encoding="utf-8")
     for verb in ("requests.post", "requests.put", "requests.delete", "requests.patch", ".table("):
