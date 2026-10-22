@@ -59,7 +59,8 @@ MAX_PAGES = 200
 # --check-links: public storefront pages read per run (bounded, polite).
 MAX_LINK_PAGES = 60
 LINK_PAGE_DELAY_SECONDS = 0.5
-FIELDS = ",".join(("id", "sku", "status", "permalink", "name") + wtg.SHARED_FIELDS[1:])
+# meta_data: a draft's language is only known from TSYC's own meta.
+FIELDS = ",".join(("id", "sku", "status", "permalink", "name", "meta_data") + wtg.SHARED_FIELDS[1:])
 
 
 def fetch_all_products(get_page: Callable[[int], list[dict[str, Any]]]) -> list[dict[str, Any]]:

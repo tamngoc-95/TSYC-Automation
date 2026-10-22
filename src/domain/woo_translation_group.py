@@ -1,4 +1,4 @@
-"""One logical book = one WooCommerce translation group (VI source + EN/DE).
+﻿"""One logical book = one WooCommerce translation group (VI source + EN/DE).
 
 Background (read-only production checks, 2026-10-22): free Polylang 3.8.4
 already translates the `product` post type. Production holds ~874 VI,
@@ -68,6 +68,13 @@ FORBIDDEN_TRANSLATION_FIELDS = frozenset({
 BASIS_ADDON = "ADDON_LANG_FIELD"
 BASIS_PERMALINK_PREFIX = "PERMALINK_PREFIX"
 BASIS_PERMALINK_DEFAULT = "PERMALINK_DEFAULT"
+BASIS_TSYC_CREATED = "TSYC_CREATED"
+
+# TSYC's ownership meta (create_woocommerce_draft.py). TSYC creates products
+# only through wc/v3, where free Polylang assigns the default language (vi).
+# A future TSYC translation draft records its language explicitly.
+TSYC_OWNER_META_KEY = "_tsyc_internal_product_id"
+TSYC_LANGUAGE_META_KEY = "_tsyc_language"
 
 MODE_ADDON = "ADDON"
 MODE_MANUAL = "MANUAL"
@@ -100,12 +107,32 @@ def product_language(product: Mapping[str, Any]) -> tuple[str | None, str | None
     permalink = str(product.get("permalink") or "")
     if not permalink:
         return None, None
-    path = urlparse(permalink).path or "/"
+    parsed = urlparse(permalink)
+    path = parsed.path or "/"
     match = _LANG_PREFIX.match(path)
     if match:
         return match.group(1), BASIS_PERMALINK_PREFIX
+    if "p=" in parsed.query and path.strip("/") == "":
+        # A draft's "?post_type=product&p=N" link never carries a language
+        # prefix, whatever its language. Only TSYC's own products are known:
+        # by their recorded language meta, else vi (REST-created source).
+        if is_tsyc_created(product):
+            recorded = meta_value(product, TSYC_LANGUAGE_META_KEY)
+            return (str(recorded).lower() if recorded else SOURCE_LANGUAGE), BASIS_TSYC_CREATED
+        return None, None
     # Polylang hides the default-language (vi) prefix on this site.
     return SOURCE_LANGUAGE, BASIS_PERMALINK_DEFAULT
+
+
+def meta_value(product: Mapping[str, Any], key: str) -> Any:
+    for meta in product.get("meta_data") or []:
+        if isinstance(meta, Mapping) and meta.get("key") == key:
+            return meta.get("value")
+    return None
+
+
+def is_tsyc_created(product: Mapping[str, Any]) -> bool:
+    return bool(meta_value(product, TSYC_OWNER_META_KEY))
 
 
 @dataclass(frozen=True)
@@ -150,6 +177,9 @@ def _norm(field_name: str, value: Any) -> Any:
     if field_name == "stock_quantity":
         return None if value in (None, "") else int(value)
     return value
+
+
+normalise_field_value = _norm
 
 
 def evaluate_translation_group(sku: str, matches: Sequence[Mapping[str, Any]]) -> TranslationGroup:

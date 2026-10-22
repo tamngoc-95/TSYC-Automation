@@ -1,5 +1,10 @@
 # Polylang for WooCommerce: implementation plan (NOT implemented)
 
+> 2026-10-22: the owner and developer keep the existing architecture (free
+> Polylang + pll-bulk-link-translations v1/v2 + Flatsome Child hooks) and do
+> not buy the add-on for now. Current work: `POLYLANG_EXISTING_ARCHITECTURE.md`.
+> This plan stays as reference for a later decision.
+
 Status: plan only (2026-10-19). Nothing in this plan has been installed or
 purchased on any site. Every step that changes the live site needs the
 owner's explicit decision.
