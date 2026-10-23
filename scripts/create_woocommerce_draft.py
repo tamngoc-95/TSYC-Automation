@@ -810,6 +810,7 @@ def run_catalog_identity_check(
         product_code=product["product_code"],
         snapshot=snapshot,
         barcode=barcode,
+        reviewed_distinct=woo_catalog_identity.reviewed_distinct_keys(product),
     )
 
 

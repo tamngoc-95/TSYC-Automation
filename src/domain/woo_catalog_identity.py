@@ -121,8 +121,25 @@ def check_before_create(
     product_code: str,
     snapshot: CatalogSnapshot,
     barcode: str | None = None,
+    reviewed_distinct: frozenset[tuple[str, str, str]] = frozenset(),
 ) -> CreateCheck:
-    """Classify one product that is about to be created."""
+    """Classify one product that is about to be created.
+
+    ``reviewed_distinct`` (see reviewed_distinct_keys) only ever turns a
+    POSSIBLE_DUPLICATE whose every match was reviewed as a different book
+    into NEW_CONFIRMED; certain, edition, ISBN and barcode matches are
+    never affected."""
+    check = _check_before_create(listing, product_code=product_code, snapshot=snapshot, barcode=barcode)
+    return apply_distinct_review(check, reviewed_distinct)
+
+
+def _check_before_create(
+    listing: idx.Listing,
+    *,
+    product_code: str,
+    snapshot: CatalogSnapshot,
+    barcode: str | None,
+) -> CreateCheck:
     if not snapshot.complete:
         return CreateCheck(
             CATALOG_UNAVAILABLE,
@@ -240,6 +257,56 @@ def blocking_marker(internal_product: Mapping[str, Any] | None) -> Mapping[str, 
     if marker.get("product_code") != (internal_product or {}).get("product_code"):
         return None
     return marker
+
+
+# Evidence-based resolution of a CATALOG_DUPLICATE_REVIEW
+# (scripts/resolve_catalog_duplicate_review.py), 2026-10-23.
+REVIEW_KEY = "catalog_identity_review"
+REVIEW_DISTINCT = "DISTINCT"
+REVIEW_SAME_AS_EXISTING = "SAME_AS_EXISTING"
+
+
+def review_entry_key(origin: str, ref: str, title: str) -> tuple[str, str, str]:
+    """A reviewed match is bound to its exact origin, ref AND folded title:
+    if the other record is renamed, the review no longer applies."""
+    return (str(origin), str(ref), idx.folded_title_key(title))
+
+
+def reviewed_distinct_keys(internal_product: Mapping[str, Any] | None) -> frozenset[tuple[str, str, str]]:
+    """The (origin, ref, title key) matches recorded as different books for
+    this exact product code; empty without a valid DISTINCT review."""
+    metadata = (internal_product or {}).get("product_metadata")
+    review = metadata.get(REVIEW_KEY) if isinstance(metadata, Mapping) else None
+    if not isinstance(review, Mapping) or review.get("decision") != REVIEW_DISTINCT:
+        return frozenset()
+    if review.get("product_code") != (internal_product or {}).get("product_code"):
+        return frozenset()
+    keys = set()
+    for item in review.get("distinct_from") or ():
+        if isinstance(item, Mapping) and item.get("origin") and item.get("ref") and item.get("title"):
+            keys.add(review_entry_key(item["origin"], item["ref"], item["title"]))
+    return frozenset(keys)
+
+
+def apply_distinct_review(check: CreateCheck, reviewed: frozenset[tuple[str, str, str]]) -> CreateCheck:
+    """NEW_CONFIRMED only when the check is POSSIBLE_DUPLICATE and EVERY
+    piece of evidence is a POSSIBLE-strength match reviewed as distinct.
+    Any unreviewed, renamed, certain, edition or barcode match keeps the
+    block. The reviewed matches stay in the evidence."""
+    if not reviewed or check.classification != POSSIBLE_DUPLICATE or not check.evidence:
+        return check
+    for item in check.evidence:
+        if item.get("strength") != idx.MATCH_POSSIBLE:
+            return check
+        key = review_entry_key(item.get("origin") or "", item.get("ref") or "", item.get("title") or "")
+        if key not in reviewed:
+            return check
+    return CreateCheck(
+        NEW_CONFIRMED,
+        f"Only possible matches remain and each was reviewed as a different book ({check.reason}).",
+        tuple({**item, "reviewed_distinct": True} for item in check.evidence),
+        check.logical_products,
+    )
 
 
 # Resolution of an uncertain historical create (recover_historical_woo_create.py).

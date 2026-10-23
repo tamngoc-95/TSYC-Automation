@@ -99,6 +99,22 @@ Two more guards around the POST:
 - The create is reserved by a compare-and-set on the sync row. A concurrent creator loses before uploading anything.
 - A fresh exact-SKU any+trash re-check runs immediately before the POST.
 
+Resolving a `CATALOG_DUPLICATE_REVIEW` once the evidence is clear (cover,
+publisher, translator, language, sellable unit), with the sources in a JSON
+file (`{"summary": ..., "sources": [{"source", "finding"}]}`):
+```
+.venv/Scripts/python.exe scripts/resolve_catalog_duplicate_review.py --product-code TSYC-<code> --decision SAME_AS_EXISTING --woo-id <id> --evidence-file <file> --max-products 1   (dry run)
+.venv/Scripts/python.exe scripts/resolve_catalog_duplicate_review.py --product-code TSYC-<code> --decision DISTINCT --distinct-from <ref> --evidence-file <file> --max-products 1 --confirm-apply
+```
+- `SAME_AS_EXISTING` writes the terminal `EXISTING_PRODUCT` marker; every
+  `--woo-id` must be in the stored evidence and is re-read live (not trashed).
+- `DISTINCT` records the exact (origin, ref, title) of each reviewed POSSIBLE
+  match in `product_metadata.catalog_identity_review`, and a fresh complete
+  catalog check must then return `NEW_CONFIRMED`. The create path applies the
+  same review before every POST. It never clears a certain, edition, ISBN or
+  barcode match, nor a new match or one whose title has changed since.
+- If the evidence stays uncertain, leave the gate in place.
+
 ## 8. Recovery
 `RECOVERY_REQUIRED` means remote state could not be confirmed. Never retry
 draft creation blindly. Reconcile manually with
