@@ -107,6 +107,11 @@ def plan_resolution(
         return plan
 
     stored = [item for item in marker.get("evidence") or () if isinstance(item, dict)]
+    total = marker.get("evidence_total")
+    if isinstance(total, int) and total > len(stored):
+        plan.reason = (f"The stored check evidence is truncated ({len(stored)} of {total}); "
+                       "a review cannot cover matches it cannot cite.")
+        return plan
     by_ref = {str(item.get("ref")): item for item in stored}
     review = {
         "decision": decision,

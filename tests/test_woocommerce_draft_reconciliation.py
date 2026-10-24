@@ -16,6 +16,8 @@ media upload function -- it only reads/writes through the fake repository.
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 import create_woocommerce_draft as woo
@@ -425,3 +427,81 @@ def test_mark_sync_failed_preserves_prior_response_payload_evidence():
     # This attempt's own failure evidence must also be present.
     assert updated["response_payload"]["error"]["code"] == "woocommerce_rest_product_not_created"
     assert updated["woocommerce_status"] == WooCommerceSyncStatus.FAILED
+
+
+def _partial_upload_repository(sync_id: str) -> FakeSupabaseRepository:
+    return FakeSupabaseRepository(
+        tables={
+            "woocommerce_product_syncs": [
+                {
+                    "sync_id": sync_id,
+                    "internal_product_id": INTERNAL_PRODUCT_ID,
+                    "woocommerce_status": WooCommerceSyncStatus.IN_PROGRESS,
+                    "woocommerce_product_id": None,
+                    "response_payload": {
+                        "create_reservation": {"attempt": 1},
+                    },
+                }
+            ]
+        }
+    )
+
+
+def test_mark_sync_failed_keeps_media_saved_during_a_failed_upload():
+    """Regression (FAHASA-2026-003-CAN-0006, 2026-10-24): a Supabase download
+    failed on the 6th image after 5 WordPress uploads. Each upload had been
+    saved by save_uploaded_media_progress, but the failure handler recorded
+    the caller's stale pre-upload list ([]), erasing media #4999..#5003 --
+    a retry would have uploaded duplicates instead of reusing them."""
+    sync_id = "sync-partial-1"
+    repository = _partial_upload_repository(sync_id)
+    stale_sync = copy.deepcopy(repository.client.table("woocommerce_product_syncs").select("*").eq(
+        "sync_id", sync_id
+    ).execute().data[0])
+    saved = [
+        {"source_image_id": "img-1", "wordpress_media_id": 4999},
+        {"source_image_id": "img-2", "wordpress_media_id": 5000},
+    ]
+    woo.save_uploaded_media_progress(repository=repository, sync_id=sync_id, uploaded_media=saved)
+
+    woo.mark_sync_failed(
+        repository=repository,
+        sync_id=sync_id,
+        error_code="SUPABASE_IMAGE_DOWNLOAD_FAILED",
+        error_message="Could not download the image through authenticated Supabase Storage.",
+        uploaded_media=[],
+        error_payload={"exception_type": "RemoteProtocolError"},
+        existing_response_payload=stale_sync.get("response_payload"),
+    )
+
+    payload = repository.client.table("woocommerce_product_syncs").select("*").eq(
+        "sync_id", sync_id
+    ).execute().data[0]["response_payload"]
+    assert payload["uploaded_media"] == saved
+    assert payload["media_upload_completed"] is False
+    assert payload["create_reservation"] == {"attempt": 1}
+
+
+def test_mark_sync_failed_after_complete_upload_marks_media_completed():
+    sync_id = "sync-complete-1"
+    repository = _partial_upload_repository(sync_id)
+    media = [
+        {"source_image_id": "img-1", "wordpress_media_id": 4999},
+        {"source_image_id": "img-2", "wordpress_media_id": 5000},
+    ]
+    woo.save_uploaded_media_progress(repository=repository, sync_id=sync_id, uploaded_media=media)
+
+    woo.mark_sync_failed(
+        repository=repository,
+        sync_id=sync_id,
+        error_code="woocommerce_rest_product_not_created",
+        error_message="create failed",
+        uploaded_media=media,
+        error_payload={"code": "x"},
+    )
+
+    payload = repository.client.table("woocommerce_product_syncs").select("*").eq(
+        "sync_id", sync_id
+    ).execute().data[0]["response_payload"]
+    assert payload["uploaded_media"] == media
+    assert payload["media_upload_completed"] is True

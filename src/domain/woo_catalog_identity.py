@@ -35,6 +35,7 @@ from src.domain.rules import catalog_identity_index as idx
 from src.domain.rules import identity_rules
 
 CHECK_VERSION = "1.0.0"
+MARKER_EVIDENCE_LIMIT = 200
 
 EXISTING_PRODUCT = "EXISTING_PRODUCT"
 LINKED_TRANSLATION = "LINKED_TRANSLATION"
@@ -82,12 +83,18 @@ class CreateCheck:
         return self.classification in CREATE_ALLOWED
 
     def marker(self, *, product_code: str, checked_at: str, checked_by: str) -> dict[str, Any]:
-        """The evidence record stored on internal_products.product_metadata."""
+        """The evidence record stored on internal_products.product_metadata.
+
+        A DISTINCT review must cover every match (apply_distinct_review), and
+        the reviewer can only cite stored evidence: a series with many sibling
+        records needs all of them stored, so the bound is generous and the
+        full count is recorded (evidence_total) to make truncation visible."""
         return {
             "classification": self.classification,
             "reason": self.reason,
             "product_code": product_code,
-            "evidence": list(self.evidence)[:20],
+            "evidence": list(self.evidence)[:MARKER_EVIDENCE_LIMIT],
+            "evidence_total": len(self.evidence),
             "logical_products": [list(ids) for ids in self.logical_products],
             "terminal": self.classification in TERMINAL_CLASSIFICATIONS,
             "checked_at": checked_at,

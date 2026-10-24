@@ -144,6 +144,33 @@ def test_apply_is_bounded_and_logged():
     assert repository.client.tables["process_logs"][-1]["process_name"] == res.TOOL_NAME
 
 
+def test_marker_stores_every_sibling_match_of_a_large_series():
+    """Regression (FAHASA-2026-003 Mix And Match, 2026-10-24): the marker
+    kept only 20 evidence items, so once 21+ sibling records matched, the
+    resolver could not cite the dropped ones and DISTINCT never passed."""
+    listing = idx.Listing(title="Mix And Match - Bé Tập Phối Đồ - Trang Phục Bốn Mùa")
+    entries = [idx.IndexEntry(origin=idx.ORIGIN_CANDIDATE, ref=f"S-{a}{b}",
+                              title=f"Mix And Match - Bé Tập Phối Đồ - Chủ Đề {a}{b}")
+               for a in "XY" for b in "abcdefghijklm"]
+    check = wci.check_before_create(listing, product_code=CODE, snapshot=snap(*entries))
+    marker = check.marker(product_code=CODE, checked_at="t0", checked_by="test")
+    assert marker["evidence_total"] == len(check.evidence) == len(marker["evidence"]) > 20
+
+    product = blocked_product(marker["evidence"])
+    reviewed = plan(product, wci.REVIEW_DISTINCT, refs=[e["ref"] for e in marker["evidence"]],
+                    run_check=lambda p: wci.check_before_create(
+                        listing, product_code=CODE, snapshot=snap(*entries),
+                        reviewed_distinct=wci.reviewed_distinct_keys(p)))
+    assert reviewed.ok and reviewed.marker["classification"] == wci.NEW_CONFIRMED
+
+
+def test_distinct_plan_refuses_truncated_stored_evidence():
+    product = blocked_product(MOON_EVIDENCE)
+    product["product_metadata"][wci.MARKER_KEY]["evidence_total"] = 2
+    result = plan(product, wci.REVIEW_DISTINCT, refs=[MOON.ref])
+    assert not result.ok and "truncated" in result.reason
+
+
 def test_existing_product_review_makes_the_candidate_terminal():
     result = plan(blocked_product(WOO_EVIDENCE, logical=[(1493, 1494, 1495)]), wci.REVIEW_SAME_AS_EXISTING, woo_ids=[1493])
     marker = wci.blocking_marker({"product_code": CODE, "product_metadata": {wci.MARKER_KEY: result.marker}})

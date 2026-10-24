@@ -2004,6 +2004,45 @@ def create_woocommerce_product(
     return response_payload
 
 
+def merge_saved_media_progress(
+    repository: SupabaseRepository,
+    sync_id: str,
+    uploaded_media: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Union of the media progress saved on the sync row and uploaded_media,
+    keyed by source_image_id (the in-memory record wins), saved order first."""
+    rows = (
+        repository.client
+        .table("woocommerce_product_syncs")
+        .select("*")
+        .eq(
+            "sync_id",
+            sync_id,
+        )
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+
+    saved = extract_uploaded_media(rows[0]) if rows else []
+    in_memory = {
+        item.get("source_image_id"): item
+        for item in uploaded_media
+    }
+
+    merged = [
+        in_memory.pop(item.get("source_image_id"), item)
+        for item in saved
+    ]
+
+    return merged + [
+        item
+        for item in uploaded_media
+        if item.get("source_image_id") in in_memory
+    ]
+
+
 def mark_sync_failed(
     repository: SupabaseRepository,
     sync_id: str,
@@ -2023,7 +2062,24 @@ def mark_sync_failed(
     response_payload already existed -- never discard the rest of the
     row's history, mirroring the additive-merge pattern already used by
     build_cleared_response_payload() in clear_woocommerce_sync_recovery.py.
+
+    uploaded_media is merged with the media progress already saved on the
+    row (save_uploaded_media_progress persists each upload as it happens):
+    a failure in the middle of upload_or_reuse_product_images reaches the
+    caller with its pre-upload list, and recording that stale list would
+    erase the IDs of media already in WordPress -- the next attempt would
+    then upload duplicates instead of reusing them (CLAUDE.md 18).
     """
+    merged_media = merge_saved_media_progress(
+        repository=repository,
+        sync_id=sync_id,
+        uploaded_media=uploaded_media,
+    )
+    # Media recovered only from saved progress means the upload stopped part
+    # way: pipeline_state reports MEDIA_UPLOAD_INCOMPLETE for that row.
+    media_upload_completed = bool(uploaded_media) and len(merged_media) == len(uploaded_media)
+    uploaded_media = merged_media
+
     if isinstance(
         error_payload,
         dict,
@@ -2046,9 +2102,7 @@ def mark_sync_failed(
     response_payload.update(
         {
             "uploaded_media": uploaded_media,
-            "media_upload_completed": bool(
-                uploaded_media
-            ),
+            "media_upload_completed": media_upload_completed,
             "error": normalized_error_payload,
             "failed_at": utc_now(),
         }
