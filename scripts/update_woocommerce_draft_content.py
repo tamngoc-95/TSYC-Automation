@@ -55,6 +55,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 import create_woocommerce_draft as cwd  # noqa: E402
 from src.cli_bootstrap import configure_utf8_console  # noqa: E402
+from src.domain import woo_remote_status  # noqa: E402
 from src.domain.rules import storefront_text, woo_presentation  # noqa: E402
 from src.domain.woocommerce_status import WooCommerceStatus  # noqa: E402
 from src.repositories.supabase_repository import SupabaseRepository  # noqa: E402
@@ -266,7 +267,7 @@ def load_local_target(repository: SupabaseRepository, product_code: str) -> dict
 
     syncs = (
         repository.client.table("woocommerce_product_syncs")
-        .select("sync_id, woocommerce_product_id, product_sku, woocommerce_status, request_payload")
+        .select("sync_id, woocommerce_product_id, product_sku, woocommerce_status, request_payload, response_payload")
         .eq("internal_product_id", product["internal_product_id"])
         .execute()
         .data
@@ -303,6 +304,10 @@ def run_update(
         return report
 
     sync = local["sync"]
+    blocked = woo_remote_status.local_write_block_reason(local["product"], sync, allow_published=allow_published)
+    if blocked is not None:
+        report.update(result=LOCAL_NOT_READY, detail=f"Local write gate: {blocked}")
+        return report
     product_id = sync["woocommerce_product_id"]
     sku = str(sync["product_sku"])
     report["woocommerce_product_id"] = product_id

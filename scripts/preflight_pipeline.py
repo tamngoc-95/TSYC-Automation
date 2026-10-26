@@ -27,6 +27,7 @@ scripts/run_batch.py already does, rather than duplicating either.
 from __future__ import annotations
 
 import argparse
+import collections
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -71,7 +72,7 @@ from pipeline_state import derive_sync_recovery_state  # noqa: E402
 configure_utf8_console()
 
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 
 PYTHON_EXE = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
 
@@ -687,6 +688,101 @@ def check_woo_read(
     )
 
 
+def check_woo_remote_state(
+    *,
+    configuration_ok: bool,
+    repository: Any | None,
+    repository_factory: Callable[[], Any],
+    reader: Any,
+) -> PreflightCheck:
+    """Compare every TSYC sync row with the live remote product (GETs only,
+    one fresh validation pass -- no result is reused from an earlier run).
+
+    A failed bulk read or an outage-sized share of unreadable products is
+    systemic and blocks every production write. Per-product mismatches
+    (owner published/removed/restored, SKU mismatch, uncertain create) are
+    candidate-specific: reported as warnings, and every writer refuses that
+    product through src.domain.woo_remote_status.local_write_block_reason /
+    its own fresh re-read. Reuses scripts/audit_woo_remote_status.py."""
+    if not configuration_ok:
+        return PreflightCheck(
+            code="WOO_REMOTE_STATE",
+            status=CheckStatus.FAIL,
+            message="Skipped: required Supabase/WooCommerce configuration is missing.",
+        )
+    try:
+        import audit_woo_remote_status as remote_status  # noqa: E402
+
+        active_repository = repository if repository is not None else repository_factory()
+        records = remote_status.load_local_records(active_repository)
+        report = remote_status.run_check(records, reader)
+    except Exception as error:
+        return PreflightCheck(
+            code="WOO_REMOTE_STATE",
+            status=CheckStatus.FAIL,
+            message=f"Remote state check failed: {type(error).__name__}: {error}",
+        )
+
+    if report.systemic_failure:
+        return PreflightCheck(
+            code="WOO_REMOTE_STATE",
+            status=CheckStatus.FAIL,
+            display="UNRELIABLE",
+            message=f"Remote state cannot be verified: {report.systemic_message}",
+        )
+
+    mismatches = collections.Counter(r.classification for r in report.mismatches)
+    if mismatches:
+        return PreflightCheck(
+            code="WOO_REMOTE_STATE",
+            status=CheckStatus.WARNING,
+            display="MISMATCHES",
+            message=f"{sum(mismatches.values())} product(s) differ from their remote state.",
+            warning_lines=tuple(
+                f"WOO_REMOTE_STATE {name}: {count} (candidate-specific; writes to these products are refused; "
+                "see scripts/audit_woo_remote_status.py --plan)"
+                for name, count in sorted(mismatches.items())
+            ),
+        )
+    return PreflightCheck(
+        code="WOO_REMOTE_STATE",
+        status=CheckStatus.PASS,
+        message=f"{len(report.results)} sync row(s) match their remote state.",
+    )
+
+
+def check_writer_lock(inspect: Callable[[], Any]) -> PreflightCheck:
+    """Single-writer rule: another live production writer blocks."""
+    from src.services import writer_lock
+
+    try:
+        state = inspect()
+    except Exception as error:
+        return PreflightCheck(
+            code="WRITER_LOCK",
+            status=CheckStatus.FAIL,
+            message=f"Writer lock could not be inspected: {type(error).__name__}: {error}",
+        )
+    holder = state.holder or {}
+    if state.state == writer_lock.HELD_BY_OTHER:
+        return PreflightCheck(
+            code="WRITER_LOCK",
+            status=CheckStatus.FAIL,
+            display="BUSY",
+            message=(f"Concurrent production writer: PID {holder.get('pid')} ({holder.get('owner')}) "
+                     f"holds {state.path.name} since {holder.get('acquired_at')}."),
+        )
+    if state.state in (writer_lock.STALE, writer_lock.UNREADABLE):
+        return PreflightCheck(
+            code="WRITER_LOCK",
+            status=CheckStatus.WARNING,
+            display=state.state,
+            message=(f"{state.path.name} is {state.state.lower()} (holder {holder.get('pid')}); the next writer "
+                     "takes over a stale lock, an unreadable one must be inspected."),
+        )
+    return PreflightCheck(code="WRITER_LOCK", status=CheckStatus.PASS, message="No other production writer.")
+
+
 _FORBIDDEN_DISPATCH_SUBSTRINGS = (
     "publish",
     "PUBLISH",
@@ -897,6 +993,8 @@ def run_preflight(
     subprocess_runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
     git_runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
     http_get: Callable[..., Any] | None = None,
+    woo_remote_reader: Any | None = None,
+    writer_lock_inspector: Callable[[], Any] | None = None,
 ) -> PreflightResult:
     """Run every deterministic preflight check and return the aggregate result.
 
@@ -949,6 +1047,21 @@ def run_preflight(
         env=active_env,
         http_get=active_http_get,
     )
+    if woo_remote_reader is None and woo_config_ok:
+        import audit_woo_remote_status as remote_status  # noqa: E402
+
+        woo_remote_reader = remote_status.build_reader(active_env, http_get=active_http_get)
+    woo_remote_state_check = check_woo_remote_state(
+        configuration_ok=supabase_config_ok and woo_config_ok and woo_read_check.status == CheckStatus.PASS,
+        repository=repository,
+        repository_factory=active_repository_factory,
+        reader=woo_remote_reader,
+    )
+    if writer_lock_inspector is None:
+        from src.services.writer_lock import inspect_lock
+
+        writer_lock_inspector = inspect_lock
+    writer_lock_check = check_writer_lock(writer_lock_inspector)
     orchestrator_safety_check = check_orchestrator_safety()
     git_state_check = check_git_state(active_git_runner)
 
@@ -962,6 +1075,8 @@ def run_preflight(
             pipeline_audit_check,
             recovery_health_check,
             woo_read_check,
+            woo_remote_state_check,
+            writer_lock_check,
             orchestrator_safety_check,
             git_state_check,
         )
@@ -994,6 +1109,8 @@ _LABELS: dict[str, str] = {
     "PIPELINE_AUDIT": "Pipeline audit",
     "RECOVERY_HEALTH": "Recovery health",
     "WOO_READ": "Woo read connectivity",
+    "WOO_REMOTE_STATE": "Woo remote state",
+    "WRITER_LOCK": "Writer lock",
     "ORCHESTRATOR_SAFETY": "Orchestrator safety",
     "GIT_STATE": "Git state",
 }

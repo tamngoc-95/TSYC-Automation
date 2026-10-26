@@ -45,6 +45,7 @@ from src.cli_bootstrap import configure_utf8_console  # noqa: E402
 from src.domain.decisions import Outcome  # noqa: E402
 from src.domain.rules import lane_rules  # noqa: E402
 from src.repositories.supabase_repository import SupabaseRepository  # noqa: E402
+from src.services.writer_lock import ProductionWriterLock, WriterLockBusy  # noqa: E402
 
 import preflight_pipeline  # noqa: E402
 from pipeline_state import (  # noqa: E402
@@ -1524,6 +1525,7 @@ def main(
     subprocess_runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
     confirm: Callable[[str], bool] | None = None,
     preflight_runner: Callable[[], preflight_pipeline.PreflightResult] | None = None,
+    writer_lock: Any | None = None,
 ) -> int:
     """Run the batch orchestrator. Returns a process exit code.
 
@@ -1582,6 +1584,29 @@ def main(
             )
             return 2
 
+        # Single-writer rule (CLAUDE_AUTOMATION.md): a production run holds
+        # the writer lock for its whole duration; a live holder refuses.
+        lock = writer_lock if writer_lock is not None else ProductionWriterLock(f"run_batch/{SCRIPT_VERSION}")
+        try:
+            lock.acquire()
+        except WriterLockBusy as error:
+            print(f"Error: {error} Refusing to start production writes.", file=sys.stderr)
+            return 2
+        try:
+            return _execute_allowlist(args, allowlist, repository, subprocess_runner, confirm)
+        finally:
+            lock.release()
+
+    return _execute_allowlist(args, allowlist, repository, subprocess_runner, confirm)
+
+
+def _execute_allowlist(
+    args: argparse.Namespace,
+    allowlist: list[str],
+    repository: SupabaseRepository,
+    subprocess_runner: Callable[[list[str]], subprocess.CompletedProcess],
+    confirm: Callable[[str], bool],
+) -> int:
     expected_batch_id: str | None = None
 
     if args.batch_code:

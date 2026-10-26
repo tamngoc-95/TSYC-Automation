@@ -46,6 +46,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 import create_woocommerce_draft as cwd  # noqa: E402
 from src.cli_bootstrap import configure_utf8_console  # noqa: E402
+from src.domain import woo_remote_status  # noqa: E402
 from src.domain.rules import preorder_inventory_rules as rules  # noqa: E402
 
 configure_utf8_console()
@@ -108,7 +109,7 @@ def load_local_target(repository: Any, product_code: str) -> dict[str, Any]:
 
     syncs = (
         repository.client.table("woocommerce_product_syncs")
-        .select("sync_id, woocommerce_product_id, product_sku, request_payload")
+        .select("sync_id, woocommerce_product_id, product_sku, woocommerce_status, request_payload, response_payload")
         .eq("internal_product_id", product["internal_product_id"]).execute().data
         or []
     )
@@ -117,6 +118,9 @@ def load_local_target(repository: Any, product_code: str) -> dict[str, Any]:
     sync = syncs[0]
     if not sync.get("woocommerce_product_id") or not sync.get("product_sku"):
         raise RuntimeError("Sync row has no remote product id / SKU; remote identity is not certain.")
+    blocked = woo_remote_status.local_write_block_reason(product, sync)
+    if blocked is not None:
+        raise RuntimeError(f"Local write gate: {blocked}")
     return {"product": product, "candidate": candidate, "sync": sync}
 
 

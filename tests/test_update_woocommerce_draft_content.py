@@ -67,8 +67,9 @@ def patched_local(monkeypatch):
 
     def fake_load(repository, product_code):
         return {
-            "product": {"candidate_id": "c1", "product_code": product_code},
-            "sync": {"woocommerce_product_id": 101, "product_sku": SKU, "request_payload": dict(ORIGINAL)},
+            "product": {"candidate_id": "c1", "product_code": product_code, "woocommerce_status": "DRAFT_CREATED"},
+            "sync": {"woocommerce_product_id": 101, "product_sku": SKU, "woocommerce_status": "DRAFT_CREATED",
+                     "request_payload": dict(ORIGINAL), "response_payload": {}},
             "content": content,
         }
 
@@ -177,8 +178,11 @@ def test_published_update_preserves_status_and_prices(patched_local_published):
 def test_published_without_flag_is_never_written(patched_local_published):
     client = FakeClient(_remote(status="publish"))
     report = uwd.run_update(None, client, SKU, dry_run=False, allow_published=False)
-    assert report["result"] == uwd.NOT_DRAFT
+    # Refused by the local write gate before the remote is even read.
+    assert report["result"] == uwd.LOCAL_NOT_READY
+    assert "PUBLISHED_NOT_AUTHORIZED" in report["detail"]
     assert client.puts == []
+    assert client.gets == 0
 
 
 def test_published_manual_edit_is_never_overwritten(patched_local_published):

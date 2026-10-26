@@ -57,6 +57,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 import create_woocommerce_draft as cwd  # noqa: E402
 from src.cli_bootstrap import configure_utf8_console  # noqa: E402
+from src.domain import woo_remote_status  # noqa: E402
 from src.domain.rules import preorder_inventory_rules  # noqa: E402
 from src.domain.rules import woo_gallery_rules as rules  # noqa: E402
 from src.domain.woocommerce_status import WooCommerceStatus, WooCommerceSyncStatus  # noqa: E402
@@ -152,6 +153,9 @@ def load_local_target(repository: Any, product_code: str) -> dict[str, Any]:
         raise RuntimeError("Sync row has no remote product id or a different SKU; remote identity is not certain.")
     if sync.get("woocommerce_status") != WooCommerceSyncStatus.DRAFT_CREATED:
         raise RuntimeError(f"Sync status is {sync.get('woocommerce_status')!r}, not DRAFT_CREATED.")
+    blocked = woo_remote_status.local_write_block_reason(product, sync)
+    if blocked is not None:
+        raise RuntimeError(f"Local write gate: {blocked}")
 
     images = cwd.get_publishable_images(repository=repository, candidate_id=product["candidate_id"])
     mains = [image for image in images if image.get("is_selected_main_image") is True]

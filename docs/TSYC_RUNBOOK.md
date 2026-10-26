@@ -22,9 +22,13 @@ Never use system Python when `.venv` exists.
 Read-only. Checks Python environment, configuration presence, Supabase read
 connectivity, domain/schema drift, the decision engine, the deterministic
 pipeline audit, recovery health, WooCommerce read connectivity, orchestrator
-safety config, and Git state. Ends with `READY_FOR_BATCH` (exit 0) or
+safety config, the remote Woo state of every TSYC product (section 7b), the
+production writer lock, and Git state. Ends with `READY_FOR_BATCH` (exit 0) or
 `NOT_READY_FOR_BATCH` (exit 1). `run_batch.py` also runs this in-process
 before any non-dry-run batch and refuses to start writes on a blocker.
+A non-dry-run `run_batch.py` holds `data/processed/orchestration/production_writer.lock`
+for its whole run; a second production writer refuses to start while a live
+process holds it (a lock left by a dead process is taken over and reported).
 
 ## 3. Start bounded batch
 ```
@@ -114,6 +118,52 @@ file (`{"summary": ..., "sources": [{"source", "finding"}]}`):
   same review before every POST. It never clears a certain, edition, ISBN or
   barcode match, nor a new match or one whose title has changed since.
 - If the evidence stays uncertain, leave the gate in place.
+
+## 7b. Remote status check and local-only reconciliation
+The shop owner publishes, trashes, deletes and restores products directly in
+WooCommerce. `scripts/audit_woo_remote_status.py` compares every
+`woocommerce_product_syncs` row with the live product (GETs only) and
+classifies it (`src/domain/woo_remote_status.py`):
+
+| Class | Meaning | Next step |
+|---|---|---|
+| `CONSISTENT` | local and remote agree | none |
+| `REMOTE_PUBLISHED` | owner published a TSYC draft | local reconcile -> PUBLISHED |
+| `REMOTE_TRASHED` / `REMOTE_REMOVED` | owner trashed / deleted it (404 confirmed by exact-SKU searches with status any AND trash) | local reconcile -> terminal REMOTE_* marker, never recreated |
+| `LOCAL_STATUS_STALE` | internal_products lags its own sync row; remote draft as expected | local reconcile -> DRAFT_CREATED |
+| `OWNER_MODIFIED` | removal recorded but product live again, published moved back to draft, pending/private | proposal only (owner) |
+| `IDENTITY_MISMATCH` | other ID, or remote SKU differs/empty (a title never proves identity) | proposal only |
+| `TRANSLATION_LINKED_RECORD` | VI gone/trashed while EN/DE copies still carry the SKU | proposal only (owner) |
+| `UNCERTAIN_CREATE` | no Woo ID without a create-outcome resolution, or `recovery_required` | `recover_historical_woo_create.py` |
+| `API_ACCESS_ERROR` | timeout, 401/403/5xx, unreadable body, incomplete SKU search | re-read later; never a deletion |
+| `UNRESOLVED` | e.g. SKU found on another VI product or in trash under another ID; no stored SKU | proposal only |
+
+```
+.venv/Scripts/python.exe scripts/audit_woo_remote_status.py            # read-only report
+.venv/Scripts/python.exe scripts/audit_woo_remote_status.py --plan     # + dry-run repair plan
+.venv/Scripts/python.exe scripts/audit_woo_remote_status.py --apply ^
+  --product-code TSYC-... --product-code TSYC-... --max-products 10 --confirm-reconcile
+```
+`--apply` writes only the two LOCAL rows, only for the four reconcilable
+classes, through the existing writer `sync_woocommerce_product_status.py`.
+For each product it re-reads local and remote state fresh (never the plan or
+an earlier report), snapshots both rows, writes, re-reads, and verifies the
+product is now `CONSISTENT`. It logs to `process_logs`, checkpoints every
+product, holds the writer lock, and stops on a writer failure, a verification
+failure, or 3 consecutive unreadable products. Resume with `--resume RUN_ID`.
+Restore with `--rollback RUN_ID --product-code ... --confirm-rollback`, which
+is refused when the rows changed after the reconciliation. Snapshots and
+checkpoints live in `data/processed/orchestration/woo_remote_reconcile/`
+(gitignored); reports go to `data/output/woo_remote_status/`.
+
+Preflight runs the same check in one fresh pass:
+- A failed bulk read, or inconclusive reads for at least max(3, 10 %) of the products, is **systemic** and blocks every production write.
+- Per-product mismatches are warnings; that product alone is refused.
+- `update_woocommerce_draft_content.py`, `apply_preorder_inventory.py` and `apply_fahasa_gallery_to_woo_drafts.py` apply `local_write_block_reason` before their own fresh remote re-read. It refuses:
+  - an owner-removed product, including a stale removal marker;
+  - an unresolved create;
+  - a non-draft local status;
+  - a published product without explicit authorization.
 
 ## 8. Recovery
 `RECOVERY_REQUIRED` means remote state could not be confirmed. Never retry
