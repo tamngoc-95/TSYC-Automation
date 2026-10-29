@@ -182,6 +182,13 @@ Open `OWNER_MODIFIED` case (re-checked 2026-10-29, read-only):
 - Classification: **manual WordPress administration, not TSYC**. Whether the restore was *intended* (and by whom) is still `OWNER_DECISION_REQUIRED`.
 - The removal marker stays until the owner confirms. Every TSYC write to #3772 stays refused.
 - The live permalink `/product/__trashed-18/` is an owner-side cleanup item. TSYC does not touch it.
+- Related pattern found 2026-10-29 by `audit_language_product_mapping.py`:
+  - On 2026-10-14, 14:16 GMT, #4858 was made as a copy of TSYC's #4657 (IMG-004-CAN-0033, "Người Giàu Có Nhất Thành Babylon").
+  - **Every `_tsyc_*` meta key was copied**, together with the same image.
+  - The SKU was edited to `…CAN-44`, sale price 6.99, stock 1.
+  - #4657 is still published, but its slug is `__trashed-20`.
+  - This fits a used-copy listing workflow by the owner on that day, and it makes #3772's restore more plausible as deliberate. It is still not proof.
+  - It confirms that TSYC meta on a product is never proof of TSYC ownership. #4858 is reported as `COPIED_OWNERSHIP_META` and is never adopted. Whether two sellable VI products for one title are intended is an owner question.
 
 ## 8. Recovery
 `RECOVERY_REQUIRED` means remote state could not be confirmed. Never retry

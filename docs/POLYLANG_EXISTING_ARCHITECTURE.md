@@ -145,6 +145,45 @@ One logical book is TSYC's VI product: the sync row's Woo ID plus its SKU.
   meta. Any other draft's language is unknown, which is an ERROR and is never
   guessed (fixed in `woo_translation_group.product_language`).
 
+### 5a. Local per-language mapping (2026-10-29)
+- **Table** `woocommerce_language_products` (`migrations/011_create_woocommerce_language_products.sql`).
+  - One row per book and storefront language, with a unique Woo ID.
+  - `origin` is either:
+    - `TSYC_CREATED`: TSYC's own record, the only proof of ownership;
+    - `POLYLANG_LINKED`: an existing copy, accepted only with a staging-proven link and never written.
+  - `mapping_status`: `PENDING_CREATE`, `RECORDED`, `REMOTE_REMOVED` (terminal) or `CONFLICT`.
+  - Also stored: the create `request_id` (idempotency) and the write baseline.
+  - **Not applied to production yet.** Apply it as a reviewed schema change. It is additive only.
+- **Domain** `src/domain/language_product_mapping.py`.
+  - `derive_vi_mapping` builds the VI row only from the sync row's own TSYC request: draft, exact SKU, and TSYC's own internal-product meta in the *request*. The baseline comes from the stored create response. Remote meta is never used to create a record.
+  - `validate_mappings` and `compare_stored_vi` check the rows.
+  - `verify_remote` reports, read-only:
+    - copied ownership meta;
+    - unmapped SKU copies;
+    - language, SKU and meta mismatches;
+    - changes since the baseline.
+  - `adapter_inputs` feeds the adapter:
+    - records: `RECORDED` TSYC rows only;
+    - `uncertain_languages`: pending creates;
+    - `blocked_languages`: removed or conflicting languages, which are never recreated.
+- **Read-only audit:**
+
+  ```
+  .venv/Scripts/python.exe scripts/audit_language_product_mapping.py --remote --plan-backfill
+  ```
+
+  - It does Supabase SELECTs and a GET-only catalog read.
+  - It reports `NOT_APPLIED` while the table is missing.
+  - First live run, 2026-10-29: 182 VI mappings derived (87 recorded, 95 removed) and 177 create baselines.
+  - It found 1 `COPIED_OWNERSHIP_META`: #4858 is a hand copy of #4657 carrying every `_tsyc_*` key. See TSYC_RUNBOOK §7b.
+  - It also found 15 unmapped SKU copies, which are EN/DE copies carrying the VI SKU and are never adopted.
+- **Link reader** `src/services/polylang_link_reader.py`. This is the staging-ready client of the proposed `GET tsyc/v1/translations/{id}`:
+  - strict parsing;
+  - any failure raises and never means "no translations";
+  - `verified_on_staging` is False unless attested.
+  - `TranslationDraftWriter` fixes the create-and-link contract: draft only, no price or stock, idempotent per request ID.
+  - `require_staging_target` refuses the production host for pilot steps.
+
 No writer is wired to the adapter yet. Offline tests:
 `tests/test_multilingual_adapter.py` against `tests/support/fake_polylang_store.py`.
 Every hook there is a switch the test turns on or off. The tests prove TSYC's

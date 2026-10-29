@@ -149,6 +149,19 @@ class WooRemoteReader:
                     found[int(product["id"])] = product
         return found
 
+    def list_page(self, params: Mapping[str, Any]) -> tuple[list[dict[str, Any]], int]:
+        """One page of /products and the total page count. Raises
+        RemoteReadError when the page cannot be read."""
+        try:
+            response = self._get("products", params)
+            body = response.json() if response.status_code == 200 else None
+            pages = int(response.headers.get("X-WP-TotalPages") or 0)
+        except Exception as error:  # noqa: BLE001 - any failure means unknown state
+            raise RemoteReadError(f"Page read failed: {type(error).__name__}: {error}") from error
+        if not isinstance(body, list):
+            raise RemoteReadError(f"Page read failed: HTTP {getattr(response, 'status_code', None)}.")
+        return [p for p in body if isinstance(p, dict)], pages
+
     def get_one(self, product_id: int) -> tuple[int | None, dict[str, Any] | None, str | None]:
         """(http_status, body, error). Never raises."""
         try:

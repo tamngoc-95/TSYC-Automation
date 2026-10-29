@@ -419,10 +419,12 @@ def plan_language_actions(
     create_authorized: bool = False,
     link_mechanism: LinkMechanism | None = None,
     uncertain_languages: Sequence[str] = (),
+    blocked_languages: Sequence[str] = (),
 ) -> dict[str, str]:
     """Per-language action for one logical book. Idempotent: an existing
     draft whose text already matches is NO_OP. Only an unchanged
-    TSYC-created draft is ever updated; uncertain ownership is REFUSE."""
+    TSYC-created draft is ever updated; uncertain ownership is REFUSE, and
+    so is a blocked language (a removed product is never recreated)."""
     if not resolution.actionable:
         return {lang: REFUSE for lang in wtg.TRANSLATION_LANGUAGES}
 
@@ -432,7 +434,9 @@ def plan_language_actions(
         approved = content is not None and content.get("content_status") == "APPROVED"
         member_id = resolution.members.get(lang)
         member = products_by_id.get(member_id) if member_id is not None else None
-        if lang in uncertain_languages:
+        if lang in blocked_languages:
+            actions[lang] = REFUSE
+        elif lang in uncertain_languages:
             actions[lang] = RECONCILE_FIRST
         elif member is not None:
             owner = ownership_of(member, lang, internal_product_id=internal_product_id,
