@@ -52,15 +52,45 @@ def can_0022(store, stock=0, vi_backorders="notify", backorders="yes"):
     store.link(3780, 3926, 3927)
 
 
-def resolve(store, source_id=3780, sku=SKU):
-    groups, _ = plg.build_groups(list(store.products.values()), store.all_page_links())
+def record(store, lang, pid):
+    """TSYC's sync record of a product it created, with the baseline read
+    right after its last confirmed write."""
+    product = store.products.get(pid, {})
+    return ma.TsycProductRecord(lang=lang, woo_id=pid, internal_product_id=IPID,
+                                baseline_modified_gmt=product.get("date_modified_gmt"),
+                                baseline_text={f: str(product.get(f) or "") for f in ma.wtg.TRANSLATED_FIELDS})
+
+
+def source_records(store, source_id):
+    return {"vi": record(store, "vi", source_id)}
+
+
+def link_map(store, source_id, verified=True):
+    return ma.PolylangLinkMap(source_id=source_id, translations=store.polylang_translations(source_id),
+                              mechanism="staging-proven endpoint", verified_on_staging=verified)
+
+
+LIVE = object()  # today: no Polylang map can be read
+
+
+def resolve(store, source_id=3780, sku=SKU, *, links=None, records=None, pages=None):
+    groups, _ = plg.build_groups(list(store.products.values()),
+                                 store.all_page_links() if pages is None else pages)
+    if links is None:
+        links = link_map(store, source_id) if source_id in store.products else None
+    elif links is LIVE:
+        links = None
     return ma.resolve_group(product_code=sku, source_id=source_id, products_by_id=store.products,
-                            sku_matches=store.sku_matches(sku), storefront_groups=groups)
+                            sku_matches=store.sku_matches(sku), storefront_groups=groups,
+                            tsyc_records=source_records(store, source_id) if records is None else records,
+                            link_map=links)
 
 
-def plan(store, resolution, **kwargs):
-    return ma.plan_language_actions(resolution, internal_product_id=IPID, products_by_id=store.products,
-                                    approved_contents=kwargs.pop("contents", CONTENTS), render=render, **kwargs)
+def plan(store, resolution, records=None, **kwargs):
+    return ma.plan_language_actions(
+        resolution, internal_product_id=IPID, products_by_id=store.products,
+        approved_contents=kwargs.pop("contents", CONTENTS), render=render,
+        tsyc_records=source_records(store, resolution.source_id) if records is None else records, **kwargs)
 
 
 # --- existing relationships and language IDs ----------------------------
@@ -71,7 +101,86 @@ def test_existing_linked_trio_resolves_to_exact_language_ids():
     resolution = resolve(store)
     assert resolution.status == ma.RESOLVED
     assert resolution.members == {"vi": 3780, "en": 3926, "de": 3927}
-    assert {e.source for e in resolution.evidence} == {"SKU", "HREFLANG"}
+    assert {e.source for e in resolution.evidence} == {"TSYC_RECORD", "SKU", "HREFLANG", "POLYLANG_LINK"}
+
+
+def test_live_today_without_a_polylang_map_nothing_is_resolved():
+    """SKU and hreflang agree on the live trio, yet without Polylang's own
+    map from a staging-proven mechanism the links stay unproven."""
+    store = FakePolylangStore()
+    can_0022(store)
+    resolution = resolve(store, links=LIVE)
+    assert resolution.status == ma.UNVERIFIABLE
+    assert resolution.members == {"vi": 3780, "en": 3926, "de": 3927}  # for read-only reporting
+    assert set(plan(store, resolution, create_authorized=True, link_mechanism=Mechanism()).values()) == {ma.REFUSE}
+    unproven = resolve(store, links=link_map(store, 3780, verified=False))
+    assert unproven.status == ma.UNVERIFIABLE
+    assert any("not proven on staging" in r for r in unproven.reasons)
+
+
+def test_missing_map_never_proves_that_no_translation_exists():
+    store = FakePolylangStore()
+    store.add(4868, "vi", "co-tich-1", status="draft", sku=SKU, meta=OWNED)
+    resolution = resolve(store, source_id=4868, links=LIVE)
+    assert resolution.status == ma.UNVERIFIABLE
+    assert any("that no translation exists cannot be proven" in r for r in resolution.reasons)
+    assert set(plan(store, resolution, create_authorized=True, link_mechanism=Mechanism()).values()) == {ma.REFUSE}
+
+
+def test_hreflang_disagreeing_with_polylang_is_a_conflict():
+    """A stale or wrong hreflang (cache, bad theme template) never wins:
+    the sources must agree."""
+    store = FakePolylangStore()
+    can_0022(store)
+    pages = store.all_page_links()
+    pages[3780] = {"vi": pages[3780]["vi"], "de": pages[3780]["de"]}  # EN missing on the VI page
+    resolution = resolve(store, pages=pages)
+    assert resolution.status == ma.CONFLICT
+
+
+def test_polylang_link_to_another_book_is_a_conflict():
+    store = FakePolylangStore()
+    can_0022(store)
+    store.add(5200, "de", "anderes-buch", sku="TSYC-OTHER-BOOK")
+    store.link(3780, 3926, 5200)           # Polylang now links the wrong DE book
+    resolution = resolve(store)
+    assert resolution.status == ma.CONFLICT
+    assert any("de" in r and "#5200" in r for r in resolution.reasons)
+
+
+def test_map_of_another_source_or_unread_member_is_a_conflict():
+    store = FakePolylangStore()
+    can_0022(store)
+    wrong_source = ma.PolylangLinkMap(source_id=3926, translations={"vi": 3926}, mechanism="x",
+                                      verified_on_staging=True)
+    assert resolve(store, links=wrong_source).status == ma.CONFLICT
+    unread = ma.PolylangLinkMap(source_id=3780, translations={"vi": 3780, "en": 3926, "de": 9999},
+                                mechanism="x", verified_on_staging=True)
+    resolution = resolve(store, links=unread)
+    assert resolution.status == ma.CONFLICT
+    assert any("#9999 is linked by Polylang but was not read" in r for r in resolution.reasons)
+
+
+def test_conflicting_recorded_woo_ids_are_a_conflict():
+    store = FakePolylangStore()
+    tsyc_draft_trio(store)
+    records = trio_records(store)
+    records["en"] = record(store, "en", 4870)       # TSYC thinks DE #4870 is its EN draft
+    resolution = resolve(store, source_id=4868, records=records)
+    assert resolution.status == ma.CONFLICT
+    store.add(4871, "en", "fairy-tale-1-owner", status="draft")
+    relinked = ma.PolylangLinkMap(source_id=4868, translations={"vi": 4868, "en": 4871, "de": 4870},
+                                  mechanism="x", verified_on_staging=True)
+    resolution = resolve(store, source_id=4868, records=trio_records(store), links=relinked)
+    assert resolution.status == ma.CONFLICT
+    assert any("TSYC recorded en #4869, Polylang links 4871" in r for r in resolution.reasons)
+
+
+def test_source_must_be_tsyc_recorded_vi_product():
+    store = FakePolylangStore()
+    can_0022(store)
+    assert resolve(store, records={}).status == ma.SOURCE_INVALID
+    assert resolve(store, records={"vi": record(store, "vi", 3926)}).status == ma.SOURCE_INVALID
 
 
 def test_catalog_graph_reports_backorder_drift_and_shape():
@@ -122,23 +231,32 @@ def test_draft_source_with_published_copies_like_can_0003_is_unverifiable():
     store.add(4014, "en", "from-a-boy-tu-be-trai", sku=SKU, image=3310)
     store.add(4018, "de", "vom-jungen-tu-be-trai", sku=SKU, image=3310)
     store.link(3311, 4014, 4018)
-    resolution = resolve(store, source_id=3311)
-    assert resolution.status == ma.UNVERIFIABLE
-    assert any("vi #3311 (draft) has no public page" in r for r in resolution.reasons)
+    resolution = resolve(store, source_id=3311, links=LIVE)
+    assert resolution.status == ma.UNVERIFIABLE   # the VI draft's link has no public page
     assert set(plan(store, resolution, create_authorized=True, link_mechanism=Mechanism()).values()) == {ma.REFUSE}
+    # With Polylang's own map the group is proven, and the published
+    # owner copies are still never written.
+    proven = resolve(store, source_id=3311)
+    assert proven.status == ma.RESOLVED
+    assert set(plan(store, proven, create_authorized=True, link_mechanism=Mechanism()).values()) == {
+        ma.SKIP_OWNER_MAINTAINED}
 
 
 # --- duplicate linking, wrong book / edition ------------------------------
 
-def test_linked_copy_without_sku_belongs_to_the_group_by_its_polylang_link():
-    """10 live groups: the VI carries the TSYC SKU, the linked copies none."""
+def test_linked_copy_without_sku_is_linked_but_its_identity_is_unproven():
+    """10 live groups: the VI carries the TSYC SKU, the linked copies none.
+    The link is Polylang's, but it may come from a bulk-link slug or image
+    match, so without the SKU or a TSYC record the book is unproven."""
     store = FakePolylangStore()
     can_0022(store)
     store.products[3926]["sku"] = store.products[3927]["sku"] = ""
     resolution = resolve(store)
-    assert resolution.status == ma.RESOLVED
+    assert resolution.status == ma.UNVERIFIABLE
     assert resolution.members == {"vi": 3780, "en": 3926, "de": 3927}
     assert [e.source for e in resolution.evidence].count("HREFLANG_ONLY") == 2
+    assert sum("book identity is unproven" in r for r in resolution.reasons) == 2
+    assert set(plan(store, resolution).values()) == {ma.REFUSE}
 
 
 def test_linked_copy_with_another_sku_is_a_conflict():
@@ -267,6 +385,10 @@ def tsyc_draft_trio(store):
     store.link(4868, 4869, 4870)
 
 
+def trio_records(store):
+    return {"vi": record(store, "vi", 4868), "en": record(store, "en", 4869), "de": record(store, "de", 4870)}
+
+
 def test_draft_copy_without_tsyc_meta_has_unknown_language():
     store = FakePolylangStore()
     store.add(3311, "vi", "tu-be-trai", status="draft", sku=SKU, meta=OWNED)
@@ -279,40 +401,145 @@ def test_draft_copy_without_tsyc_meta_has_unknown_language():
 def test_drafts_without_public_pages_cannot_be_proven_linked():
     store = FakePolylangStore()
     tsyc_draft_trio(store)
-    resolution = resolve(store, source_id=4868)
+    resolution = resolve(store, source_id=4868, records=trio_records(store), links=LIVE)
     assert resolution.status == ma.UNVERIFIABLE
-    assert set(plan(store, resolution).values()) == {ma.REFUSE}
+    assert set(plan(store, resolution, records=trio_records(store)).values()) == {ma.REFUSE}
 
 
 def resolved_draft_trio(store):
     tsyc_draft_trio(store)
-    return ma.GroupResolution(status=ma.RESOLVED, source_id=4868, members={"vi": 4868, "en": 4869, "de": 4870})
+    records = trio_records(store)
+    resolution = resolve(store, source_id=4868, records=records)
+    assert resolution.status == ma.RESOLVED
+    return resolution, records
 
 
 def test_text_sync_updates_only_owned_drafts_and_is_idempotent():
     store = FakePolylangStore()
-    resolution = resolved_draft_trio(store)
-    assert plan(store, resolution) == {"en": ma.UPDATE_TEXT_DRAFT, "de": ma.UPDATE_TEXT_DRAFT}
+    resolution, records = resolved_draft_trio(store)
+    assert plan(store, resolution, records) == {"en": ma.UPDATE_TEXT_DRAFT, "de": ma.UPDATE_TEXT_DRAFT}
     for lang in ("en", "de"):
         store.save(resolution.members[lang], ma.build_text_payload(CONTENTS[lang], lang, render))
-    assert plan(store, resolution) == {"en": ma.NO_OP, "de": ma.NO_OP}
+    # Repeated runs, before and after the writer records its new baseline.
+    assert plan(store, resolution, records) == {"en": ma.NO_OP, "de": ma.NO_OP}
+    records = trio_records(store)
+    for _ in range(2):
+        assert plan(store, resolution, records) == {"en": ma.NO_OP, "de": ma.NO_OP}
+    assert len(store.writes) == 2
 
 
-def test_draft_copy_without_tsyc_ownership_is_owner_maintained():
+def test_recorded_draft_whose_meta_was_removed_has_unknown_ownership():
     store = FakePolylangStore()
-    resolution = resolved_draft_trio(store)
+    resolution, records = resolved_draft_trio(store)
     store.products[4870]["meta_data"] = []
-    assert plan(store, resolution)["de"] == ma.SKIP_OWNER_MAINTAINED
+    assert ma.ownership_of(store.products[4870], "de", internal_product_id=IPID,
+                           record=records["de"]) == ma.OWN_UNKNOWN
+    assert plan(store, resolution, records)["de"] == ma.REFUSE
+
+
+def test_owner_edit_after_tsyc_baseline_is_never_overwritten():
+    store = FakePolylangStore()
+    resolution, records = resolved_draft_trio(store)
+    store.products[4869]["description"] = "<p>Owner's own text.</p>"
+    store.products[4870]["date_modified_gmt"] = "2026-10-25T09:00:00"  # e.g. a sibling-save hook
+    assert ma.ownership_of(store.products[4869], "en", internal_product_id=IPID,
+                           record=records["en"]) == ma.OWN_TSYC_DRAFT_EDITED
+    assert plan(store, resolution, records) == {"en": ma.SKIP_OWNER_MAINTAINED, "de": ma.SKIP_OWNER_MAINTAINED}
+
+
+def test_recorded_draft_published_by_the_owner_is_owner_maintained():
+    store = FakePolylangStore()
+    resolution, records = resolved_draft_trio(store)
+    store.products[4869]["status"] = "publish"
+    assert ma.ownership_of(store.products[4869], "en", internal_product_id=IPID,
+                           record=records["en"]) == ma.OWN_PUBLISHED
+    assert plan(store, resolution, records)["en"] == ma.SKIP_OWNER_MAINTAINED
+
+
+def test_recorded_draft_without_a_baseline_has_unknown_ownership():
+    store = FakePolylangStore()
+    resolution, records = resolved_draft_trio(store)
+    records["en"] = ma.TsycProductRecord(lang="en", woo_id=4869, internal_product_id=IPID)
+    assert plan(store, resolution, records)["en"] == ma.REFUSE
+
+
+def test_copied_ownership_meta_on_an_unrecorded_copy_is_a_conflict():
+    """The developer makes EN with Polylang's "+" and a metadata-copy hook
+    copies `_tsyc_internal_product_id` (and SKU) from the VI draft. The
+    meta alone must never make that copy TSYC's."""
+    store = FakePolylangStore()
+    store.add(4868, "vi", "co-tich-1", status="draft", sku=SKU, meta=OWNED)
+    store.add(4900, "en", "fairy-tale-1", status="draft", sku=SKU, meta=dict(OWNED))
+    store.link(4868, 4900)
+    resolution = resolve(store, source_id=4868)
+    assert resolution.status == ma.CONFLICT
+    assert any("#4900 carries TSYC's ownership meta" in r for r in resolution.reasons)
+    # Even with a forced resolution the copy is never written.
+    forced = ma.GroupResolution(status=ma.RESOLVED, source_id=4868, members={"vi": 4868, "en": 4900})
+    assert ma.ownership_of(store.products[4900], "en", internal_product_id=IPID, record=None) == ma.OWN_CONFLICT
+    assert plan(store, forced)["en"] == ma.REFUSE
+
+
+def test_copied_language_meta_contradicting_the_record_is_a_conflict():
+    store = FakePolylangStore()
+    tsyc_draft_trio(store)
+    store.products[4870]["meta_data"] = [{"key": "_tsyc_internal_product_id", "value": IPID},
+                                         {"key": "_tsyc_language", "value": "en"}]
+    resolution = resolve(store, source_id=4868, records=trio_records(store))
+    assert resolution.status == ma.CONFLICT
+
+
+def test_linked_owner_draft_without_tsyc_meta_is_owner_maintained():
+    store = FakePolylangStore()
+    store.add(4868, "vi", "co-tich-1", status="draft", sku=SKU, meta=OWNED)
+    store.add(4901, "en", "fairy-tale-1", status="draft")
+    assert ma.ownership_of(store.products[4901], "en", internal_product_id=IPID,
+                           record=None) == ma.OWN_LINKED_TRANSLATION
+    forced = ma.GroupResolution(status=ma.RESOLVED, source_id=4868, members={"vi": 4868, "en": 4901})
+    assert plan(store, forced)["en"] == ma.SKIP_OWNER_MAINTAINED
+
+
+def test_recorded_translation_missing_from_the_group_is_refused():
+    store = FakePolylangStore()
+    resolution, records = resolved_draft_trio(store)
+    shrunk = ma.GroupResolution(status=ma.RESOLVED, source_id=4868, members={"vi": 4868, "de": 4870})
+    assert plan(store, shrunk, records, create_authorized=True, link_mechanism=Mechanism())["en"] == ma.REFUSE
+
+
+def test_unlinked_tsyc_translation_is_a_conflict():
+    store = FakePolylangStore()
+    tsyc_draft_trio(store)
+    store.group_of.pop(4870)            # DE exists and is recorded, but Polylang lost the link
+    resolution = resolve(store, source_id=4868, records=trio_records(store))
+    assert resolution.status == ma.CONFLICT
+    assert any("TSYC recorded de #4870, Polylang links None" in r for r in resolution.reasons)
+
+
+def test_resolution_and_planning_never_write():
+    store = FakePolylangStore()
+    resolution, records = resolved_draft_trio(store)
+    before = store.snapshot()
+    for _ in range(2):
+        resolve(store, source_id=4868, records=records)
+        plan(store, resolution, records, create_authorized=True, link_mechanism=Mechanism())
+    assert store.snapshot() == before and store.writes == []
 
 
 def test_interrupted_write_is_reconciled_before_anything_else():
     store = FakePolylangStore()
-    resolution = resolved_draft_trio(store)
+    resolution, records = resolved_draft_trio(store)
     with pytest.raises(InterruptedWrite):
         store.save(4869, ma.build_text_payload(CONTENTS["en"], "en", render), interrupt=True)
-    assert plan(store, resolution, uncertain_languages=("en",))["en"] == ma.RECONCILE_FIRST
+    assert plan(store, resolution, records, uncertain_languages=("en",))["en"] == ma.RECONCILE_FIRST
     # After reconciling (a fresh read), the saved text shows the write landed.
-    assert plan(store, resolution)["en"] == ma.NO_OP
+    assert plan(store, resolution, records)["en"] == ma.NO_OP
+
+
+def test_interrupted_write_that_did_not_land_still_waits_for_reconciliation():
+    store = FakePolylangStore()
+    resolution, records = resolved_draft_trio(store)
+    assert plan(store, resolution, records, uncertain_languages=("en",))["en"] == ma.RECONCILE_FIRST
+    assert plan(store, resolution, records)["en"] == ma.UPDATE_TEXT_DRAFT
 
 
 def test_unread_sibling_page_makes_the_group_conflicted():

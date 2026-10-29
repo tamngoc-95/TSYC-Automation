@@ -165,6 +165,24 @@ Preflight runs the same check in one fresh pass:
   - a non-draft local status;
   - a published product without explicit authorization.
 
+Open `OWNER_MODIFIED` case (re-checked 2026-10-29, read-only):
+`TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0010` Woo #3772 "Suối Nguồn Tươi Trẻ 1".
+- History:
+  - 2026-09-05: TSYC created it as a draft.
+  - 2026-09-23: it went to trash.
+  - 2026-10-02: the sync recorded `REMOTE_TRASHED`.
+  - 2026-10-14 07:28 GMT: it was modified and is `publish` since then.
+- No TSYC process ran between 2026-10-13 and 2026-10-15 (`process_logs`), and no TSYC code path can untrash or publish.
+- The current product carries values only a person in wp-admin sets, which TSYC never sends:
+  - `regular_price` and `sale_price`;
+  - `manage_stock` with stock 1;
+  - the "Thư viện sách cũ" category;
+  - a rewritten description.
+- The slug is still `__trashed-18` and `_wp_desired_post_slug` is empty. This fits an untrash followed by manual editing. It does not prove the product is deleted now, and it does not prove who restored it.
+- Classification: **manual WordPress administration, not TSYC**. Whether the restore was *intended* (and by whom) is still `OWNER_DECISION_REQUIRED`.
+- The removal marker stays until the owner confirms. Every TSYC write to #3772 stays refused.
+- The live permalink `/product/__trashed-18/` is an owner-side cleanup item. TSYC does not touch it.
+
 ## 8. Recovery
 `RECOVERY_REQUIRED` means remote state could not be confirmed. Never retry
 draft creation blindly. Reconcile manually with

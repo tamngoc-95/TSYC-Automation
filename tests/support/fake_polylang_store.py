@@ -33,6 +33,7 @@ class FakePolylangStore:
     def __init__(self, *, stock_sync: bool = False, meta_copy: bool = False) -> None:
         self.products: dict[int, dict[str, Any]] = {}
         self.group_of: dict[int, int] = {}
+        self.lang_of: dict[int, str] = {}
         self.stock_sync = stock_sync
         self.meta_copy = meta_copy
         self.writes: list[tuple[int, dict[str, Any]]] = []
@@ -56,6 +57,7 @@ class FakePolylangStore:
             "date_modified_gmt": "2026-10-01T10:00:00",
         }
         self.products[pid] = product
+        self.lang_of[pid] = lang
         return product
 
     def link(self, *pids: int) -> None:
@@ -90,6 +92,13 @@ class FakePolylangStore:
 
     def all_page_links(self) -> dict[int, dict[str, str] | None]:
         return {pid: self.page_links(pid) for pid, p in self.products.items() if p["status"] == "publish"}
+
+    def polylang_translations(self, pid: int) -> dict[str, int]:
+        """Polylang's own map of a product, as pll_get_post_translations
+        returns it (drafts included, one product per language, the last
+        write wins). Live, nothing can read this yet: it models the
+        staging-proven mechanism TSYC is waiting for."""
+        return {self.lang_of[m]: m for m in sorted([pid] + self.siblings(pid))}
 
     def sku_matches(self, sku: str) -> list[dict[str, Any]]:
         return [copy.deepcopy(p) for p in self.products.values() if p["sku"] == sku]

@@ -101,22 +101,38 @@ links are invisible.
 ## 5. TSYC adapter (`src/domain/multilingual_adapter.py`)
 
 One logical book is TSYC's VI product: the sync row's Woo ID plus its SKU.
-- **`resolve_group`** proves the translation group from two independent sources that must agree:
-  - the exact-SKU matches (copies keep the SKU), and
-  - the storefront hreflang group.
+- **`resolve_group`** (fail-closed since 2026-10-29) requires every source to agree:
+
+  | Source | Role |
+  |---|---|
+  | `TsycProductRecord` per language (local sync rows: Woo ID, book, write baseline) | Proves TSYC's own products. Any product carrying TSYC's `_tsyc_internal_product_id` for the book that TSYC never recorded is a **conflict**: copied metadata (theme hook, Duplicate Post) or an unreconciled create. |
+  | Exact-SKU matches | Identity (copies keep the SKU). |
+  | `PolylangLinkMap`, Polylang's own `pll_get_post_translations` read through a **staging-proven** mechanism | **The only link authority.** It covers drafts, which have no public page. |
+  | Storefront hreflang | Supplementary. It must match the map for every published member. |
+
+  - Without a proven map, the result is at most `UNVERIFIABLE`, even when SKU and hreflang agree, and even for "no translation exists". **That is the live state today**: free Polylang has no REST read of links.
+  - A member linked by Polylang but carrying neither the SKU nor a TSYC record stays `UNVERIFIABLE`, because a bulk-link slug or image match is a link, not an identity.
 
   The possible results:
 
   | Result | Meaning |
   |---|---|
-  | `RESOLVED` | Every member is proven by both sources. |
-  | `SOURCE_ONLY` | The VI product has no translation. |
-  | `UNVERIFIABLE` | A draft or unlinked member's link cannot be proven. CAN-0003 is this case. |
-  | `CONFLICT` | The evidence disagrees: a duplicate language, a linked copy without the SKU, a link to another product (including bulk-link mismatches), an unknown draft language, or an unread page. |
-  | `SOURCE_INVALID` | The product is not TSYC's VI source. |
+  | `RESOLVED` | Records, SKU, map and hreflang agree, and every member's identity is proven. |
+  | `SOURCE_ONLY` | The proven map holds only the VI product. |
+  | `UNVERIFIABLE` | There is no proven map, or a linked member's book identity is unproven. CAN-0003 is this case today. |
+  | `CONFLICT` | The evidence disagrees. Examples: a duplicate language, copied TSYC meta, records against the map, SKU or hreflang against the map, a wrong book linked, an unread member. |
+  | `SOURCE_INVALID` | The product is not TSYC's recorded VI source. |
+- **`ownership_of`** classifies each member:
+  - `TSYC_DRAFT_UNCHANGED`: recorded Woo ID, meta, language and draft status all match, and the modified time and text equal TSYC's baseline. **This is the only writable state.**
+  - `TSYC_DRAFT_EDITED`: changed after TSYC's baseline. This includes a sibling-save hook touching it.
+  - `LINKED_TRANSLATION`: a draft copy made inside WordPress, without TSYC meta.
+  - `PUBLISHED`.
+  - `UNKNOWN`: no meta, no baseline, or no language meta.
+  - `CONFLICT`.
 - **`plan_language_actions`** plans per language:
-  - `SKIP_OWNER_MAINTAINED`: any published copy, or any copy without TSYC's ownership meta;
-  - `UPDATE_TEXT_DRAFT` / `NO_OP`: a TSYC-owned draft only, text only, idempotent;
+  - `REFUSE` for unknown or conflicting ownership, or a recorded translation missing from the group;
+  - `SKIP_OWNER_MAINTAINED`: published, edited, or WordPress-made copies;
+  - `UPDATE_TEXT_DRAFT` / `NO_OP`: an unchanged TSYC draft only, text only, idempotent. An edited draft whose text already matches is `NO_OP` (e.g. TSYC's own write landed but its answer was lost);
   - `CREATE_NOT_AUTHORIZED` → `CREATE_BLOCKED_NO_LINK_MECHANISM` → `CREATE_AND_LINK`: the last only with authorization **and** a link mechanism proven on staging;
   - `RECONCILE_FIRST`: after an interrupted write;
   - `REFUSE`: for anything not `RESOLVED` / `SOURCE_ONLY`.
@@ -164,6 +180,9 @@ own host and database, payments, mail and feeds disabled, new keys, isolation pr
    | Save EN only | Does VI change (authority direction)? |
    | Backorders `yes` on VI | Does EN follow? |
    | Save VI with both bulk-link plugins active | Does any relink happen? |
+
+   | Create EN with "+" from a TSYC VI draft | Does the copy hook copy `_tsyc_*` meta (`resolve_group` then reports copied meta)? |
+   | Read the translation map through the mechanism | Does it return drafts, and the same IDs as hreflang for published members? |
 
 4. Only when the matrix is documented: choose the link mechanism. The options are
    a developer endpoint around `pll_set_post_language` / `pll_save_post_translations`
