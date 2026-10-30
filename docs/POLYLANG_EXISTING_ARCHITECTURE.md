@@ -163,6 +163,9 @@ One logical book is TSYC's VI product: the sync row's Woo ID plus its SKU.
   - Run files: `data/output/language_mapping/backfill/<run>/` (plan, before snapshot, checkpoint). These are runtime files and are never committed.
   - `--rollback <run_dir> [--confirm-rollback]` deletes only that run's rows that are still unchanged.
   - Dry run 2026-10-30: 86 recorded and 94 tombstones eligible. Isolated: CAN-0033 (#4858 copied meta, §7b) and CAN-0010 (#3772 recorded removed but published, owner decision).
+  - **Applied 2026-10-30.** The owner ran migration 011 in the SQL Editor. The live schema was verified definition by definition: 17 columns, 1 PK, 3 FKs, 1 unique key, 8 checks, 5 indexes, RLS on.
+  - The backfill then inserted 180 vi rows: 94 `REMOTE_REMOVED` (10 batches) and 86 `RECORDED` (9 batches). They match the approved plan code for code; CAN-0033, CAN-0010 and CAN-0031 have no row.
+  - The audit checks stored rows plus derived rows not yet stored, so an isolated book's conflict stays reported after the backfill.
 - **Domain** `src/domain/language_product_mapping.py`.
   - `derive_vi_mapping` builds the VI row only from the sync row's own TSYC request: draft, exact SKU, and TSYC's own internal-product meta in the *request*. The baseline comes from the stored create response. Remote meta is never used to create a record.
   - `validate_mappings` and `compare_stored_vi` check the rows.

@@ -154,8 +154,11 @@ def run(repository: Any, *, reader: Any | None, plan_backfill: bool) -> dict[str
     if reader is not None:
         catalog = read_catalog(reader)
         catalog_size = len(catalog)
-        # Stored rows are the record once present; until then the derived VI rows are.
-        findings.extend(lpm.verify_remote(stored if stored else derived, catalog))
+        # Stored rows are the record; a derived VI row not stored (pending or
+        # isolated by the backfill) is still checked, so its conflict stays visible.
+        stored_keys = {(r.internal_product_id, r.language_code) for r in stored}
+        unstored = [r for r in derived if (r.internal_product_id, r.language_code) not in stored_keys]
+        findings.extend(lpm.verify_remote(list(stored) + unstored, catalog))
     return build_report(table_state=table_state, derived=derived, stored=stored, findings=findings,
                         catalog_size=catalog_size, plan_backfill=plan_backfill)
 

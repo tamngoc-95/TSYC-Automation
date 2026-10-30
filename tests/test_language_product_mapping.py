@@ -468,6 +468,23 @@ def test_audit_compares_stored_rows_and_reads_the_whole_catalog():
     assert report["finding_counts"] == {"ERROR COPIED_OWNERSHIP_META": 1, "WARNING UNMAPPED_SKU_COPY": 1}
 
 
+def test_audit_keeps_checking_books_the_backfill_left_unstored():
+    """A book isolated by the backfill (no stored row) must not drop out of
+    the remote check once other rows are stored."""
+    other = "33333333-3333-4333-8333-333333333333"
+    repository = fake_repository(stored=[{**vi_row().as_row(), "language_product_id": "x"}])
+    repository.client.tables["internal_products"].append({"internal_product_id": other, "product_code": "TSYC-B"})
+    isolated = sync_row(woo_id=4657, sync_id="s2", internal_product_id=other, product_sku="TSYC-B",
+                        request_payload={"sku": "TSYC-B", "status": "draft",
+                                         "meta_data": meta({"_tsyc_internal_product_id": other})})
+    repository.client.tables["woocommerce_product_syncs"].append(isolated)
+    reader = FakeCatalogReader([remote(4868), remote(4657, sku="TSYC-B", owner=other),
+                                remote(4858, sku="TSYC-B", owner=other)])
+    report = audit.run(repository, reader=reader, plan_backfill=False)
+    assert report["finding_counts"].get("ERROR COPIED_OWNERSHIP_META") == 1
+    assert report["finding_counts"].get("WARNING STORED_VI_MISSING") == 1
+
+
 def test_audit_unexpected_read_error_is_raised_not_hidden():
     class Broken(FakeSupabaseClient):
         def table(self, name):
