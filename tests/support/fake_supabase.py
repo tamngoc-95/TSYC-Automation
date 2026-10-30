@@ -31,6 +31,7 @@ PRIMARY_KEY_COLUMNS: dict[str, str] = {
     "product_contents": "product_content_id",
     "woocommerce_product_syncs": "sync_id",
     "process_logs": "process_log_id",
+    "woocommerce_language_products": "language_product_id",
 }
 
 

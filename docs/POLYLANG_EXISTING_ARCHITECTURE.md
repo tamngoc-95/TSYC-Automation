@@ -153,7 +153,16 @@ One logical book is TSYC's VI product: the sync row's Woo ID plus its SKU.
     - `POLYLANG_LINKED`: an existing copy, accepted only with a staging-proven link and never written.
   - `mapping_status`: `PENDING_CREATE`, `RECORDED`, `REMOTE_REMOVED` (terminal) or `CONFLICT`.
   - Also stored: the create `request_id` (idempotency) and the write baseline.
-  - **Not applied to production yet.** Apply it as a reviewed schema change. It is additive only.
+  - **Applying it.** Reviewed 2026-10-30: additive only (one new table, three indexes, RLS on with no policy like every other table; `if not exists` everywhere, so a re-run is a no-op). Its `on delete restrict` foreign keys only stop deleting an internal product, sync row or content row that a mapping still points at. TSYC's MCP connection is read-only and the venv has no Postgres driver, so the shop owner runs the file unchanged in the Supabase SQL Editor (README "migrations are executed manually"). Verify with `select to_regclass('public.woocommerce_language_products');` and `audit_language_product_mapping.py`, which then reports `PRESENT`. Rollback, only while no writer depends on it: `drop table public.woocommerce_language_products;`.
+- **VI backfill** `scripts/backfill_language_product_mapping.py` (Supabase only; Woo catalog GET only).
+  - Allowlist: the `backfill_plan` codes of an audit report (`--allowlist-from-audit`), plus `--max-products`. Every row is re-derived at run time.
+  - `--group recorded`: `RECORDED` rows. Each is inserted only when the live product still has the book's SKU, TSYC's meta for this book, and reads as vi.
+  - `--group removed`: `REMOTE_REMOVED` tombstones, only for products absent from the catalog read. The removal evidence stays in the sync row the tombstone points at. Nothing is restored or recreated.
+  - A book with any audit ERROR, contradicted remote state or a differing stored row is isolated with its reason and gets no row. Shared-SKU EN/DE copies are never linked.
+  - Batches of `--batch-size` rows: one INSERT each, re-read and compared, then checkpointed and logged (`process_logs`, `language_mapping_backfill`). A re-run reuses identical rows. A failed insert is never retried.
+  - Run files: `data/output/language_mapping/backfill/<run>/` (plan, before snapshot, checkpoint). These are runtime files and are never committed.
+  - `--rollback <run_dir> [--confirm-rollback]` deletes only that run's rows that are still unchanged.
+  - Dry run 2026-10-30: 86 recorded and 94 tombstones eligible. Isolated: CAN-0033 (#4858 copied meta, §7b) and CAN-0010 (#3772 recorded removed but published, owner decision).
 - **Domain** `src/domain/language_product_mapping.py`.
   - `derive_vi_mapping` builds the VI row only from the sync row's own TSYC request: draft, exact SKU, and TSYC's own internal-product meta in the *request*. The baseline comes from the stored create response. Remote meta is never used to create a record.
   - `validate_mappings` and `compare_stored_vi` check the rows.
