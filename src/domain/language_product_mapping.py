@@ -374,6 +374,49 @@ def verify_remote(
 
 
 # ---------------------------------------------------------------------
+# Blocked books
+# ---------------------------------------------------------------------
+
+BLOCKED_COPIED_OWNERSHIP_META = "BLOCKED_COPIED_OWNERSHIP_META"
+BLOCKED_OWNER_DECISION = "BLOCKED_OWNER_DECISION"
+BLOCKED_CREATE_UNRESOLVED = "BLOCKED_CREATE_UNRESOLVED"
+BLOCKED_AUDIT_ERROR = "BLOCKED_AUDIT_ERROR"
+NOT_STORED = "NOT_STORED"
+
+# First matching finding code decides the disposition.
+_BLOCKING_ORDER = (
+    (COPIED_OWNERSHIP_META, BLOCKED_COPIED_OWNERSHIP_META),
+    (REMOTE_PRESENT_AFTER_REMOVAL, BLOCKED_OWNER_DECISION),
+    (NO_WOO_ID, BLOCKED_CREATE_UNRESOLVED),
+    (RECOVERY_REQUIRED, BLOCKED_CREATE_UNRESOLVED),
+)
+
+
+def blocked_books(
+    derived: Sequence[LanguageProduct],
+    stored: Sequence[LanguageProduct],
+    findings: Sequence[Finding],
+) -> list[dict[str, Any]]:
+    """Every book without a stored VI row, with an explicit disposition and
+    the finding codes behind it. This names the block; it never clears,
+    downgrades or hides a finding (the ERROR stays counted)."""
+    stored_keys = {(r.internal_product_id, r.language_code) for r in stored}
+    codes = {r.product_code for r in derived if (r.internal_product_id, r.language_code) not in stored_keys}
+    codes |= {f.product_code for f in findings if f.code in (NO_WOO_ID, RECOVERY_REQUIRED)}
+    result = []
+    for code in sorted(codes):
+        own = [f for f in findings if f.product_code == code and f.severity in (ERROR, WARNING)
+               and f.code != STORED_MISSING]
+        found = {f.code for f in own}
+        disposition = next((d for c, d in _BLOCKING_ORDER if c in found), None)
+        if disposition is None:
+            disposition = BLOCKED_AUDIT_ERROR if any(f.severity == ERROR for f in own) else NOT_STORED
+        result.append({"product_code": code, "disposition": disposition,
+                       "finding_codes": sorted(f"{f.severity} {f.code}" for f in own)})
+    return result
+
+
+# ---------------------------------------------------------------------
 # Adapter inputs
 # ---------------------------------------------------------------------
 

@@ -483,6 +483,27 @@ def test_audit_keeps_checking_books_the_backfill_left_unstored():
     report = audit.run(repository, reader=reader, plan_backfill=False)
     assert report["finding_counts"].get("ERROR COPIED_OWNERSHIP_META") == 1
     assert report["finding_counts"].get("WARNING STORED_VI_MISSING") == 1
+    # The block is named explicitly, and the ERROR stays counted.
+    assert report["blocked_books"] == [{"product_code": "TSYC-B", "disposition": lpm.BLOCKED_COPIED_OWNERSHIP_META,
+                                        "finding_codes": ["ERROR COPIED_OWNERSHIP_META"]}]
+    assert report["severity_counts"]["ERROR"] == 1
+
+
+def test_blocked_books_name_owner_decisions_and_unresolved_creates_without_hiding_findings():
+    removed = vi_row(mapping_status=lpm.REMOTE_REMOVED, product_code="TSYC-R", internal_product_id="r")
+    pending = vi_row(product_code="TSYC-P", internal_product_id="p")
+    stored_ok = vi_row()
+    findings = [
+        lpm.Finding(lpm.WARNING, lpm.REMOTE_PRESENT_AFTER_REMOVAL, "TSYC-R", "vi", "live again"),
+        lpm.Finding(lpm.WARNING, lpm.STORED_MISSING, "TSYC-R", "vi", "not stored"),
+        lpm.Finding(lpm.WARNING, lpm.NO_WOO_ID, "TSYC-N", "vi", "no id"),
+    ]
+    blocked = {b["product_code"]: b for b in lpm.blocked_books([removed, pending, stored_ok], [stored_ok], findings)}
+    assert blocked["TSYC-R"]["disposition"] == lpm.BLOCKED_OWNER_DECISION
+    assert blocked["TSYC-R"]["finding_codes"] == ["WARNING REMOTE_PRESENT_AFTER_REMOVAL"]
+    assert blocked["TSYC-N"]["disposition"] == lpm.BLOCKED_CREATE_UNRESOLVED
+    assert blocked["TSYC-P"]["disposition"] == lpm.NOT_STORED
+    assert CODE not in blocked
 
 
 def test_audit_unexpected_read_error_is_raised_not_hidden():

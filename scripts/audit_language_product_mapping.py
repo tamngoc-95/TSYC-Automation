@@ -16,6 +16,9 @@ What it does (no database write, no WooCommerce write, ever):
      adopted as a translation link.
   4. --plan-backfill lists the VI rows a future writer would insert (dry
      run, nothing written).
+  5. Names every book without a stored VI row and why it is blocked
+     (e.g. BLOCKED_COPIED_OWNERSHIP_META). Naming a block never clears or
+     downgrades its finding.
 
 Exit code: 0 no ERROR finding, 1 at least one ERROR, 2 a read failed.
 
@@ -46,7 +49,7 @@ from src.domain import language_product_mapping as lpm  # noqa: E402
 configure_utf8_console()
 
 AUDITOR_NAME = "language_product_mapping_audit"
-AUDITOR_VERSION = "1.0.0"
+AUDITOR_VERSION = "1.1.0"
 REPORT_DIR = PROJECT_ROOT / "data" / "output" / "language_mapping"
 CATALOG_FIELDS = "id,sku,status,permalink,date_modified_gmt,meta_data"
 SYNC_COLUMNS = (
@@ -132,6 +135,7 @@ def build_report(*, table_state: str, derived: Sequence[lpm.LanguageProduct],
         "severity_counts": dict(severities),
         "finding_counts": dict(collections.Counter(f"{f.severity} {f.code}" for f in findings)),
         "findings": [f.as_dict() for f in findings],
+        "blocked_books": lpm.blocked_books(derived, stored, findings),
     }
     if plan_backfill:
         stored_keys = {(r.internal_product_id, r.language_code) for r in stored}
@@ -179,6 +183,10 @@ def print_summary(report: Mapping[str, Any], path: Path) -> None:
     for finding in report["findings"]:
         if finding["severity"] == lpm.ERROR:
             print(f"- ERROR {finding['code']} {finding['product_code']} {finding['language']}: {finding['detail']}")
+    if report["blocked_books"]:
+        print("Books without a stored VI row (blocked; findings above stay counted):")
+        for book in report["blocked_books"]:
+            print(f"  {book['product_code']}: {book['disposition']} {book['finding_codes']}")
     if "backfill_plan" in report:
         print(f"Backfill plan (dry run, nothing written): {len(report['backfill_plan'])} VI row(s).")
     print(f"JSON report: {path}")
