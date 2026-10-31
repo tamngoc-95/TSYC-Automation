@@ -196,6 +196,62 @@ One logical book is TSYC's VI product: the sync row's Woo ID plus its SKU.
   - `TranslationDraftWriter` fixes the create-and-link contract: draft only, no price or stock, idempotent per request ID.
   - `require_staging_target` refuses the production host for pilot steps.
 
+### 5b. Post-migration assessment (2026-10-31, read-only)
+- **Baseline.** The 180 stored vi rows are unchanged since the insert:
+  - 86 `RECORDED` + 94 `REMOTE_REMOVED`;
+  - 180 distinct Woo IDs and books, every row with its sync row;
+  - `updated_at` equals the insert time.
+
+  The mapping audit (1.1.0) still reports exactly 1 ERROR. It now names every book without a row (`blocked_books`), and the ERROR stays counted (exit 1):
+
+  | Book | Disposition | Reason |
+  |---|---|---|
+  | CAN-0033 | `BLOCKED_COPIED_OWNERSHIP_META` | ERROR `COPIED_OWNERSHIP_META` |
+  | AUTOIMPORT-CAN-0010 | `BLOCKED_OWNER_DECISION` | `REMOTE_PRESENT_AFTER_REMOVAL` |
+  | IMG-004-CAN-0031 | `BLOCKED_CREATE_UNRESOLVED` | `NO_WOO_ID` |
+- **CAN-0033: copied ownership metadata on an owner-maintained product.**
+  - TSYC's local ownership is correct:
+    - #4657 is TSYC's create. Its sync row was created 2026-10-08 22:40:10 and the product 22:40:18.
+    - It carries the exact SKU and this book's `_tsyc_internal_product_id`. The audit derives its `RECORDED` row from TSYC's own request.
+  - #4858 is not TSYC's:
+    - It was created 2026-10-14 14:16:37 GMT. No TSYC process logged anything between 2026-10-11 and 2026-10-15.
+    - It carries all six `_tsyc_*` values verbatim, the same image #4833 and a description of the same length.
+    - Changes a person made in wp-admin: SKU `…IMG-004-CAN-44`, sale price 6.99, stock 1 with backorders `no`, and the category "Thư viện sách cũ" (used books, 97 products).
+    - #4657 itself was modified 17 s later (14:18:32), and its slug is `__trashed-20` (trashed, then restored).
+  - It is not a duplicate identity in TSYC's sense: separate stock, price and category make a separate sellable listing of the same title.
+  - Whether the owner wants a used-copy listing that carries TSYC meta is an **owner decision**, and it is not inferred here.
+  - Disposition:
+    - no mapping row for CAN-0033;
+    - #4858 is never adopted;
+    - no validator is relaxed;
+    - nothing is written to Woo.
+
+  Removing the copied meta from #4858 is an owner/wp-admin action.
+- **CAN-0010 #3772:** the evidence is unchanged since 2026-10-29 (TSYC_RUNBOOK §7b).
+  - It is the only other product with TSYC meta in "Thư viện sách cũ". It was edited the same morning (07:28 GMT) with the same used-copy values: sale price 6.99, stock 1.
+  - This fits the same manual workflow, but it is not proof of intent.
+  - It stays `OWNER_DECISION_REQUIRED` and protected.
+- **EN/DE discovery** (`scripts/discover_translation_candidates.py`, `src/domain/translation_discovery.py`; read-only):
+  - Inputs: Supabase SELECT, catalog GET, and the public pages of the VI products, their SKU copies and the products they link.
+  - It never infers a link from a SKU, title or image alone.
+  - A mapping row may be planned only for `VERIFIED_LINK`, which needs a staging-proven Polylang map.
+
+  Live run 2026-10-31: 86 books, 94 pages read and 0 unread. The adapter returned `UNVERIFIABLE` for all 86.
+
+  | Class | Candidates | Books |
+  |---|---|---|
+  | `VERIFIED_LINK` | 0 | — |
+  | `POTENTIAL_LINK` | 13 (7 EN, 6 DE) | 7: FB-HIST-001-CAN-0003/0007, 002-CAN-0006, AUTOIMPORT-CAN-0001/0002/0005/0022. Each has mutual hreflang plus the exact SKU. |
+  | `UNVERIFIABLE` | 22 | 2 are FB-2026-001-CAN-0003 EN #4014 / DE #4018, whose VI #3311 is a draft. The other 20 are hreflang-linked copies **without** a SKU in 10 groups, where identity may rest on a bulk-link slug or image match. |
+  | `OWNER_MAINTAINED` | 0 | — |
+  | `IDENTITY_CONFLICT` | 0 | — |
+
+  - 68 books have no EN/DE candidate.
+  - The 15 known shared-SKU copies split into 13 `POTENTIAL_LINK` and 2 `UNVERIFIABLE`.
+  - Mapping inserts allowed: 0.
+- The local integration test that can turn `POTENTIAL_LINK` into
+  `VERIFIED_LINK` is planned in `POLYLANG_LOCAL_INTEGRATION_TEST_PLAN.md`.
+
 No writer is wired to the adapter yet. Offline tests:
 `tests/test_multilingual_adapter.py` against `tests/support/fake_polylang_store.py`.
 Every hook there is a switch the test turns on or off. The tests prove TSYC's
@@ -216,6 +272,8 @@ rules under each assumption, not the live hooks.
 
 Prerequisite: an isolated staging copy (`POLYLANG_WOOCOMMERCE_PLAN.md` section 4a:
 own host and database, payments, mail and feeds disabled, new keys, isolation proof).
+A local WordPress with synthetic data can stand in for it; see
+`POLYLANG_LOCAL_INTEGRATION_TEST_PLAN.md` (matrix L1–L10).
 1. Run `audit_polylang_catalog.py` on staging. Its groups must equal production's.
 2. Take one TSYC draft with no translations (e.g. a FAHASA-2026-002 draft). Create
    its EN copy the way the developer does today, then read back the VI, EN, links,

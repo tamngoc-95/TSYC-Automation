@@ -189,6 +189,12 @@ Open `OWNER_MODIFIED` case (re-checked 2026-10-29, read-only):
   - #4657 is still published, but its slug is `__trashed-20`.
   - This fits a used-copy listing workflow by the owner on that day, and it makes #3772's restore more plausible as deliberate. It is still not proof.
   - It confirms that TSYC meta on a product is never proof of TSYC ownership. #4858 is reported as `COPIED_OWNERSHIP_META` and is never adopted. Whether two sellable VI products for one title are intended is an owner question.
+  - Re-checked 2026-10-31 (read-only):
+    - TSYC's record of #4657 is correct: its sync row, create time, exact SKU and meta all agree.
+    - #4858 is an owner-made used-copy listing carrying copied meta.
+    - The mapping audit names the block `BLOCKED_COPIED_OWNERSHIP_META` and keeps the ERROR.
+    - Details are in POLYLANG_EXISTING_ARCHITECTURE.md §5b.
+    - Owner action, if wanted: remove the `_tsyc_*` meta from #4858 in wp-admin. TSYC never edits it.
 
 ## 8. Recovery
 `RECOVERY_REQUIRED` means remote state could not be confirmed. Never retry
