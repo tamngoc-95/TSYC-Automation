@@ -196,6 +196,14 @@ Open `OWNER_MODIFIED` case (re-checked 2026-10-29, read-only):
     - Details are in POLYLANG_EXISTING_ARCHITECTURE.md §5b.
     - Owner action, if wanted: remove the `_tsyc_*` meta from #4858 in wp-admin. TSYC never edits it.
 
+## 7c. Multilingual (VI/EN/DE) status
+- Current reference: `POLYLANG_BRIDGE.md`. **No EN/DE product is created or linked on production.** The bridge is not installed there, and its write routes must never be enabled there without separate owner authorization.
+- Read-only, safe at any time:
+  - `scripts/plan_translation_drafts.py`: the first blocker per book.
+  - `scripts/discover_translation_candidates.py`: the review queue of existing copies.
+  - `scripts/audit_language_product_mapping.py --remote`: exits 1 by design while CAN-0033 stays unresolved.
+- Local lab, synthetic data only: `tools/wp_lab/provision_lab.py`, then `tools/wp_lab/run_local_pilot.py`. A pass there is not evidence about the live theme hooks.
+
 ## 8. Recovery
 `RECOVERY_REQUIRED` means remote state could not be confirmed. Never retry
 draft creation blindly. Reconcile manually with

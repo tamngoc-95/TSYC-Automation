@@ -1,5 +1,14 @@
 # Existing multilingual architecture (Polylang, kept as is)
 
+> **Update 2026-11-02.** `POLYLANG_BRIDGE.md` is now the current integration
+> reference. The developer has since confirmed that Polylang's "+" creates
+> translations and that the bulk-link plugins were for products that already
+> existed: they are a **legacy** mechanism, not a create path. Polylang's API
+> behaviour is now verified on real plugin code. Flatsome Child remains
+> uninspected. Where counts below differ from `POLYLANG_BRIDGE.md` section 7, that
+> section is newer (for example, FB-2026-001-CAN-0003's VI #3311 is now published
+> and FAHASA-002-CAN-0013/0014 are trashed).
+
 Status 2026-10-22: the website developer confirmed the architecture below.
 It stays in place, and Polylang for WooCommerce is **not** purchased for now
 (this supersedes the add-on route in `POLYLANG_WOOCOMMERCE_PLAN.md`, which is

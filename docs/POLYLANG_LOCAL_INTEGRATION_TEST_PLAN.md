@@ -1,6 +1,22 @@
 # Local WordPress integration test (Polylang link mechanism)
 
-Status 2026-10-31: plan only. Nothing here touches production.
+Status 2026-11-02: the native part has run; the theme-dependent part is still
+blocked on the developer's source. Nothing here touches production. The bridge,
+lab and full results are in `POLYLANG_BRIDGE.md`; the original plan stays below.
+
+| Step | Result 2026-11-02 |
+|---|---|
+| L1, and L2's hreflang comparison | `NOT_RUN`: the lab pilot does not exercise hreflang |
+| L2 endpoint on seed products | `PASS_REAL_LOCAL` (T05) |
+| L3 endpoint failures | `PASS_REAL_LOCAL` (S1, S2, S4) |
+| L4 "+" from a TSYC draft | Plain Polylang: `PASS_REAL_LOCAL` (T03B), no `_tsyc_*` copied. With the theme: `BLOCKED_MISSING_DEPENDENCY` |
+| L5 copy, then SKU edit | WooCommerce Duplicate: `PASS_REAL_LOCAL` (T10), reported as a conflict. Duplicate Post RB: `BLOCKED_MISSING_DEPENDENCY` |
+| L6, L7, L9 stock, price, backorders | `BLOCKED_MISSING_DEPENDENCY`; native baseline recorded (T11, T12, T12B) |
+| L8 save with bulk-link plugins | `BLOCKED_MISSING_DEPENDENCY` |
+| L10 discovery with an attested map | Adapter `RESOLVED` on bridge drafts (T06). Published groups with hreflang: `NOT_RUN` |
+
+The environment differs from section 3: portable PHP with SQLite on loopback, as no
+Docker, PHP or Node is installed here. A theme-dependent rerun should use MySQL.
 
 ## Purpose
 
@@ -24,13 +40,11 @@ data, so the production numbers stay with the read-only audits.
 | EN/DE candidate discovery | `discover_translation_candidates.py`, `src/domain/translation_discovery.py` | read-only, plans no row without `VERIFIED_LINK` |
 | Group resolution and write planning | `src/domain/multilingual_adapter.py` | fail-closed: `UNVERIFIABLE` without a staging-proven map |
 | Link-map client | `src/services/polylang_link_reader.py` (`GET tsyc/v1/translations/{id}`) | strict parser; `require_staging_target` refuses the production host and non-https URLs |
-| Create-and-link writer | `TranslationDraftWriter` (contract only) | **not implemented on purpose** |
+| Create-and-link writer | `src/services/polylang_bridge_writer.py` | staging and lab only; refuses the production host |
 | Hook-assumption tests | `tests/support/fake_polylang_store.py` | each hook is a switch; this proves TSYC's rules, not the live hooks |
 
 Missing pieces:
-- the endpoint itself;
 - the hook source;
-- an isolated WordPress to run them in;
 - an EN/DE mapping writer. That writer is written only after the matrix below passes.
 
 ## 2. Inputs from the website developer (the only real dependency)
@@ -44,10 +58,8 @@ Missing pieces:
 3. How the existing EN/DE copies were made (Duplicate Post RB, Polylang "+",
    or by hand). Also, whether the bulk-link plugins run on `save_post` or only
    from an admin screen.
-4. The endpoint (option B, as a mu-plugin) built on Polylang's public PHP API
-   only:
-   - `GET tsyc/v1/translations/{id}`, wrapping `pll_get_post_translations` and `pll_get_post_language`;
-   - later `POST tsyc/v1/translations`: draft only, idempotent per `request_id`, no price, stock or SKU fields.
+4. A review of the bridge TSYC has now written
+   (`wordpress/tsyc-polylang-bridge/`, built on Polylang's public PHP API only).
 
 TSYC asks for nothing on production: no plugin purchase, no theme setting
 and no change to a link.
