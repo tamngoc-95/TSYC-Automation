@@ -10,6 +10,9 @@ What it does (no database write, no WooCommerce/WordPress write, ever):
      host only, no redirects, polite delay), and parses the hreflang links.
   4. Classifies every EN/DE candidate as VERIFIED_LINK, POTENTIAL_LINK,
      OWNER_MAINTAINED, UNVERIFIABLE or IDENTITY_CONFLICT.
+  5. Writes a review queue naming every existing copy with its operator class
+     (AUTHORITATIVE_LINK_VERIFIED, POTENTIAL_LINK, UNLINKED, IDENTITY_CONFLICT,
+     OWNER_MAINTAINED, REMOTE_REMOVED, UNKNOWN) and the only action allowed.
 
 No mapping row is planned unless a staging-proven Polylang map confirms the
 link (VERIFIED_LINK). There is none today, so the plan is always empty.
@@ -60,12 +63,15 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def load_recorded_vi(repository: Any, product_codes: Sequence[str] | None) -> list[lpm.LanguageProduct]:
+def load_rows(repository: Any) -> list[lpm.LanguageProduct]:
     products = repository.client.table("internal_products").select("internal_product_id, product_code").execute().data or []
     codes = {str(p["internal_product_id"]): str(p.get("product_code") or "") for p in products}
     rows = repository.client.table(lpm.TABLE).select("*").execute().data or []
-    recorded = [lpm.LanguageProduct.from_row(r, codes.get(str(r["internal_product_id"]), "")) for r in rows]
-    recorded = [r for r in recorded if r.language_code == wtg.SOURCE_LANGUAGE and r.mapping_status == lpm.RECORDED
+    return [lpm.LanguageProduct.from_row(r, codes.get(str(r["internal_product_id"]), "")) for r in rows]
+
+
+def select_recorded_vi(rows: Sequence[lpm.LanguageProduct], product_codes: Sequence[str] | None) -> list[lpm.LanguageProduct]:
+    recorded = [r for r in rows if r.language_code == wtg.SOURCE_LANGUAGE and r.mapping_status == lpm.RECORDED
                 and r.origin == lpm.ORIGIN_TSYC_CREATED and r.woocommerce_product_id is not None]
     if product_codes:
         wanted = set(product_codes)
@@ -123,13 +129,16 @@ def read_page_links(
 
 
 def run(rows: Sequence[lpm.LanguageProduct], catalog: Mapping[int, Mapping[str, Any]],
-        read_page: Callable[[str], str | None], max_pages: int) -> dict[str, Any]:
+        read_page: Callable[[str], str | None], max_pages: int,
+        all_rows: Sequence[lpm.LanguageProduct] = ()) -> dict[str, Any]:
     codes = {row.product_code for row in rows}
     start = {int(row.woocommerce_product_id or 0) for row in rows} | {
         pid for pid, p in catalog.items() if str(p.get("sku") or "") in codes and p.get("status") != "trash"}
     page_links = read_page_links(catalog, sorted(start), read_page, max_pages)
     groups, _unlinked = plg.build_groups(list(catalog.values()), page_links)
     books = [td.discover_book(row, catalog, groups, page_links) for row in rows]
+    queue = td.review_queue(books) + td.removed_book_copies(all_rows, catalog)
+    by_review = {cls: sum(1 for item in queue if item["review_class"] == cls) for cls in td.REVIEW_CLASSES}
     return {
         "discoverer": f"{DISCOVERER_NAME}/{DISCOVERER_VERSION}",
         "checked_at": utc_now(),
@@ -139,6 +148,8 @@ def run(rows: Sequence[lpm.LanguageProduct], catalog: Mapping[int, Mapping[str, 
         "pages_unread": sum(1 for v in page_links.values() if v is None),
         "link_authority": "none: no staging-proven Polylang map; hreflang and SKU are supplementary",
         **td.summarize(books),
+        "review_queue_by_class": by_review,
+        "review_queue": queue,
         "books_detail": [b.as_dict() for b in books],
     }
 
@@ -149,7 +160,7 @@ def print_summary(report: Mapping[str, Any], path: Path) -> None:
     print("=" * 78)
     for key in ("checked_at", "recorded_vi_rows", "remote_catalog_products", "pages_read", "pages_unread",
                 "link_authority", "books_by_outcome", "adapter_status", "candidates", "candidates_by_class",
-                "candidates_by_language_class", "mapping_inserts_allowed"):
+                "candidates_by_language_class", "mapping_inserts_allowed", "review_queue_by_class"):
         print(f"{key}: {report[key]}")
     for book in report["books_detail"]:
         if not book["candidates"]:
@@ -191,9 +202,10 @@ def main(argv: list[str] | None = None) -> int:
         return response.text if response.status_code == 200 else None
 
     try:
-        rows = load_recorded_vi(SupabaseRepository(), args.product_code)
+        all_rows = load_rows(SupabaseRepository())
+        rows = select_recorded_vi(all_rows, args.product_code)
         catalog = read_catalog(wrs_cli.build_reader(os.environ))
-        report = run(rows, catalog, read_page, args.max_pages)
+        report = run(rows, catalog, read_page, args.max_pages, all_rows)
     except Exception as error:  # noqa: BLE001 - a failed read is never a clean result
         print(f"Read failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 2

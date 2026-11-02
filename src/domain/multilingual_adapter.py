@@ -36,8 +36,10 @@ are never part of a TSYC payload, and the VI product stays the only price
 and inventory authority.
 
 Creating or linking a missing translation needs a link mechanism that has
-been proven on an isolated staging copy. No such mechanism exists yet, so
-those actions are planned as blocked, never improvised.
+been proven on an isolated copy of the store. The TSYC bridge is that mechanism
+(docs/POLYLANG_BRIDGE.md). It has passed on the local lab, is not installed on
+production and has not met the store's theme hooks, so nothing attests it for
+production and those actions stay blocked there.
 """
 from __future__ import annotations
 
@@ -326,6 +328,11 @@ def resolve_group(
             continue
         sku = str(products_by_id[pid].get("sku") or "")
         record = tsyc_records.get(lang)
+        owner_meta = str(wtg.meta_value(products_by_id[pid], wtg.TSYC_OWNER_META_KEY) or "")
+        if owner_meta and owner_meta != source_record.internal_product_id:
+            # Positive evidence of the wrong book or edition, not just missing proof.
+            resolution.reasons.append(f"{lang} #{pid} is linked by Polylang but carries another book's TSYC meta.")
+            continue
         if sku == product_code or (record is not None and record.woo_id == pid):
             continue
         if sku:

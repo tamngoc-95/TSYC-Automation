@@ -263,6 +263,79 @@ def _classify(
     return None
 
 
+# ---------------------------------------------------------------------
+# Review queue (the operator-facing classes of every existing copy)
+# ---------------------------------------------------------------------
+
+REVIEW_AUTHORITATIVE_LINK_VERIFIED = "AUTHORITATIVE_LINK_VERIFIED"
+REVIEW_POTENTIAL_LINK = "POTENTIAL_LINK"
+REVIEW_UNLINKED = "UNLINKED"
+REVIEW_IDENTITY_CONFLICT = "IDENTITY_CONFLICT"
+REVIEW_OWNER_MAINTAINED = "OWNER_MAINTAINED"
+REVIEW_REMOTE_REMOVED = "REMOTE_REMOVED"
+REVIEW_UNKNOWN = "UNKNOWN"
+REVIEW_CLASSES = (REVIEW_AUTHORITATIVE_LINK_VERIFIED, REVIEW_POTENTIAL_LINK, REVIEW_UNLINKED, REVIEW_IDENTITY_CONFLICT,
+                  REVIEW_OWNER_MAINTAINED, REVIEW_REMOTE_REMOVED, REVIEW_UNKNOWN)
+
+_REVIEW_ACTION = {
+    REVIEW_AUTHORITATIVE_LINK_VERIFIED: "May become a POLYLANG_LINKED mapping row through an authorized writer.",
+    REVIEW_POTENTIAL_LINK: "Confirm through the bridge read once it is installed. No mapping row until then.",
+    REVIEW_UNLINKED: "Carries the SKU, but Polylang shows no link. Owner decides; TSYC never links it.",
+    REVIEW_IDENTITY_CONFLICT: "Owner or developer resolves the conflicting evidence. Never adopted.",
+    REVIEW_OWNER_MAINTAINED: "Published by the owner while its VI link cannot be observed. Never written.",
+    REVIEW_REMOTE_REMOVED: "Its VI product is recorded removed. Never recreated or relinked; owner decides.",
+    REVIEW_UNKNOWN: "The evidence cannot identify the book. Confirm through the bridge read; no write.",
+}
+
+
+def review_class(candidate: Candidate) -> str:
+    """The class shown to a person, from the discovery class and its bases."""
+    if candidate.classification == VERIFIED_LINK:
+        return REVIEW_AUTHORITATIVE_LINK_VERIFIED
+    if candidate.classification == POTENTIAL_LINK:
+        return REVIEW_POTENTIAL_LINK
+    if candidate.classification == IDENTITY_CONFLICT:
+        return REVIEW_IDENTITY_CONFLICT
+    if candidate.classification == OWNER_MAINTAINED:
+        return REVIEW_UNLINKED
+    if BASIS_SKU in candidate.bases and candidate.status == "publish":
+        return REVIEW_OWNER_MAINTAINED
+    return REVIEW_UNKNOWN
+
+
+def review_queue(books: Sequence[BookDiscovery]) -> list[dict[str, Any]]:
+    """Every existing copy with a class and the only action allowed on it."""
+    queue = []
+    for book in books:
+        for candidate in book.candidates:
+            cls = review_class(candidate)
+            queue.append({"product_code": book.product_code, "vi_woo_id": book.vi_woo_id, "language": candidate.language,
+                          "woo_id": candidate.woo_id, "status": candidate.status, "sku": candidate.sku,
+                          "review_class": cls, "allowed_action": _REVIEW_ACTION[cls],
+                          "bases": list(candidate.bases), "reasons": list(candidate.reasons)})
+    return queue
+
+
+def removed_book_copies(
+    rows: Sequence[lpm.LanguageProduct], catalog: Mapping[int, Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """Live products still carrying the SKU of a book whose VI product is a
+    REMOTE_REMOVED tombstone. A tombstone itself is not a live product."""
+    tombstones = {r.product_code: r for r in rows
+                  if r.language_code == wtg.SOURCE_LANGUAGE and r.mapping_status == lpm.REMOTE_REMOVED}
+    queue = []
+    for pid, product in sorted(catalog.items()):
+        code = str(product.get("sku") or "")
+        row = tombstones.get(code)
+        if row is None or product.get("status") == "trash" or pid == row.woocommerce_product_id:
+            continue
+        queue.append({"product_code": code, "vi_woo_id": row.woocommerce_product_id,
+                      "language": wtg.product_language(product)[0], "woo_id": pid, "status": product.get("status"),
+                      "sku": code, "review_class": REVIEW_REMOTE_REMOVED,
+                      "allowed_action": _REVIEW_ACTION[REVIEW_REMOTE_REMOVED], "bases": [BASIS_SKU], "reasons": []})
+    return queue
+
+
 def summarize(books: Sequence[BookDiscovery]) -> dict[str, Any]:
     by_class = collections.Counter(c.classification for b in books for c in b.candidates)
     by_lang = collections.Counter(f"{c.language} {c.classification}" for b in books for c in b.candidates)

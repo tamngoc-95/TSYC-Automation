@@ -348,7 +348,8 @@ def reader_with(response, calls=None):
     return plr.EndpointLinkReader(store_url="https://staging.example.test", auth=None, http_get=http_get)
 
 
-GOOD = {"id": 4868, "lang": "vi", "sku": CODE, "status": "draft", "translations": {"vi": 4868, "en": "4869"}}
+GOOD = {"id": 4868, "lang": "vi", "sku": CODE, "status": "draft", "translations": {"vi": 4868, "en": "4869"},
+        "consistent": True, "issues": []}
 
 
 def test_reader_parses_a_valid_answer_and_issues_one_get():
