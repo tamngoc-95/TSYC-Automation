@@ -1,0 +1,1156 @@
+{
+ "measured_on": {
+  "bridge_version": "1.1.0",
+  "default_language": "vi",
+  "environment": "local",
+  "languages": [
+   "vi",
+   "en",
+   "de"
+  ],
+  "mechanism": "tsyc/v1 translations endpoint",
+  "polylang_version": "3.8.4",
+  "woocommerce": "10.7.0",
+  "writes_enabled": true
+ },
+ "note": "Plain WordPress, WooCommerce and Polylang in the lab; no theme.",
+ "scenarios": {
+  "bridge_create_de_after_en": {
+   "added_post_meta:_backorders": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_download_expiry": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_download_limit": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_downloadable": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_manage_stock": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_product_version": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_sold_individually": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_stock": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_stock_status": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tax_class": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tax_status": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_authorization_id": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_bridge_state": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_bridge_warnings": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_group_snapshot": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_internal_product_id": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_language": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_request_fingerprint": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_request_id": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_source_product_id": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_virtual": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_wc_average_rating": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_wc_review_count": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:total_sales": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "draft_product": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "pll_copy_post_metas": {
+    "count": 2,
+    "languages": [],
+    "roles": [
+     "NONE"
+    ]
+   },
+   "pll_save_post": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "save_post": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "save_post_product": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "set_object_terms": {
+    "count": 10,
+    "languages": [
+     "de",
+     "en",
+     "vi"
+    ],
+    "roles": [
+     "OTHER",
+     "SIBLING_DRAFT",
+     "SOURCE"
+    ]
+   },
+   "transition_post_status": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "updated_post_meta:_tsyc_bridge_state": {
+    "count": 2,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_after_product_object_save": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_before_product_object_save": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "NONE"
+    ]
+   },
+   "woocommerce_new_product": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_product_object_updated_props": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_product_set_stock": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_product_set_stock_status": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "wp_insert_post": {
+    "count": 1,
+    "languages": [
+     "de"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   }
+  },
+  "bridge_create_en": {
+   "added_post_meta:_backorders": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_download_expiry": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_download_limit": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_downloadable": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_manage_stock": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_product_version": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_sold_individually": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_stock": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_stock_status": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tax_class": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tax_status": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_authorization_id": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_bridge_state": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_bridge_warnings": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_group_snapshot": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_internal_product_id": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_language": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_request_fingerprint": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_request_id": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_tsyc_source_product_id": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_virtual": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_wc_average_rating": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:_wc_review_count": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "added_post_meta:total_sales": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "draft_product": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "pll_copy_post_metas": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "NONE"
+    ]
+   },
+   "pll_save_post": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "save_post": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "save_post_product": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "set_object_terms": {
+    "count": 9,
+    "languages": [
+     "en",
+     "vi"
+    ],
+    "roles": [
+     "OTHER",
+     "SOURCE"
+    ]
+   },
+   "transition_post_status": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "updated_post_meta:_tsyc_bridge_state": {
+    "count": 2,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_after_product_object_save": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_before_product_object_save": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "NONE"
+    ]
+   },
+   "woocommerce_new_product": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_product_object_updated_props": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_product_set_stock": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_product_set_stock_status": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "wp_insert_post": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "OTHER"
+    ]
+   }
+  },
+  "bridge_rollback": {
+   "added_post_meta:_wp_desired_post_slug": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "added_post_meta:_wp_trash_meta_status": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "added_post_meta:_wp_trash_meta_time": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "edit_post": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "pll_save_post": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "post_updated": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "pre_post_update": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "save_post": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "save_post_product": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "set_object_terms": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "transition_post_status": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "trash_product": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "trashed_post": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "wp_insert_post": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "wp_trash_post": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   }
+  },
+  "order_on_en_backorder": {
+   "edit_post": {
+    "count": 2,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "save_post": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "set_object_terms": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "transition_post_status": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_after_product_object_save": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_before_product_object_save": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_order_status_processing": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_product_object_updated_props": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_product_set_stock": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_reduce_order_item_stock": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_reduce_order_stock": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   },
+   "woocommerce_update_product": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_updated_product_stock": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "wp_insert_post": {
+    "count": 1,
+    "languages": [],
+    "roles": [
+     "OTHER"
+    ]
+   }
+  },
+  "wc_rest_en_stock_update": {
+   "pll_copy_post_metas": {
+    "count": 4,
+    "languages": [],
+    "roles": [
+     "NONE"
+    ]
+   },
+   "set_object_terms": {
+    "count": 2,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "updated_post_meta:_stock": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "updated_post_meta:_stock_status": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_after_product_object_save": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_before_product_object_save": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_product_object_updated_props": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_product_set_stock": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_product_set_stock_status": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_rest_insert_product_object": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_rest_pre_insert_product_object": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   },
+   "woocommerce_update_product": {
+    "count": 1,
+    "languages": [
+     "en"
+    ],
+    "roles": [
+     "TARGET"
+    ]
+   }
+  },
+  "wc_rest_vi_price_update": {
+   "pll_copy_post_metas": {
+    "count": 4,
+    "languages": [],
+    "roles": [
+     "NONE"
+    ]
+   },
+   "set_object_terms": {
+    "count": 1,
+    "languages": [
+     "vi"
+    ],
+    "roles": [
+     "SOURCE"
+    ]
+   },
+   "updated_post_meta:_price": {
+    "count": 1,
+    "languages": [
+     "vi"
+    ],
+    "roles": [
+     "SOURCE"
+    ]
+   },
+   "updated_post_meta:_regular_price": {
+    "count": 1,
+    "languages": [
+     "vi"
+    ],
+    "roles": [
+     "SOURCE"
+    ]
+   },
+   "woocommerce_after_product_object_save": {
+    "count": 1,
+    "languages": [
+     "vi"
+    ],
+    "roles": [
+     "SOURCE"
+    ]
+   },
+   "woocommerce_before_product_object_save": {
+    "count": 1,
+    "languages": [
+     "vi"
+    ],
+    "roles": [
+     "SOURCE"
+    ]
+   },
+   "woocommerce_product_object_updated_props": {
+    "count": 1,
+    "languages": [
+     "vi"
+    ],
+    "roles": [
+     "SOURCE"
+    ]
+   },
+   "woocommerce_rest_insert_product_object": {
+    "count": 1,
+    "languages": [
+     "vi"
+    ],
+    "roles": [
+     "SOURCE"
+    ]
+   },
+   "woocommerce_rest_pre_insert_product_object": {
+    "count": 1,
+    "languages": [
+     "vi"
+    ],
+    "roles": [
+     "SOURCE"
+    ]
+   },
+   "woocommerce_update_product": {
+    "count": 1,
+    "languages": [
+     "vi"
+    ],
+    "roles": [
+     "SOURCE"
+    ]
+   }
+  }
+ }
+}
