@@ -7,7 +7,8 @@ these routes on production either; both locks must fail for a write to land.
 Every answer is sorted into exactly one kind (CLAUDE.md 2.6):
 
   CONFIRMED  the bridge read the link back and said so;
-  REFUSED    a deterministic 4xx: nothing new was created by this call;
+  REFUSED    a deterministic 4xx: nothing new was created by this call,
+             except a side-effect stop, which names the draft it left behind;
   UNCERTAIN  a timeout, a broken connection, a 5xx or a malformed success:
              the product may exist. Reconcile before anything else.
 """
@@ -30,6 +31,9 @@ UNCERTAIN = "UNCERTAIN"
 INVENTORY_PROFILE_FAHASA_PREORDER = "FAHASA_PREORDER"
 BRIDGE_STATE_LINKED = "LINKED"
 BRIDGE_BUSY = "tsyc_busy"
+# Protected values moved during the operation. The bridge stopped and repaired
+# nothing, so the whole book stops for a person (docs/POLYLANG_BRIDGE.md).
+BRIDGE_SIDE_EFFECT = "tsyc_sibling_side_effect"
 
 
 @dataclass(frozen=True)
@@ -74,6 +78,23 @@ class CreateOutcome:
     text: Mapping[str, str] | None = None
     translations: Mapping[str, int] = field(default_factory=dict)
     replayed: bool = False
+    changes: tuple[Mapping[str, Any], ...] = ()
+
+
+def _refusal_data(body: Any) -> Mapping[str, Any]:
+    data = body.get("data") if isinstance(body, Mapping) else None
+    return data if isinstance(data, Mapping) else {}
+
+
+def _named_product(data: Mapping[str, Any]) -> int | None:
+    """The product a refusal names: its own partial draft, or the one in the way."""
+    pid = data.get("product_id")
+    return pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else None
+
+
+def _changes(data: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    changes = data.get("changes")
+    return tuple(c for c in changes if isinstance(c, Mapping)) if isinstance(changes, list) else ()
 
 
 def parse_create_response(status: int | None, body: Any, request: CreateRequest) -> CreateOutcome:
@@ -94,7 +115,8 @@ def parse_create_response(status: int | None, body: Any, request: CreateRequest)
         # this call changed nothing, but the outcome is not known yet.
         return CreateOutcome(UNCERTAIN, rid, code, str(message), status)
     if isinstance(status, int) and 400 <= status < 500 and isinstance(code, str) and code.startswith(("tsyc_", "rest_")):
-        return CreateOutcome(REFUSED, rid, code, str(message), status)
+        data = _refusal_data(body)
+        return CreateOutcome(REFUSED, rid, code, str(message), status, product_id=_named_product(data), changes=_changes(data))
     # A 5xx, or a 4xx that is not the bridge's (a proxy, a WAF): unknown effect.
     return CreateOutcome(UNCERTAIN, rid, str(code) if code else "UNEXPECTED_ANSWER", str(message), status)
 
@@ -186,4 +208,5 @@ class BridgeDraftWriter:
         code = parsed.get("code") if isinstance(parsed, Mapping) else None
         message = parsed.get("message") if isinstance(parsed, Mapping) else None
         kind = REFUSED if 400 <= status < 500 else UNCERTAIN
-        return CreateOutcome(kind, request_id, str(code), str(message), status)
+        data = _refusal_data(parsed)
+        return CreateOutcome(kind, request_id, str(code), str(message), status, product_id=_named_product(data), changes=_changes(data))

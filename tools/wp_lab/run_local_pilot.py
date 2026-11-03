@@ -34,7 +34,9 @@ import requests
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import provision_lab  # noqa: E402
 from src.cli_bootstrap import configure_utf8_console  # noqa: E402
 from src.domain import language_product_mapping as lpm  # noqa: E402
 from src.domain import multilingual_adapter as ma  # noqa: E402
@@ -88,6 +90,15 @@ class Lab:
         self.secrets = json.loads((lab_dir / "lab_secrets.json").read_text(encoding="utf-8"))
         self.auth: tuple[str, str] = ("lab-admin", "")
         self.servers: list[subprocess.Popen[bytes]] = []
+        self.database_server: subprocess.Popen[bytes] | None = None
+
+    @property
+    def database(self) -> str:
+        return "mariadb" if (self.dir / "mariadb").exists() else "sqlite"
+
+    def start_database(self) -> None:
+        if self.database == "mariadb":
+            self.database_server = provision_lab.start_mariadb(self.dir)
 
     def wp(self, *arguments: str, check: bool = True) -> str:
         done = subprocess.run([str(self.php), "-c", str(self.ini), str(self.cli), f"--path={self.site}", *arguments],
@@ -129,6 +140,12 @@ class Lab:
     def stop_all(self) -> None:
         for server in list(self.servers):
             self.stop_server(server)
+
+    def stop_database(self) -> None:
+        if self.database_server is not None:
+            self.database_server.terminate()
+            self.database_server.wait(timeout=60)
+            self.database_server = None
 
     # ---- plain REST -------------------------------------------------------
 
@@ -276,19 +293,23 @@ class Pilot:
     def t04_de(self) -> dict[str, Any]:
         return self._run_lang_check("de")
 
-    def t03b_plus_flow(self) -> dict[str, Any]:
-        """Polylang's real "+" screen, driven with a logged-in browser session."""
-        book, vi = self.make_book(f"{SKU_PREFIX}PLUS", "00000000-0000-4000-8000-00000000000a")
+    def admin_session(self) -> requests.Session:
         session = requests.Session()
         session.post(f"{STORE}/wp-login.php", data={"log": "lab-admin", "pwd": self.lab.secrets["admin_password"],
                                                     "wp-submit": "Log In", "testcookie": "1"},
                      cookies={"wordpress_test_cookie": "WP Cookie check"}, timeout=HTTP_TIMEOUT, allow_redirects=False)
-        edit = session.get(f"{STORE}/wp-admin/post.php", params={"post": vi["id"], "action": "edit"}, timeout=HTTP_TIMEOUT)
+        return session
+
+    def plus_links(self, session: requests.Session, source_id: int, lang: str) -> list[str]:
+        """The "+" links the source's edit screen really offers for one language."""
+        edit = session.get(f"{STORE}/wp-admin/post.php", params={"post": source_id, "action": "edit"}, timeout=HTTP_TIMEOUT)
         expect(edit.status_code == 200, f"edit screen {edit.status_code}")
-        links = re.findall(r'href="([^"]*post-new\.php[^"]*new_lang=en[^"]*)"', edit.text)
-        links += re.findall(r'href=\\?"([^"]*post-new\.php[^"]*new_lang=en[^"]*)', edit.text)
-        expect(links, "The VI edit screen shows no Polylang + link for EN.")
-        link = html_lib.unescape(links[0]).replace("\\/", "/")
+        links = re.findall(rf'href="([^"]*post-new\.php[^"]*new_lang={lang}[^"]*)"', edit.text)
+        links += re.findall(rf'href=\\?"([^"]*post-new\.php[^"]*new_lang={lang}[^"]*)', edit.text)
+        return [html_lib.unescape(link).replace("\\/", "/") for link in links]
+
+    def plus_save(self, session: requests.Session, link: str, source_id: int, lang: str, title: str) -> int:
+        """Open one "+" link and save its form as a draft. Returns the new product ID."""
         screen = session.get(link, timeout=HTTP_TIMEOUT)
         expect(screen.status_code == 200, f"post-new {screen.status_code}")
         form = re.search(r"""<form[^>]*\bid=["']post["'][^>]*>(.*)</form>""", screen.text, re.S)
@@ -302,12 +323,21 @@ class Pilot:
                 fields[name.group(1)] = html_lib.unescape((value.group(1) or value.group(2) or "")) if value else ""
         expect("post_ID" in fields, f"No post_ID among {sorted(fields)[:20]}")
         new_id = int(fields["post_ID"])
-        fields.update({"post_title": "Lab book via plus (en)", "content": "Plus flow text", "post_status": "draft",
-                       "save": "Save Draft", "product-type": "simple", "post_lang_choice": "en",
-                       "post_tr_lang[vi]": str(vi["id"]), "action": "editpost", "originalaction": "editpost",
+        fields.update({"post_title": title, "content": "Plus flow text", "post_status": "draft",
+                       "save": "Save Draft", "product-type": "simple", "post_lang_choice": lang,
+                       "post_tr_lang[vi]": str(source_id), "action": "editpost", "originalaction": "editpost",
                        "post_type": "product"})
         save = session.post(f"{STORE}/wp-admin/post.php", data=fields, timeout=HTTP_TIMEOUT, allow_redirects=False)
         expect(save.status_code in (200, 302), f"save {save.status_code}")
+        return new_id
+
+    def t03b_plus_flow(self) -> dict[str, Any]:
+        """Polylang's real "+" screen, driven with a logged-in browser session."""
+        book, vi = self.make_book(f"{SKU_PREFIX}PLUS", "00000000-0000-4000-8000-00000000000a")
+        session = self.admin_session()
+        links = self.plus_links(session, vi["id"], "en")
+        expect(links, "The VI edit screen shows no Polylang + link for EN.")
+        new_id = self.plus_save(session, links[0], vi["id"], "en", "Lab book via plus (en)")
         group = self.reader.read_group(vi["id"])
         copied = self.lab.eval_json(f"""
 $meta = get_post_meta({new_id});
@@ -936,6 +966,7 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     lab = Lab(args.lab_dir.resolve())
+    lab.start_database()
     lab.wipe_products()
     lab.auth = ("lab-admin", lab.wp("user", "application-password", "create", "lab-admin", f"pilot-{time.time()}", "--porcelain"))
     lab.start_server()
@@ -976,8 +1007,9 @@ def main(argv: list[str] | None = None) -> int:
             pilot.record(test_id, title, fn)
     finally:
         lab.stop_all()
-    report = {"ran_at": datetime.now(timezone.utc).isoformat(), "versions": versions,
-              "not_in_lab": ["Flatsome + Flatsome Child", "pll-bulk-link-translations v1/v2", "Duplicate Post RB", "MySQL (SQLite here)", "production data"],
+        lab.stop_database()
+    report = {"ran_at": datetime.now(timezone.utc).isoformat(), "versions": versions, "database": lab.database,
+              "not_in_lab": ["Flatsome + Flatsome Child", "pll-bulk-link-translations v1/v2", "Duplicate Post RB", "production data"],
               "results": pilot.results}
     path = run_dir / "pilot_report.json"
     path.write_text(json.dumps(report, ensure_ascii=False, indent=1, default=str), encoding="utf-8")

@@ -25,4 +25,9 @@ add_action('tsyc_bridge_checkpoint', static function (string $stage): void {
         status_header(502);
         exit('lab fault at ' . $stage);
     }
+    // Widens a race window deterministically: "stage=seconds".
+    $delay = isset($_SERVER['HTTP_X_TSYC_LAB_DELAY']) ? explode('=', (string) $_SERVER['HTTP_X_TSYC_LAB_DELAY'], 2) : array();
+    if (count($delay) === 2 && $delay[0] === $stage) {
+        sleep(min(30, (int) $delay[1]));
+    }
 });
