@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 from src.domain import multilingual_adapter as ma
+from src.domain import woo_remote_lifecycle
 from src.domain import woo_translation_group as wtg
 
 TABLE = "woocommerce_language_products"
@@ -294,6 +295,66 @@ def compare_stored_vi(stored: Sequence[LanguageProduct], derived: Sequence[Langu
                                         f"{name}: stored {getattr(current, name)!r}, sync row implies "
                                         f"{getattr(row, name)!r}."))
     return findings
+
+
+# ---------------------------------------------------------------------
+# RECORDED -> REMOTE_REMOVED for a stored VI row whose sync row was
+# reconciled to a confirmed owner removal after the backfill (2026-11-07:
+# FAHASA-002-CAN-0013 #4928 and CAN-0014 #4930). The backfill writer only
+# inserts; this is the one transition an existing row may take.
+# ---------------------------------------------------------------------
+
+TRANSITION_TO_REMOVED = "TRANSITION_TO_REMOVED"
+ALREADY_REMOVED = "ALREADY_REMOVED"
+TRANSITION_REFUSED = "TRANSITION_REFUSED"
+
+
+def plan_removal_transition(
+    stored: LanguageProduct | None,
+    derived: LanguageProduct | None,
+    sync: Mapping[str, Any] | None,
+    remote: Mapping[str, Any] | None,
+    other_language_rows: Sequence[LanguageProduct] = (),
+) -> tuple[str, str]:
+    """(outcome, reason) for one book. Only TRANSITION_TO_REMOVED is written.
+
+    Every condition must hold; anything else refuses:
+      - a stored VI row, TSYC_CREATED, RECORDED;
+      - the sync row derives the same Woo ID, sync row and origin, with
+        status REMOTE_REMOVED;
+      - the sync row's removal marker is confirmed by the strict rule
+        (woo_remote_lifecycle.confirmed_remote_removal) for that Woo ID;
+      - the remote catalog read (status any, trash excluded) does not show
+        the product live: an owner restore is never overwritten;
+      - no EN/DE row depends on this VI row (a translation needs a
+        RECORDED VI)."""
+    if stored is None:
+        return TRANSITION_REFUSED, "No stored VI row."
+    if stored.language_code != wtg.SOURCE_LANGUAGE or stored.origin != ORIGIN_TSYC_CREATED:
+        return TRANSITION_REFUSED, "Only TSYC's own VI row can take this transition."
+    if stored.mapping_status == REMOTE_REMOVED:
+        return ALREADY_REMOVED, "Stored row already REMOTE_REMOVED."
+    if stored.mapping_status != RECORDED:
+        return TRANSITION_REFUSED, f"Stored status is {stored.mapping_status}, not RECORDED."
+    if derived is None or derived.mapping_status != REMOTE_REMOVED:
+        return TRANSITION_REFUSED, "The sync row does not imply REMOTE_REMOVED."
+    for name in ("internal_product_id", "woocommerce_product_id", "sync_id", "origin"):
+        if getattr(stored, name) != getattr(derived, name):
+            return TRANSITION_REFUSED, f"{name} differs between the stored row and the sync row."
+    if sync is None or str(sync.get("sync_id")) != str(stored.sync_id):
+        return TRANSITION_REFUSED, "The sync row the mapping points at was not read."
+    if woo_remote_lifecycle.confirmed_remote_removal(sync) not in woo_remote_lifecycle.REMOTE_REMOVAL_STATES:
+        return TRANSITION_REFUSED, "The sync row carries no confirmed removal marker for its Woo ID."
+    if remote is not None and remote.get("status") not in (None, "trash"):
+        return TRANSITION_REFUSED, (
+            f"#{stored.woocommerce_product_id} reads {remote.get('status')!r}: live again, owner decision.")
+    dependents = [r for r in other_language_rows
+                  if r.internal_product_id == stored.internal_product_id and r.language_code != wtg.SOURCE_LANGUAGE]
+    if dependents:
+        return TRANSITION_REFUSED, (
+            f"{len(dependents)} translation row(s) depend on this VI row; resolve them first.")
+    return TRANSITION_TO_REMOVED, (
+        f"Sync row confirms owner removal of #{stored.woocommerce_product_id}; mapping follows (terminal).")
 
 
 # ---------------------------------------------------------------------
