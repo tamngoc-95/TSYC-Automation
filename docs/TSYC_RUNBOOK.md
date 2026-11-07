@@ -195,6 +195,31 @@ Open `OWNER_MODIFIED` case (re-checked 2026-10-29, read-only):
     - The mapping audit names the block `BLOCKED_COPIED_OWNERSHIP_META` and keeps the ERROR.
     - Details are in POLYLANG_EXISTING_ARCHITECTURE.md §5b.
     - Owner action, if wanted: remove the `_tsyc_*` meta from #4858 in wp-admin. TSYC never edits it.
+- Second instance found 2026-11-07: #4829 "Hiểu Về Trái Tim", created 2026-10-14 08:02 GMT, carries every `_tsyc_*` key of IMG-003-CAN-0034 (TSYC's own product is #4595), SKU hand-edited to `…IMG-003-CAN-51`. It was not in the morning's catalog read (status any, trash excluded) and was modified 2026-11-07 16:17 GMT, so it is live again. It is reported as `COPIED_OWNERSHIP_META` and never adopted; #4595's mapping row is unchanged.
+
+### 7b.1 Reconciliation run of 2026-11-07
+- `--plan` found 25 `REMOTE_PUBLISHED`, 2 `REMOTE_TRASHED` (#4928, #4930), 1 `OWNER_MODIFIED` (#3772). `--apply` on exactly those 27 codes: 27 `RECONCILED`, run `20261107T085704Z`. Afterwards: 182 `CONSISTENT`, 1 `OWNER_MODIFIED`.
+- The two trashed books still had `RECORDED` language-mapping rows (the backfill only inserts). They were moved with the new transition writer, which changes nothing else:
+```
+.venv/Scripts/python.exe scripts/reconcile_language_mapping_status.py --product-code TSYC-... --max-products N            (dry run)
+... --confirm-update
+.venv/Scripts/python.exe scripts/reconcile_language_mapping_status.py --rollback data/output/language_mapping/status_reconcile/<run> [--confirm-rollback]
+```
+  It moves a VI row from `RECORDED` to `REMOTE_REMOVED` only when the sync row strictly confirms the owner removal for the same Woo ID, the catalog read does not show the product live again, and no EN/DE row depends on it. It works compare-and-set, with a read-back, a checkpoint and no retry. Run `20261107T165847Z`: 2 `UPDATED`.
+
+### 7b.2 Stored status vs sync evidence (pipeline audit 1.1.0)
+`audit_pipeline_state.py` also compares `internal_products.woocommerce_status` with the product's own sync rows and markers (`src/domain/woo_status_consistency.py`). It reads no remote state; live owner changes stay this section's remote check.
+
+| Code | Severity | Meaning |
+|---|---|---|
+| `WOO_STATUS_LIVE_AFTER_CONFIRMED_REMOVAL` | ERROR | Sync records an owner removal, stored status is not FAILED |
+| `WOO_STATUS_REMOVAL_MARKER_MISMATCH` | ERROR | Removal marker on only one row, or on different IDs: interrupted reconciliation |
+| `WOO_STATUS_LIVE_WITHOUT_REMOTE_ID` | ERROR | PUBLISHED / READY_TO_PUBLISH without any Woo ID |
+| `WOO_STATUS_LIVE_WITH_FAILED_SYNC` | ERROR | Live stored status, only a FAILED unconfirmed sync |
+| `WOO_STATUS_CREATE_OUTCOME_UNRESOLVED` | ERROR | A started create without an ID, never resolved, while a create is still invited |
+| `WOO_STATUS_STALE_TERMINAL` | WARNING (accepted) | READY_FOR_DRAFT, but the catalog check is terminal: never dispatched |
+
+On 2026-11-07: 0 errors, 2 `WOO_STATUS_STALE_TERMINAL` (IMG-002-CAN-0019 existing #1493, IMG-004-CAN-0031 resolved interrupted create). No writer changes these columns; they are an accepted, visible cache lag.
 
 ## 7c. Multilingual (VI/EN/DE) status
 - Current reference: `POLYLANG_BRIDGE.md`. **No EN/DE product is created or linked on production.** The bridge is not installed there, and its write routes must never be enabled there without separate owner authorization.
