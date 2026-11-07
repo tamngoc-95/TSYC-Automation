@@ -94,6 +94,11 @@ ACCEPTED_WARNING_CODES = {
     # proved the book is already an existing WooCommerce product. Terminal:
     # never created a second time.
     "EXISTING_WOO_PRODUCT",
+    # Stored READY_FOR_DRAFT on a product whose catalog check is terminal
+    # (src.domain.woo_status_consistency): stale cache, never dispatched,
+    # no create possible. Every dangerous stored/sync contradiction from
+    # that module is an ERROR and is NOT accepted here.
+    "WOO_STATUS_STALE_TERMINAL",
 }
 
 # The full named state machine from the Phase C plan. run_batch.py's
