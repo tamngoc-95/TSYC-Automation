@@ -35,11 +35,17 @@ HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = HERE.parents[1]
 BRIDGE_SOURCE = PROJECT_ROOT / "wordpress" / "tsyc-polylang-bridge" / "tsyc-polylang-bridge.php"
 
-# The versions production runs where they are known
-# (docs/POLYLANG_EXISTING_ARCHITECTURE.md section 1).
+# The versions production runs, read-only from wc/v3/system_status on
+# 2026-11-07 (WordPress 7.1.4, WooCommerce 11.2.1, Polylang 3.9.1, PHP 8.3).
+# The 2026-11-03 lab runs used WooCommerce 10.7.0 / Polylang 3.8.4; pass
+# --woocommerce-version / --polylang-version to reproduce them.
 PHP_BRANCH = "8.3"
 WORDPRESS_VERSION = "7.1.4"
-PLUGINS = {"woocommerce": "10.7.0", "polylang": "3.8.4", "sqlite-database-integration": "3.1.2"}
+WOOCOMMERCE_VERSION = "11.2.1"
+POLYLANG_VERSION = "3.9.1"
+SQLITE_INTEGRATION_VERSION = "3.1.2"
+PLUGINS = {"woocommerce": WOOCOMMERCE_VERSION, "polylang": POLYLANG_VERSION,
+           "sqlite-database-integration": SQLITE_INTEGRATION_VERSION}
 PORT = 8765
 TIMEOUT = 300
 MARIADB_VERSION = "11.4.5"
@@ -189,6 +195,18 @@ def provision_plugin(lab: Path, site: Path, slug: str, version: str) -> None:
     shutil.move(str(unpacked / slug), str(target))
 
 
+def installed_plugin_version(folder: Path, slug: str) -> str | None:
+    """The 'Version:' header of an installed plugin's main file, if any."""
+    main = folder / f"{slug}.php"
+    if not main.exists():
+        return None
+    for line in main.read_text(encoding="utf-8", errors="replace").splitlines()[:60]:
+        stripped = line.strip().lstrip("*").strip()
+        if stripped.lower().startswith("version:"):
+            return stripped.split(":", 1)[1].strip()
+    return None
+
+
 def write_config(site: Path, secrets_data: dict[str, str], db: str = "sqlite") -> None:
     salts = "\n".join(
         f"define('{key}', '{secrets.token_hex(32)}');"
@@ -242,15 +260,26 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", choices=("sqlite", "mariadb"), default="sqlite")
     parser.add_argument("--lab-dir", type=Path)
+    parser.add_argument("--woocommerce-version", default=WOOCOMMERCE_VERSION)
+    parser.add_argument("--polylang-version", default=POLYLANG_VERSION)
     args = parser.parse_args(argv)
     lab: Path = (args.lab_dir or default_lab_dir(args.db)).resolve()
     if PROJECT_ROOT in lab.parents or lab == PROJECT_ROOT:
         raise SystemExit("The lab must live outside the repository.")
     lab.mkdir(parents=True, exist_ok=True)
+    plugins = {**PLUGINS, "woocommerce": args.woocommerce_version, "polylang": args.polylang_version}
 
     php = provision_php(lab)
     site = provision_wordpress(lab)
-    for slug, version in PLUGINS.items():
+    installed = site / "wp-content" / "plugins"
+    for slug in ("woocommerce", "polylang"):
+        # provision_plugin() never overwrites: an existing lab keeps the
+        # version it was built with. Refuse rather than silently test the
+        # wrong one.
+        found = installed_plugin_version(installed / slug, slug)
+        if found and found != plugins[slug]:
+            raise SystemExit(f"{lab} already has {slug} {found}, not {plugins[slug]}: use a fresh --lab-dir.")
+    for slug, version in plugins.items():
         if args.db == "mariadb" and slug == "sqlite-database-integration":
             continue
         provision_plugin(lab, site, slug, version)

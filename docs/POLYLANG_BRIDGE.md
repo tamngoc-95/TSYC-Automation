@@ -1,7 +1,8 @@
 # TSYC Polylang bridge and multilingual integration
 
-Status 2026-11-03, bridge 1.1.0. The bridge has passed on an isolated local WordPress,
-on both SQLite and MariaDB. It is **not installed on production or any copy of the
+Status 2026-11-07, bridge 1.1.0. The bridge has passed on an isolated local WordPress,
+on both SQLite and MariaDB, and was re-run on 2026-11-07 at the versions production
+runs (WordPress 7.1.4, WooCommerce 11.2.1, Polylang 3.9.1, PHP 8.3; section 5.2). It is **not installed on production or any copy of the
 store**, and it has **not met the store's theme hooks**. No EN/DE product, link or mapping
 row exists because of it. Staging write tests are not yet allowed: see section 10.
 
@@ -22,9 +23,11 @@ Two flows, kept separate:
 - **New product:** TSYC VI draft → bridge creates the EN/DE drafts → Polylang link → verified read-back → mapping row.
 - **Legacy product:** existing copies are only read and classified (`discover_translation_candidates.py`). They are never written, relinked or adopted.
 
-## 2. Polylang 3.8.4: verified behaviour
+## 2. Polylang 3.8.4 and 3.9.1: verified behaviour
 
-Read in the plugin source and run on the real code (test IDs refer to section 5).
+Read in the 3.8.4 plugin source and run on the real code (test IDs refer to section 5).
+Every test below passed again on 3.9.1 with WooCommerce 11.2.1 (section 5.2); the 3.9.1
+source was not re-read line by line.
 
 | API | Behaviour TSYC depends on | Evidence |
 |---|---|---|
@@ -119,11 +122,11 @@ a `CONFLICT`.
 
 ## 5. Local lab results
 
-Isolated lab: `tools/wp_lab/` provisions WordPress 7.1.4, WooCommerce 10.7.0 (HPOS on),
-Polylang 3.8.4 and portable PHP 8.3 with checksums verified, on loopback only, using SQLite or MariaDB 11.4.5, synthetic data, outbound HTTP blocked and mail off. No production value is read.
+Isolated lab: `tools/wp_lab/` provisions WordPress 7.1.4, WooCommerce 11.2.1 (HPOS on),
+Polylang 3.9.1 and portable PHP 8.3 with checksums verified, on loopback only, using SQLite or MariaDB 11.4.5, synthetic data, outbound HTTP blocked and mail off. No production value is read. These are production's versions as read from `wc/v3/system_status` on 2026-11-07; the 2026-11-03 runs below used WooCommerce 10.7.0 and Polylang 3.8.4 (`--woocommerce-version` / `--polylang-version` reproduce them). An existing lab keeps the version it was built with, and the provisioner refuses a lab whose installed version differs from the one requested, so upgrade into a fresh `--lab-dir`.
 
 ```
-.venv/Scripts/python.exe tools/wp_lab/provision_lab.py [--db mariadb]
+.venv/Scripts/python.exe tools/wp_lab/provision_lab.py [--db mariadb] [--lab-dir PATH]
 .venv/Scripts/python.exe tools/wp_lab/run_local_pilot.py [--lab-dir PATH]
 .venv/Scripts/python.exe tools/wp_lab/run_hardening_pilot.py [--lab-dir PATH]
 ```
@@ -199,6 +202,49 @@ The labels are not interchangeable. `PASS_SYNTHETIC_HOOK` uses `tsyc-lab-synthet
 - Polylang's edit screen always prints the add link for a language, hidden when it is taken. **Opening that URL and saving silently evicts the existing translation**, which stays a draft outside the group. A bridge replay then refuses with `tsyc_link_changed` and does not undo the person's change (H12).
 - A person's "+" copy has no `_tsyc_*` meta. The bridge keeps it in the group and never adopts it.
 
+### 5.2 Re-run at production versions, 2026-11-07
+
+Production was read (`wc/v3/system_status`, GET) at WordPress 7.1.4, WooCommerce **11.2.1**
+and Polylang **3.9.1**, PHP 8.3.36, while every earlier run used 10.7.0 / 3.8.4. Two fresh
+labs were provisioned at exactly those versions (the 2026-11-03 labs are kept as baseline).
+
+| Run | Database | Result | Report (gitignored) |
+|---|---|---|---|
+| Base pilot | MariaDB 11.4.5 | 23 `PASS_REAL_LOCAL`, 2 `BLOCKED_MISSING_DEPENDENCY` (T11, T12B), 0 `FAIL` | `polylang_local/20261107T170422Z` |
+| Base pilot | SQLite | 23 `PASS_REAL_LOCAL`, 2 `BLOCKED_MISSING_DEPENDENCY`, 0 `FAIL` | `polylang_local/20261107T174319Z` |
+| Hardening pilot | MariaDB 11.4.5 | 13 `PASS_REAL_LOCAL`, 8 `PASS_SYNTHETIC_HOOK`, 6 `BLOCKED_MISSING_SOURCE`, 0 `FAIL` | `polylang_hardening/20261107T171300Z` |
+| Hardening pilot, first | SQLite | 12 `PASS_REAL_LOCAL`, **1 `FAIL` (H09)**, 8 `PASS_SYNTHETIC_HOOK`, 6 `BLOCKED_MISSING_SOURCE` | `polylang_hardening/20261107T174855Z` |
+| H09 alone | SQLite | `PASS_REAL_LOCAL` (98.7 s) | `polylang_hardening/20261107T201741Z` |
+| Hardening pilot, second | SQLite | 13 `PASS_REAL_LOCAL`, 8 `PASS_SYNTHETIC_HOOK`, 6 `BLOCKED_MISSING_SOURCE`, 0 `FAIL` | `polylang_hardening/20261107T202129Z` |
+
+**The H09 failure.** One `wp eval-file` call inside H09 blocked for ~430 s past its
+subprocess timeout; the test took 704 s against a normal 78–101 s. No bridge answer or
+group state was wrong in the evidence: the harness never got the PHP result back. It did not
+recur in an isolated re-run or a full re-run, and never on MariaDB. It is recorded as an
+intermittent lab stall on SQLite (single writer, PHP's built-in server), **not explained and
+not excused**: if it recurs, find which evaluation blocks before trusting H09 on SQLite.
+
+**Measured hook events changed with the upgrade.** Same database, old versus new versions:
+
+| Scenario | 10.7.0 / 3.8.4 | 11.2.1 / 3.9.1 |
+|---|---|---|
+| `bridge_create_en`, `bridge_create_de_after_en`, `bridge_rollback` | — | **identical** |
+| `wc_rest_vi_price_update` | `set_object_terms` 1× on the source | not fired |
+| `wc_rest_en_stock_update` | `set_object_terms` 2× | 1× |
+| `order_on_en_backorder` | `set_object_terms` 1×, `edit_post` 2× | not fired, `edit_post` 3× |
+
+Control: old MariaDB versus old SQLite, and new MariaDB versus new SQLite, are identical in all
+6 scenarios, so the change is the version upgrade, not the database. The link path the guard
+depends on is unchanged. What changed is which core hooks a plain price, stock or order save
+fires, which is exactly where a theme's sync code would hang. `tests/fixtures/php_hooks/
+measured_hook_events.json` (read by `inventory_php_hooks.py`) is refreshed from the MariaDB
+run, so the hook inventory judges the developer's code against the versions production runs.
+**This makes the developer source (B11–B16) more important, not less**: a theme hook written
+against `set_object_terms` on a price save would silently stop firing on 11.2.1 / 3.9.1.
+
+Still not verified, unchanged: price, stock and backorder sync, parallel ordering, and every
+Flatsome Child, bulk-link and Duplicate Post RB behaviour. Those need the real code (B11–B16).
+
 ## 6. Price, stock and pre-orders
 
 | Field | Source of truth | Status |
@@ -241,6 +287,16 @@ backorders `yes`, no price), never to an existing published product.
 | Dry run | `VI_PUBLISHED_OWNER_TERRITORY` 84, `VI_NOT_READ` 2; creates possible today: **0** |
 | Existing copies | 35: `POTENTIAL_LINK` 15 (was 13: FB-2026-001-CAN-0003's VI #3311 is now published), `UNKNOWN` 20 (hreflang without SKU), `AUTHORITATIVE_LINK_VERIFIED` 0. Mapping inserts allowed: 0 |
 
+Update 2026-11-07 (read-only, plus local-only reconciliation):
+
+| Item | Result |
+|---|---|
+| Versions | WordPress 7.1.4, WooCommerce 11.2.1, Polylang **3.9.1** (was 3.8.4); no `tsyc/*` route on production |
+| Woo catalog | 0 drafts; 1958 published in the morning, 1966 by the afternoon |
+| #4928, #4930 | Sync rows reconciled to `REMOTE_TRASHED`, mapping rows moved to `REMOTE_REMOVED` (`reconcile_language_mapping_status.py`). Mapping: 84 `RECORDED`, 96 `REMOTE_REMOVED` |
+| Copied ownership meta | A second case: #4829 carries IMG-003-CAN-0034's `_tsyc_*` keys (TSYC's product is #4595), SKU `…CAN-51`, live again since 2026-11-07 16:17 GMT. `COPIED_OWNERSHIP_META`, never adopted |
+| Owner's native "+" use | The owner created VI→EN→DE trios by hand today, without SKUs (e.g. #5301/#5307/#5308, #5309/#5312/#5313). This is the create path the developer described |
+
 **The bridge as designed serves future drafts. It cannot add EN/DE to any book recorded
 today**, because every live one is published and owner-maintained. Whether automation
 may ever do that is an owner decision (section 9).
@@ -251,7 +307,7 @@ may ever do that is an owner decision (section 9).
 |---|---|---|
 | A. Existing architecture verified | Hook list with fields and direction, from the real source | **Partial:** Polylang and WooCommerce verified; tooling ready; Flatsome Child and bulk-link not read |
 | B. Polylang read-only integration | Bridge read and client pass real tests; a read returns the same IDs as production hreflang | **Local only** (H13). Not installed anywhere real |
-| C. Local WordPress pilot | Matrix passes on real plugins | **Passed on the native stack, on SQLite and MariaDB** |
+| C. Local WordPress pilot | Matrix passes on real plugins | **Passed on the native stack, on SQLite and MariaDB, at production's versions (2026-11-07; one intermittent SQLite H09 stall, section 5.2)** |
 | D. Price, stock, backorders with the real customization | B11–B16 run with the real theme on MariaDB and are read by a person | **Blocked: developer source** |
 | E. Controlled create interface | Stage D passes with no sibling side effect | Not started |
 | F. One authorized logical-book pilot, isolated copy | Owner authorization; isolation proof | Not started |

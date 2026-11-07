@@ -9,8 +9,8 @@
    "de"
   ],
   "mechanism": "tsyc/v1 translations endpoint",
-  "polylang_version": "3.8.4",
-  "woocommerce": "10.7.0",
+  "polylang_version": "3.9.1",
+  "woocommerce": "11.2.1",
   "writes_enabled": true
  },
  "note": "Plain WordPress, WooCommerce and Polylang in the lab; no theme.",
@@ -842,7 +842,7 @@
   },
   "order_on_en_backorder": {
    "edit_post": {
-    "count": 2,
+    "count": 3,
     "languages": [],
     "roles": [
      "OTHER"
@@ -853,15 +853,6 @@
     "languages": [],
     "roles": [
      "OTHER"
-    ]
-   },
-   "set_object_terms": {
-    "count": 1,
-    "languages": [
-     "en"
-    ],
-    "roles": [
-     "TARGET"
     ]
    },
    "transition_post_status": {
@@ -963,7 +954,7 @@
     ]
    },
    "set_object_terms": {
-    "count": 2,
+    "count": 1,
     "languages": [
      "en"
     ],
@@ -1068,15 +1059,6 @@
     "languages": [],
     "roles": [
      "NONE"
-    ]
-   },
-   "set_object_terms": {
-    "count": 1,
-    "languages": [
-     "vi"
-    ],
-    "roles": [
-     "SOURCE"
     ]
    },
    "updated_post_meta:_price": {
