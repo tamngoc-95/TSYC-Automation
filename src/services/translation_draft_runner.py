@@ -10,7 +10,9 @@ Order of one language:
   3. REQUEST_SENT is written to disk, then one POST is sent.
   4. The result is stored. An UNCERTAIN result is never retried in this run.
 
-A failure in one language or book never stops the others. Nothing here writes
+A failure in one language or book never stops the others, with one exception:
+a side-effect stop halts that whole book, in this run and every later one,
+because the store changed products TSYC must not touch. Nothing here writes
 to Supabase: confirmed creates are returned as proposed mapping rows, for a
 separately authorized writer.
 """
@@ -35,6 +37,7 @@ RESULT_UNCERTAIN = "UNCERTAIN"
 RESULT_REFUSED = "REFUSED"
 RESULT_SKIPPED = "SKIPPED"
 RESULT_ERROR = "ERROR"
+BOOK_STOPPED_SIDE_EFFECT = "BOOK_STOPPED_SIDE_EFFECT"
 
 
 class CatalogReader(Protocol):
@@ -110,13 +113,22 @@ class TranslationDraftRunner:
         result = BookResult(book.product_code)
         for lang in wtg.TRANSLATION_LANGUAGES:
             try:
-                result.languages[lang] = self._run_language(book, lang, create_authorized, result)
+                stopped = self._side_effect_stop(book, lang)
+                result.languages[lang] = stopped or self._run_language(book, lang, create_authorized, result)
             except Exception as error:  # noqa: BLE001 - isolate one language from the rest
                 result.languages[lang] = LanguageResult(lang, RESULT_ERROR, code=type(error).__name__, detail=str(error))
         result.proposed_rows = [_baseline_row(op) for lang in wtg.TRANSLATION_LANGUAGES
                                 if (op := self.store.get(book.internal_product_id, lang)) is not None
                                 and op.state == tcs.CONFIRMED]
         return result
+
+    def _side_effect_stop(self, book: BookInput, lang: str) -> LanguageResult | None:
+        for operation in (self.store.get(book.internal_product_id, other) for other in wtg.TRANSLATION_LANGUAGES):
+            if operation is not None and operation.reason_code == pbw.BRIDGE_SIDE_EFFECT:
+                return LanguageResult(lang, RESULT_REFUSED, code=BOOK_STOPPED_SIDE_EFFECT,
+                                      detail=f"{operation.lang} #{operation.product_id}: {operation.reason}",
+                                      product_id=operation.product_id if operation.lang == lang else None)
+        return None
 
     def _rows(self, book: BookInput) -> list[lpm.LanguageProduct]:
         rows = [book.vi_row]
@@ -205,9 +217,11 @@ class TranslationDraftRunner:
             self.store.put(operation)
             return LanguageResult(operation.lang, success, product_id=outcome.product_id)
         if outcome.kind == pbw.REFUSED:
+            operation.product_id = outcome.product_id or operation.product_id
             operation.move(tcs.REFUSED, code=outcome.code, reason=outcome.detail)
             self.store.put(operation)
-            return LanguageResult(operation.lang, RESULT_REFUSED, code=outcome.code, detail=outcome.detail)
+            return LanguageResult(operation.lang, RESULT_REFUSED, code=outcome.code, detail=outcome.detail,
+                                  product_id=outcome.product_id)
         operation.move(tcs.UNCERTAIN, code=outcome.code, reason=outcome.detail)
         self.store.put(operation)
         return LanguageResult(operation.lang, RESULT_UNCERTAIN, code=outcome.code, detail=outcome.detail)

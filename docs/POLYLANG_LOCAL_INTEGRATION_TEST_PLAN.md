@@ -1,22 +1,24 @@
 # Local WordPress integration test (Polylang link mechanism)
 
-Status 2026-11-02: the native part has run; the theme-dependent part is still
-blocked on the developer's source. Nothing here touches production. The bridge,
-lab and full results are in `POLYLANG_BRIDGE.md`; the original plan stays below.
+Status 2026-11-03: the native part has run on SQLite and MariaDB; the theme-dependent
+part is still blocked on the developer's source. Nothing here touches production. The
+bridge, lab, full results and staging criteria are in `POLYLANG_BRIDGE.md`; the original
+plan stays below.
 
 | Step | Result 2026-11-02 |
 |---|---|
-| L1, and L2's hreflang comparison | `NOT_RUN`: the lab pilot does not exercise hreflang |
-| L2 endpoint on seed products | `PASS_REAL_LOCAL` (T05) |
+| L1, and L2's hreflang comparison | `PASS_REAL_LOCAL` on the native stack (H13); `audit_polylang_catalog.py` itself did not run against the lab |
+| L2 endpoint on seed products | `PASS_REAL_LOCAL` (T05, H13) |
 | L3 endpoint failures | `PASS_REAL_LOCAL` (S1, S2, S4) |
-| L4 "+" from a TSYC draft | Plain Polylang: `PASS_REAL_LOCAL` (T03B), no `_tsyc_*` copied. With the theme: `BLOCKED_MISSING_DEPENDENCY` |
-| L5 copy, then SKU edit | WooCommerce Duplicate: `PASS_REAL_LOCAL` (T10), reported as a conflict. Duplicate Post RB: `BLOCKED_MISSING_DEPENDENCY` |
-| L6, L7, L9 stock, price, backorders | `BLOCKED_MISSING_DEPENDENCY`; native baseline recorded (T11, T12, T12B) |
-| L8 save with bulk-link plugins | `BLOCKED_MISSING_DEPENDENCY` |
+| L4 "+" from a TSYC draft | Plain Polylang: `PASS_REAL_LOCAL` (T03B, H12), no `_tsyc_*` copied. With the theme: `BLOCKED_MISSING_SOURCE` (B14) |
+| L5 copy, then SKU edit | WooCommerce Duplicate: `PASS_REAL_LOCAL` (T10), reported as a conflict. Duplicate Post RB: `BLOCKED_MISSING_SOURCE` (B16) |
+| L6, L7, L9 stock, price, backorders | `BLOCKED_MISSING_SOURCE` (B11, B12); native baseline recorded (T11, T12, T12B, H04–H06) and TSYC's reaction to assumed hooks (Y01–Y08) |
+| L8 save with bulk-link plugins | `BLOCKED_MISSING_SOURCE` (B15) |
 | L10 discovery with an attested map | Adapter `RESOLVED` on bridge drafts (T06). Published groups with hreflang: `NOT_RUN` |
 
-The environment differs from section 3: portable PHP with SQLite on loopback, as no
-Docker, PHP or Node is installed here. A theme-dependent rerun should use MySQL.
+The environment differs from section 3: portable PHP with SQLite or MariaDB 11.4.5 on
+loopback, as no Docker, PHP or Node is installed here. A theme-dependent rerun uses the
+MariaDB lab (`provision_lab.py --db mariadb`).
 
 ## Purpose
 

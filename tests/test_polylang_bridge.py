@@ -621,7 +621,56 @@ def code_only(source: str) -> str:
                                        "set_regular_price", "set_sale_price", "set_price", "set_sku", r"'publish'\s*\)\s*;\s*$",
                                        r"set_status\(\s*'publish'", "eval\\(", "wp_delete_post"])
 def test_the_bridge_uses_no_internal_polylang_write_and_no_price_or_sku_setter(php: str, forbidden: str) -> None:
-    assert not re.search(forbidden, code_only(php), flags=re.M), forbidden
+    assert not re.search(forbidden, without_lock_functions(code_only(php)), flags=re.M), forbidden
+
+
+LOCK_FUNCTIONS = ("tsyc_bridge_lock_insert", "tsyc_bridge_lock_delete", "tsyc_bridge_acquire_lock")
+
+
+def without_lock_functions(code: str) -> str:
+    for name in LOCK_FUNCTIONS:
+        code = re.sub(rf"function {name}\(.*?\n\}}\n", "", code, flags=re.S)
+    return code
+
+
+def test_the_only_sql_is_the_lock_row_in_the_options_table(php: str) -> None:
+    code = code_only(php)
+    bodies = [re.search(rf"function {name}\(.*?\n\}}\n", code, flags=re.S).group(0) for name in LOCK_FUNCTIONS]
+    statements = re.findall(r'"((?:INSERT|DELETE|SELECT|UPDATE|REPLACE)[^"]*)"', "".join(bodies))
+    assert len(statements) == 3
+    assert all("{$wpdb->options}" in statement for statement in statements)
+    assert all("option_name = %s" in statement or "VALUES (%s, %s, 'off')" in statement for statement in statements)
+    assert "query(" not in without_lock_functions(code)
+
+
+def test_the_lock_is_not_an_upsert(php: str) -> None:
+    code = code_only(php)
+    assert "add_option" not in code and "delete_option" not in code, "add_option is an upsert: two callers can both win."
+    assert "INSERT IGNORE" in code
+
+
+def test_one_lock_per_group_is_taken_by_create_and_rollback(php: str) -> None:
+    code = code_only(php)
+    assert "function tsyc_bridge_lock_key(int $source_id)" in code
+    for route in ("function tsyc_bridge_create_translation", "function tsyc_bridge_rollback_translation"):
+        body = re.search(re.escape(route) + r"\(.*?\n\}\n", code, flags=re.S).group(0)
+        assert "tsyc_bridge_acquire_lock" in body and "tsyc_bridge_watch_writes(true)" in body, route
+
+
+def test_the_source_is_rechecked_right_before_the_link(php: str) -> None:
+    code = code_only(php)
+    body = code[code.index("function tsyc_bridge_create_locked"):code.index("function tsyc_bridge_report_finished")]
+    assert body.rindex("tsyc_bridge_validate_source", 0, body.index("pll_save_post_translations")) > body.index("tsyc_bridge_side_effects")
+    assert body.index("tsyc_bridge_side_effects($before, $id, true)") > body.index("pll_save_post_translations")
+
+
+def test_a_side_effect_is_reported_and_never_repaired(php: str) -> None:
+    code = code_only(php)
+    body = code[code.index("function tsyc_bridge_side_effects"):code.index("function tsyc_bridge_create_translation")]
+    for write in ("wp_update_post", "->save(", "pll_save_post_translations", "wp_trash_post"):
+        assert write not in body, write
+    # The only writes in the stop path are on the operation's own draft.
+    assert re.findall(r"update_post_meta\((\$\w+)", body) == ["$id", "$id"]
 
 
 @pytest.mark.parametrize("api", ["pll_get_post_language", "pll_set_post_language", "pll_get_post_translations", "pll_save_post_translations"])
@@ -655,3 +704,129 @@ def test_the_lab_guards_are_not_part_of_the_bridge(php: str) -> None:
     guards = (ROOT / "tools" / "wp_lab" / "tsyc-lab-guards.php").read_text(encoding="utf-8")
     assert "wp_get_environment_type() !== 'local'" in guards
     assert "'127.0.0.1'" in guards
+
+
+# -------------------------------------------- side-effect stop (client side)
+
+
+def side_effect_answer(product_id: int = 201) -> Response:
+    return Response(409, {"code": "tsyc_sibling_side_effect", "message": "Creating changed protected values.",
+                          "data": {"status": 409, "product_id": product_id, "linked": True, "modified_gmt": BASELINE,
+                                   "changes": [{"code": "MEMBER_CHANGED", "product_id": SOURCE, "field": "_stock", "before": "0", "after": "7"}]}})
+
+
+def make_request(lang: str = "en", request_id: str = "tsyc-tr-en-side-effect") -> pbw.CreateRequest:
+    return pbw.CreateRequest(source_id=SOURCE, lang=lang, request_id=request_id, authorization_id="a", internal_product_id=BOOK,
+                             product_code=CODE, expected_source_modified_gmt=BASELINE,
+                             content={"name": "n", "description": "", "short_description": ""})
+
+
+def test_a_side_effect_answer_is_refused_and_names_what_it_left_behind() -> None:
+    answer = side_effect_answer()
+    outcome = pbw.parse_create_response(answer.status_code, answer.json(), make_request())
+    assert outcome.kind == pbw.REFUSED and outcome.code == pbw.BRIDGE_SIDE_EFFECT
+    assert outcome.product_id == 201
+    assert outcome.changes[0]["field"] == "_stock"
+
+
+@pytest.mark.parametrize("data", [{}, {"product_id": "201"}, {"product_id": True}, {"product_id": -1}, {"changes": "x"}, "not an object"])
+def test_a_refusal_with_odd_data_names_nothing(data: Any) -> None:
+    outcome = pbw.parse_create_response(409, {"code": "tsyc_x", "message": "m", "data": data}, make_request())
+    assert outcome.kind == pbw.REFUSED and outcome.product_id is None and outcome.changes == ()
+
+
+def test_a_refused_source_change_keeps_the_partial_draft_id() -> None:
+    answer = {"code": "tsyc_source_changed", "message": "m", "data": {"status": 409, "product_id": 300}}
+    outcome = pbw.parse_create_response(409, answer, make_request())
+    assert outcome.kind == pbw.REFUSED and outcome.product_id == 300
+
+
+def test_rollback_reports_a_side_effect_instead_of_success() -> None:
+    def post(*_a: Any, **_k: Any) -> Response:
+        return Response(409, {"code": pbw.BRIDGE_SIDE_EFFECT, "message": "rolled back, but", "data": {
+            "status": 409, "product_id": 7, "rolled_back": True, "changes": [{"code": "MEMBER_CHANGED"}]}})
+    writer = pbw.BridgeDraftWriter(store_url=STORE, production_url=PRODUCTION, auth=None, write_token="t", http_post=post)
+    outcome = writer.rollback("tsyc-tr-en-x", BASELINE)
+    assert outcome.kind == pbw.REFUSED and outcome.code == pbw.BRIDGE_SIDE_EFFECT and outcome.product_id == 7 and outcome.changes
+
+
+def side_effect_runner(tmp_path: Path) -> tuple[tdr.TranslationDraftRunner, FakeBridge, tcs.CheckpointStore]:
+    bridge = FakeBridge(source_id=SOURCE, internal_product_id=BOOK, product_code=CODE, modified_gmt=BASELINE)
+    store = tcs.CheckpointStore(tmp_path / "checkpoint.json")
+    reader = plr.EndpointLinkReader(store_url=STORE, auth=None, verified_on_staging=True, http_get=bridge.get)
+    writer = pbw.BridgeDraftWriter(store_url=STORE, production_url=PRODUCTION, auth=None, write_token="t",
+                                   verified_on_staging=True, http_post=bridge.post)
+    return tdr.TranslationDraftRunner(reader=reader, writer=writer, store=store, read_catalog=bridge.read_catalog, render=render), bridge, store
+
+
+def test_a_side_effect_stops_the_whole_book_now_and_on_every_later_run(tmp_path: Path) -> None:
+    runner, bridge, store = side_effect_runner(tmp_path)
+    bridge.fail_post_with = side_effect_answer()
+    first = runner.run_book(book(), create_authorized=True)
+    assert first.languages["en"].code == tdr.BOOK_STOPPED_SIDE_EFFECT or first.languages["en"].code == pbw.BRIDGE_SIDE_EFFECT
+    assert first.languages["de"].code == tdr.BOOK_STOPPED_SIDE_EFFECT
+    assert len(bridge.posts) == 1, "DE must not be sent after EN stopped on a side effect."
+    assert store.get(BOOK, "en").product_id == 201
+
+    # A later process, with the store now answering normally, still sends nothing.
+    bridge.fail_post_with = None
+    reloaded = tcs.CheckpointStore(tmp_path / "checkpoint.json")
+    runner.store = reloaded
+    again = runner.run_book(book(), create_authorized=True)
+    assert all(v.code == tdr.BOOK_STOPPED_SIDE_EFFECT for v in again.languages.values())
+    assert len(bridge.posts) == 1
+    assert again.proposed_rows == [], "No mapping row may come out of a stopped book."
+
+
+def test_a_side_effect_on_one_book_does_not_stop_another(tmp_path: Path) -> None:
+    runner, bridge, store = side_effect_runner(tmp_path)
+    bridge.fail_post_with = side_effect_answer()
+    runner.run_book(book(), create_authorized=True)
+    assert store.get(OTHER_BOOK, "en") is None
+    assert runner._side_effect_stop(tdr.BookInput(OTHER_BOOK, "OTHER", vi_row(), contents("en"), "auth"), "en") is None
+
+
+def test_an_ordinary_refusal_does_not_stop_the_other_language(tmp_path: Path) -> None:
+    runner, bridge, _store = side_effect_runner(tmp_path)
+    bridge.fail_post_with = Response(409, {"code": "tsyc_source_changed", "message": "m", "data": {"status": 409}})
+    result = runner.run_book(book(), create_authorized=True)
+    assert result.languages["en"].code == "tsyc_source_changed"
+    assert result.languages["de"].code != tdr.BOOK_STOPPED_SIDE_EFFECT
+    assert len(bridge.posts) == 2
+
+
+def test_busy_is_uncertain_and_is_reconciled_not_retried_blindly(tmp_path: Path) -> None:
+    runner, bridge, store = side_effect_runner(tmp_path)
+    bridge.fail_post_with = Response(409, {"code": "tsyc_busy", "message": "m", "data": {"status": 409}})
+    first = runner.run_book(book("en"), create_authorized=True)
+    assert first.languages["en"].result == tdr.RESULT_UNCERTAIN and store.get(BOOK, "en").state == tcs.UNCERTAIN
+    bridge.fail_post_with = None
+    second = runner.run_book(book("en"), create_authorized=True)
+    assert second.languages["en"].result == tdr.RESULT_CREATED, "By-request said absent, so the same request may be sent."
+    assert bridge.posts[0]["request_id"] == bridge.posts[-1]["request_id"]
+
+
+def test_hardening_pilot_labels_never_promote_synthetic_or_observed_results() -> None:
+    pilot = (ROOT / "tools" / "wp_lab" / "run_hardening_pilot.py").read_text(encoding="utf-8")
+    hooks = (ROOT / "tools" / "wp_lab" / "tsyc-lab-synthetic-hooks.php").read_text(encoding="utf-8")
+    assert 'PASS_SYNTHETIC = "PASS_SYNTHETIC_HOOK"' in pilot
+    assert 'BLOCKED_SOURCE = "BLOCKED_MISSING_SOURCE"' in pilot
+    assert 'OBSERVED = "OBSERVED_REAL_SOURCE"' in pilot
+    for name in re.findall(r"def (y\d+_\w+)", pilot):
+        body = pilot[pilot.index(f"def {name}"):]
+        body = body[:body.index("\n    def ", 10)]
+        assert "return PASS_SYNTHETIC" in body and "PASS_REAL" not in body, name
+    assert "NOT the store's code" in hooks and "wp_get_environment_type() !== 'local'" in hooks
+
+
+def test_source_dependent_cases_stay_registered_as_blocked() -> None:
+    pilot = (ROOT / "tools" / "wp_lab" / "run_hardening_pilot.py").read_text(encoding="utf-8")
+    for test_id in ("B11", "B12", "B13", "B14", "B15", "B16"):
+        assert f'("{test_id}"' in pilot, test_id
+    assert '"read_by_a_person": "required; this is never a pass"' in pilot
+
+
+def test_lab_only_plugins_are_not_part_of_the_bridge(php: str) -> None:
+    code = code_only(php)
+    for marker in ("tsyc_lab_", "HTTP_X_TSYC_LAB", "tsyc-lab-"):
+        assert marker not in code, marker

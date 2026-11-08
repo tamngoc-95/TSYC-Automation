@@ -27,7 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from create_internal_product import is_historical_candidate_code
 from src.cli_bootstrap import configure_utf8_console
-from src.domain import woo_remote_lifecycle
+from src.domain import woo_remote_lifecycle, woo_status_consistency
 from src.domain.content_status import ContentStatus, InternalProductContentStatus
 from src.domain.identity_status import IdentityStatus, MatchDecision
 from src.domain.image_status import ImageStatus, InternalProductImageStatus
@@ -40,7 +40,7 @@ from sync_woocommerce_product_status import LOCAL_STATUSES_VALID_WITH_REMOTE_ID
 configure_utf8_console()
 
 
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.1.0"
 
 # Must exactly match product_images_publish_eligibility_check
 # (migrations/009_add_product_image_review_guards.sql): is_publish_eligible
@@ -932,6 +932,20 @@ def audit_woocommerce(
                     "not one of the canonical synced statuses "
                     f"({sorted(LOCAL_STATUSES_VALID_WITH_REMOTE_ID)})."
                 ),
+            )
+
+        # Stored woocommerce_status versus the local sync evidence
+        # (src.domain.woo_status_consistency; 2026-11-07 drift audit).
+        for finding in woo_status_consistency.evaluate_stored_woo_status(
+            product,
+            product_syncs,
+        ):
+            add_issue(
+                issues,
+                finding.severity,
+                product_code,
+                finding.code,
+                finding.message,
             )
 
         for sync in product_syncs:
