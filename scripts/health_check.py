@@ -47,10 +47,14 @@ Usage:
   .venv/Scripts/python.exe scripts/health_check.py --scheduled --notify
   .venv/Scripts/python.exe scripts/health_check.py --allow-production-credentials
   .venv/Scripts/python.exe scripts/health_check.py --watchdog [--notify]
+  .venv/Scripts/python.exe scripts/health_check.py --test-notification   # one labelled test POST
+  .venv/Scripts/python.exe scripts/health_check.py --readiness           # activation gate, no network
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -81,6 +85,8 @@ BASELINE_FILE = PROJECT_ROOT / "config" / "health_check_baseline.json"
 STATE_FILE = PROJECT_ROOT / "data" / "processed" / "health" / "health_state.json"
 WATCHDOG_STATE_FILE = PROJECT_ROOT / "data" / "processed" / "health" / "watchdog_state.json"
 HEALTH_LOCK_FILE = PROJECT_ROOT / "data" / "processed" / "health" / "health_check.lock"
+NOTIFICATION_VERIFIED_FILE = PROJECT_ROOT / "data" / "processed" / "health" / "notification_verified.json"
+TASK_NAMES = ("TSYC Health Check", "TSYC Health Watchdog")
 OUTPUT_DIR = PROJECT_ROOT / "data" / "output" / "health"
 
 REQUIRED_KEYS = (
@@ -350,18 +356,27 @@ def write_json(path: Path, data: Any) -> None:
     os.replace(temporary, path)
 
 
-def notify(message: str, creds: Mapping[str, str], *, http_post: Callable[..., Any] | None = None) -> str:
-    """One POST of {"text": message} to the configured webhook. Not retried
-    (a lost notification is visible through the watchdog and the files)."""
+def webhook_problem(creds: Mapping[str, str]) -> str | None:
+    """None when the webhook may be used; otherwise the refusal code."""
     url = (creds.get(WEBHOOK_KEY) or "").strip()
     if not url:
         return "NOT_CONFIGURED"
     target = urlparse(url)
-    if target.scheme != "https":
+    if target.scheme != "https" or not target.hostname:
         return "REFUSED_NOT_HTTPS"
     protected = {urlparse(creds.get(k, "")).hostname for k in ("WOOCOMMERCE_URL", "SUPABASE_URL")}
     if target.hostname in protected:
         return "REFUSED_PROTECTED_HOST"
+    return None
+
+
+def notify(message: str, creds: Mapping[str, str], *, http_post: Callable[..., Any] | None = None) -> str:
+    """One POST of {"text": message} to the configured webhook. Not retried
+    (a lost notification is visible through the watchdog and the files)."""
+    problem = webhook_problem(creds)
+    if problem:
+        return problem
+    url = creds[WEBHOOK_KEY].strip()
     if http_post is None:
         import requests
 
@@ -432,7 +447,7 @@ def run_health_check(creds: Mapping[str, str], profile: str, *, collectors: Coll
                 line = json.dumps({"at": now.isoformat(), **alert.as_dict()}, ensure_ascii=False)
                 log.write(hm.redact(line, secrets) + "\n")
     if update_state:
-        write_json(state_file, evaluation.next_state)
+        write_json(state_file, {**evaluation.next_state, "last_credential_profile": profile})
 
     if run_status == hm.RUN_DEGRADED:
         code = 2
@@ -477,6 +492,139 @@ def record_crash(error: BaseException, *, output_dir: Path, now: datetime, secre
     return alert
 
 
+# ---------------------------------------------------------------------
+# Activation: test notification and readiness gate (no store/database access)
+# ---------------------------------------------------------------------
+
+
+def webhook_fingerprint(creds: Mapping[str, str]) -> str:
+    """Stable identifier of the configured webhook; the URL itself is never stored."""
+    return hashlib.sha256((creds.get(WEBHOOK_KEY) or "").strip().encode("utf-8")).hexdigest()[:16]
+
+
+def send_test_notification(target: Mapping[str, str], *, now: datetime, verified_file: Path,
+                           http_post: Callable[..., Any] | None = None) -> str:
+    """One explicit, operator-requested test POST. On success, record that
+    this exact webhook (by fingerprint) delivered."""
+    message = (f"TSYC health: TEST notification {now:%Y-%m-%d %H:%M} UTC. Not a production finding; "
+               "sent on operator request to verify alert delivery.")
+    delivery = notify(message, target, http_post=http_post)
+    if delivery == "SENT":
+        write_json(verified_file, {"verified_at": now.isoformat(), "webhook_sha256": webhook_fingerprint(target)})
+    return delivery
+
+
+def supabase_key_kind(key: str) -> str:
+    """Privilege class of a Supabase key, from its public format only."""
+    if key.startswith("sb_publishable_"):
+        return "PUBLISHABLE"
+    if key.startswith("sb_secret_"):
+        return "SECRET"
+    parts = key.split(".")
+    if len(parts) == 3:
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+        except (ValueError, UnicodeDecodeError):
+            return "UNKNOWN"
+        role = str(payload.get("role") or "") if isinstance(payload, dict) else ""
+        return {"anon": "ANON", "service_role": "SERVICE_ROLE"}.get(role, "CUSTOM_ROLE" if role else "UNKNOWN")
+    return "UNKNOWN"
+
+
+def _default_task_query(name: str) -> str | None:
+    """Task state when registered under \\TSYC\\, else None. Read-only."""
+    try:
+        completed = subprocess.run(["schtasks", "/query", "/tn", f"\\TSYC\\{name}", "/fo", "LIST"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    for line in completed.stdout.splitlines():
+        if line.strip().lower().startswith("status:"):
+            return line.split(":", 1)[1].strip() or "REGISTERED"
+    return "REGISTERED"
+
+
+READY, NOT_READY = "READY_TO_REGISTER", "NOT_READY"
+
+
+def readiness(*, env_file: Path, production_env_file: Path, state_file: Path, verified_file: Path,
+              baseline: Mapping[str, Any], lock_file: Path,
+              task_query: Callable[[str], str | None] = _default_task_query) -> tuple[str, list[tuple[str, str, str]]]:
+    """Every precondition for registering the scheduled tasks, except the
+    owner's authorization itself. Reads only local files and the task list;
+    prints no value, only names, classes and states."""
+    items: list[tuple[str, str, str]] = []
+
+    def add(name: str, status: str, detail: str) -> None:
+        items.append((name, status, detail))
+
+    add("PYTHON_VENV", "PASS" if PYTHON_EXE.exists() else "FAIL", str(PYTHON_EXE.relative_to(PROJECT_ROOT)))
+    values: dict[str, str] = {}
+    if env_file.exists():
+        values = {k: (v or "").strip() for k, v in dotenv_values(env_file).items() if v is not None}
+        add("HEALTH_ENV", "PASS", f"{env_file.name} present")
+    else:
+        add("HEALTH_ENV", "FAIL", f"{env_file.name} missing (owner: create it, see docs/HEALTH_MONITORING.md)")
+    missing = [k for k in REQUIRED_KEYS if not values.get(k)]
+    add("REQUIRED_KEYS", "FAIL" if missing else "PASS", ("missing: " + ", ".join(missing)) if missing else "all present")
+
+    production = ({k: (v or "").strip() for k, v in dotenv_values(production_env_file).items() if v is not None}
+                  if production_env_file.exists() else {})
+    woo_key = values.get("WOOCOMMERCE_CONSUMER_KEY")
+    if not woo_key:
+        add("WOO_KEY_SEPARATE", "FAIL", "no WooCommerce key in the health file")
+    elif woo_key == production.get("WOOCOMMERCE_CONSUMER_KEY"):
+        add("WOO_KEY_SEPARATE", "FAIL", "same key as the production .env; create a separate key with permission Read")
+    else:
+        add("WOO_KEY_SEPARATE", "PASS", "differs from the production key")
+    add("WOO_KEY_READ_ONLY", "MANUAL", "the owner confirms permission 'Read' when creating the key (not provable remotely)")
+
+    supabase_key = values.get("SUPABASE_KEY", "")
+    kind = supabase_key_kind(supabase_key) if supabase_key else "MISSING"
+    if kind == "MISSING":
+        add("SUPABASE_KEY_PRIVILEGE", "FAIL", "no Supabase key in the health file")
+    elif kind in ("SECRET", "SERVICE_ROLE"):
+        add("SUPABASE_KEY_PRIVILEGE", "WARN",
+            f"{kind}: full privilege; allowed only as the owner's recorded exception until a SELECT-only role exists")
+    else:
+        add("SUPABASE_KEY_PRIVILEGE", "PASS", f"{kind}; a successful scheduled run proves it can read what is needed")
+
+    problem = webhook_problem(values)
+    add("WEBHOOK", "FAIL" if problem else "PASS", problem or "HTTPS, not the store or database host")
+    verified = read_json(verified_file, {})
+    if problem:
+        add("NOTIFICATION_VERIFIED", "FAIL", "configure the webhook first")
+    elif verified.get("webhook_sha256") == webhook_fingerprint(values):
+        add("NOTIFICATION_VERIFIED", "PASS", f"test delivered {verified.get('verified_at')}")
+    else:
+        add("NOTIFICATION_VERIFIED", "FAIL", "run --test-notification and confirm it arrived")
+
+    state = read_json(state_file, {})
+    scheduled_ok = (state.get("last_credential_profile") == PROFILE_HEALTH and state.get("last_run_status") == hm.RUN_OK)
+    add("SCHEDULED_RUN", "PASS" if scheduled_ok else "FAIL",
+        f"last run {state.get('last_run_status')} with {state.get('last_credential_profile')} at {state.get('last_run_at')}"
+        if state else "no run with .env.health yet: run --scheduled once")
+
+    tracked_ids = {w for t in baseline.get("tracked") or [] for w in t.get("woo_ids") or []}
+    add("BASELINE", "PASS" if {4858, 4829, 3772} <= tracked_ids else "FAIL",
+        f"{len(baseline.get('accepted') or [])} accepted, {len(baseline.get('tracked') or [])} tracked")
+
+    from src.services.writer_lock import inspect_lock
+
+    lock = inspect_lock(lock_file).state
+    add("SINGLE_INSTANCE_LOCK", "WARN" if lock == "HELD_BY_OTHER" else "PASS", f"{lock_file.name}: {lock}")
+
+    for name in TASK_NAMES:
+        state_name = task_query(name)
+        add(f"TASK {name}", "WARN" if state_name else "PASS",
+            f"already registered ({state_name}); review before re-registering" if state_name else "not registered")
+
+    add("OWNER_AUTHORIZATION", "MANUAL", "required before register_health_tasks.ps1 -Register")
+    return (NOT_READY if any(status == "FAIL" for _, status, _ in items) else READY), items
+
+
 def print_summary(report: Mapping[str, Any]) -> None:
     print("=" * 78)
     print("TSYC SCHEDULED HEALTH CHECK (read-only)")
@@ -509,6 +657,10 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="POST new alerts to TSYC_HEALTH_WEBHOOK_URL (also with --watchdog).")
     parser.add_argument("--no-state-update", action="store_true", help="Do not persist the run state.")
     parser.add_argument("--watchdog", action="store_true", help="Credential-free missed-check detection only.")
+    parser.add_argument("--test-notification", action="store_true",
+                        help="Send ONE labelled test message to TSYC_HEALTH_WEBHOOK_URL and record delivery.")
+    parser.add_argument("--readiness", action="store_true",
+                        help="Check every precondition for registering the scheduled tasks (no network).")
     parser.add_argument("--max-gap-hours", type=float, default=26.0)
     parser.add_argument("--success-window-hours", type=float, default=50.0)
     return parser.parse_args(argv)
@@ -519,6 +671,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     now = utc_now()
     creds: Mapping[str, str] = {}
     try:
+        if args.readiness:
+            verdict, items = readiness(env_file=args.env_file or HEALTH_ENV_FILE, production_env_file=PRODUCTION_ENV_FILE,
+                                       state_file=STATE_FILE, verified_file=NOTIFICATION_VERIFIED_FILE,
+                                       baseline=read_json(BASELINE_FILE, {}), lock_file=HEALTH_LOCK_FILE)
+            for name, status, detail in items:
+                print(f"{name:<28} {status:<7} {detail}")
+            print(verdict)
+            return 0 if verdict == READY else 1
+        if args.test_notification:
+            target = load_notification_target(args.env_file)
+            delivery = send_test_notification(target, now=now, verified_file=NOTIFICATION_VERIFIED_FILE)
+            print("Test notification:", delivery)
+            return 0 if delivery == "SENT" else 1
         if args.watchdog:
             code, alerts = run_watchdog(state_file=STATE_FILE, watchdog_file=WATCHDOG_STATE_FILE, now=now,
                                         max_gap_hours=args.max_gap_hours,

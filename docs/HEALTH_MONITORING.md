@@ -35,6 +35,7 @@ show transient drift. It writes only its own files:
 | `data/output/health/alerts.jsonl` | Every alert ever raised (append-only), including watchdog and crash records |
 | `data/output/health/last_crash.txt` | Redacted traceback of the last unexpected failure (exit 4) |
 | `data/processed/health/health_state.json` | Open findings, `last_run_at`, `last_success_at`, `last_audit_pass_at`, stale baseline keys |
+| `data/processed/health/notification_verified.json` | Time and webhook fingerprint of the last delivered `--test-notification` |
 | `data/processed/health/health_check.lock` | Present only while a check runs; a second concurrent check is refused (exit 3). Not the production writer lock. A lock left by a dead process is taken over |
 
 ## Alert policy (no repeated noise)
@@ -92,12 +93,15 @@ TSYC_HEALTH_WEBHOOK_URL=https://...   # optional; notification destination
 - **WooCommerce:** WooCommerce → Settings → Advanced → REST API → Add key, permission
   **Read**, assigned to a user who is not an administrator if possible. The check cannot
   prove the permission remotely; the owner confirms it when creating the key.
-- **Supabase:** the production `SUPABASE_KEY` can write. A read-only key needs a role with
+- **Supabase:** the production `SUPABASE_KEY` is an `sb_secret_` key (checked 2026-11-10 by
+  format only: full privilege, bypasses RLS). A publishable/anon key is **not** a fix: making
+  these tables readable to it through RLS would expose them publicly. A read-only key needs a role with
   SELECT-only grants on the tables read (`internal_products`, `woocommerce_product_syncs`,
   `product_candidates`, `woocommerce_language_products`, and the tables
   `audit_pipeline_state.py` reads). That is a schema change, so it is **owner-applied**
   (MCP is read-only here). Until then the owner may knowingly place the existing key in
-  `.env.health`. That is a recorded exception, not least privilege.
+  `.env.health`. That is a recorded exception, not least privilege: `--readiness` reports it
+  as `SUPABASE_KEY_PRIVILEGE WARN` on every check, and does not block on it.
 - `audit_pipeline_state.py` runs as a subprocess with the `.env.health` values in its
   environment. Its own `load_dotenv()` does not override them.
 
@@ -108,6 +112,11 @@ TSYC_HEALTH_WEBHOOK_URL=https://...   # optional; notification destination
 refused when the URL is not HTTPS or points at the store or the database host. Without a
 configured URL the alert stays in `latest_alerts.txt` and `alerts.jsonl`
 (`notification: NOT_CONFIGURED`).
+
+`--test-notification` sends **one** message labelled "TEST notification … not a production
+finding", only when an operator runs it. On HTTP 2xx it records
+`data/processed/health/notification_verified.json` with the time and a SHA-256 fingerprint of
+the webhook (never the URL). Changing the URL invalidates the verification.
 
 ## Run it
 
@@ -138,19 +147,70 @@ Known limitations: the console window flashes briefly at run time with `Interact
 the WooCommerce key's "Read" permission cannot be proven remotely; `wc/v3/system_status`
 requires a user with `manage_woocommerce` (shop manager or administrator).
 
+## Readiness gate
+
+`health_check.py --readiness` checks every precondition except the owner's authorization. It
+needs no network, and prints names, classes and states only, never a value. Exit 0 =
+`READY_TO_REGISTER`, 1 = `NOT_READY`.
+
+| Item | Passes when |
+|---|---|
+| `PYTHON_VENV`, `HEALTH_ENV`, `REQUIRED_KEYS` | `.venv` and `.env.health` with all five keys exist |
+| `WOO_KEY_SEPARATE` | the health Woo key differs from the production `.env` key (`WOO_KEY_READ_ONLY` stays `MANUAL`) |
+| `SUPABASE_KEY_PRIVILEGE` | `WARN` for `sb_secret_` / `service_role` (recorded exception), `PASS` otherwise |
+| `WEBHOOK`, `NOTIFICATION_VERIFIED` | HTTPS and not the store/database host; `--test-notification` delivered to this exact URL |
+| `SCHEDULED_RUN` | the last state-updating run was `OK` with the `HEALTH_READONLY` profile |
+| `BASELINE` | readable, and #4858, #4829, #3772 are tracked |
+| `SINGLE_INSTANCE_LOCK`, `TASK …` | no check running; existing `\TSYC\` tasks are listed as `WARN` |
+
+`register_health_tasks.ps1` runs this gate in its dry run. `-Register` refuses unless it is
+`READY_TO_REGISTER` **and** `-Notify` is given.
+
+Readiness on 2026-11-10: `NOT_READY`. The missing items are `.env.health`, a webhook, a test
+delivery, and a scheduled-profile run. The venv, baseline and lock pass, and no task is
+registered.
+
 ## Enable (owner-authorized; not done)
 
-1. Create the read-only WooCommerce key and choose the Supabase key (above). Write `.env.health`.
-2. Choose the notification destination and put its URL in `.env.health`.
-3. Validate: `health_check.py --scheduled --notify` must exit 0 or 1, report
-   `credentials: HEALTH_READONLY`, and a test alert must arrive.
-4. Dry run of the task definition (registers nothing):
-   `powershell -ExecutionPolicy Bypass -File tools\scheduler\register_health_tasks.ps1 -Notify`
-5. Register, after the owner authorizes it:
-   `… register_health_tasks.ps1 -Register -Notify` (add `-LogonType S4U` to run while logged
-   off). This creates `\TSYC\TSYC Health Check` (daily 07:00) and `\TSYC\TSYC Health Watchdog`
-   (daily 19:00), with `StartWhenAvailable` so a missed run starts when the PC is back on.
-6. Unregister: `Unregister-ScheduledTask -TaskPath \TSYC\ -TaskName "TSYC Health Check"` (and the watchdog).
+Owner inputs, all at once:
+
+- (a) A WooCommerce REST key with permission **Read**.
+- (b) A decision on the Supabase key: the recorded exception (existing key), or apply a
+  SELECT-only role.
+- (c) An incoming-webhook URL (Slack, Teams, Discord or similar).
+- (d) Authorization to register the two tasks.
+
+Then:
+
+1. Write `.env.health` (template above) with (a)–(c).
+2. `health_check.py --test-notification`: confirm the test message arrived.
+3. `health_check.py --scheduled`: must exit 0 or 1 with `credentials: HEALTH_READONLY`. This
+   records the profile and the first state.
+4. `health_check.py --readiness` must be `READY_TO_REGISTER`. The same check is printed by the
+   dry run `powershell -ExecutionPolicy Bypass -File tools\scheduler\register_health_tasks.ps1 -Notify`.
+5. With (d): `… register_health_tasks.ps1 -Register -Notify`. Add `-LogonType S4U` to run while
+   logged off. This creates `\TSYC\TSYC Health Check` (daily 07:00) and
+   `\TSYC\TSYC Health Watchdog` (daily 19:00), with `StartWhenAvailable`.
+6. Unregister: `Unregister-ScheduledTask -TaskPath \TSYC\ -TaskName "TSYC Health Check"`, and
+   the same for the watchdog.
+
+## Dry-run evidence, 2026-11-10
+
+Production findings were collected once (read-only), then each scenario was injected in memory
+against the committed baseline. Nothing was sent or persisted.
+
+| Scenario | Alert |
+|---|---|
+| Healthy (live) | 0 alerts; 22 accepted; 4 tracked unchanged |
+| New status drift / owner change / removal / removed product live again | `NEW_REMOTE_DRIFT` / `OWNERSHIP_CHANGE` / `REMOTE_PRODUCT_REMOVED` / `REMOVED_PRODUCT_RESTORED` |
+| New mapping conflict / Woo API 503 | `NEW_MAPPING_CONFLICT` / `SYSTEMIC_API_FAILURE` |
+| New finding on known #4829 | `OWNERSHIP_CHANGE` + `TRACKED_ITEM_CHANGED` |
+| Same drift the next day | 0 (no repeat) |
+| Previous run 40 h old / no success in 60 h | `MISSED_CHECK` / `NO_RECENT_SUCCESS` |
+| Watchdog, never ran / stale / stale again | `NEVER_RAN` / `MISSED_CHECK` / silent |
+| Second CLI run while a check holds the lock | refused, exit 3, before any read |
+
+The offline equivalent is `test_committed_baseline_scenarios_alert_and_keep_known_issues_tracked`.
 
 The PC must be on, or wake, for a local task. If that is not reliable, the same command can
 run on any always-on Windows host with this repository and `.venv`. A cloud routine is not

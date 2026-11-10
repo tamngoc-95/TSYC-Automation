@@ -438,6 +438,8 @@ only after the owner authorizes the exact Woo IDs:
 - 2026-11-08: implemented and validated (live run: 22 accepted findings,
   0 alerts). 2026-11-10: monitor 1.1.0 (crash record, single-instance lock,
   watchdog notification, one-time stale-baseline alert); live re-run identical.
+  Activation gate: `--test-notification`, then `--readiness`; `-Register` refuses
+  unless `READY_TO_REGISTER`. Readiness 2026-11-10: `NOT_READY` (no `.env.health`).
   **Not enabled**: needs the read-only keys, a notification URL and
   owner authorization. See `docs/HEALTH_MONITORING.md`.
 

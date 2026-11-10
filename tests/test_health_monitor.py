@@ -456,6 +456,164 @@ def test_watchdog_notification_target_never_loads_store_or_database_keys(tmp_pat
 
 
 # ---------------------------------------------------------------------
+# Committed baseline: every failure class still alerts; known issues stay visible
+# ---------------------------------------------------------------------
+
+
+def committed_baseline() -> dict[str, Any]:
+    return json.loads(Path(hc.BASELINE_FILE).read_text(encoding="utf-8"))
+
+
+def accepted_findings(baseline: dict[str, Any]) -> list[hm.Finding]:
+    """The accepted keys as findings (what a healthy production run sees)."""
+    found = []
+    for item in baseline["accepted"]:
+        source, code, product, tail = item["key"].split(":", 3)
+        woo = int(tail) if tail.isdigit() else None
+        found.append(hm.Finding(item["key"], hm.NEW_MAPPING_CONFLICT, source, code, product, woo))
+    return found
+
+
+def test_committed_baseline_scenarios_alert_and_keep_known_issues_tracked():
+    baseline = committed_baseline()
+    healthy = accepted_findings(baseline)
+    quiet = hm.evaluate(healthy, baseline=baseline, previous={}, now=NOW, run_status=hm.RUN_OK)
+    assert quiet.alerts == [] and quiet.stale_baseline_keys == []
+
+    injected = hm.remote_findings(remote_report(
+        remote_row("NEW-DRIFT", "LOCAL_STATUS_STALE", 9001),
+        remote_row("NEW-OWNER", "OWNER_MODIFIED", 9002),
+        remote_row("NEW-TRASH", "REMOTE_TRASHED", 9003),
+        # A new finding on a known product must not hide behind its baseline entries.
+        remote_row("TSYC-FB-HIST-2026-IMG-003-CAN-0034", "IDENTITY_MISMATCH", 4829),
+    )) + hm.mapping_findings({"findings": [
+        {"severity": "WARNING", "code": "UNMAPPED_SKU_COPY", "product_code": "NEW-MAP", "language": "en", "detail": "#9004"},
+    ]}) + [hm.systemic("WOO_READ", "HTTP 503")]
+    result = hm.evaluate(healthy + injected, baseline=baseline, previous=quiet.next_state,
+                         now=NOW + timedelta(days=1), run_status=hm.RUN_DEGRADED)
+    categories = {a.category for a in result.alerts}
+    assert {hm.NEW_REMOTE_DRIFT, hm.OWNERSHIP_CHANGE, hm.REMOTE_PRODUCT_REMOVED, hm.NEW_MAPPING_CONFLICT,
+            hm.SYSTEMIC_API_FAILURE} <= categories
+    assert "remote:IDENTITY_MISMATCH:TSYC-FB-HIST-2026-IMG-003-CAN-0034:4829" in result.new_keys
+
+    complete = hm.evaluate(healthy + injected[:-1], baseline=baseline, previous=quiet.next_state,
+                           now=NOW + timedelta(days=1), run_status=hm.RUN_OK)
+    assert any(a.key == "tracked:WOO-4829" for a in complete.alerts)
+
+    # Known issues resolving is reported too (never silently "healthy").
+    gone = [f for f in healthy if f.woo_id != 3772 and "CAN-0010" not in (f.product_code or "")]
+    cleared = hm.evaluate(gone, baseline=baseline, previous=quiet.next_state, now=NOW + timedelta(days=1),
+                          run_status=hm.RUN_OK)
+    assert any(a.key == "tracked:WOO-3772" for a in cleared.alerts)
+    assert any(a.category == hm.BASELINE_ENTRY_RESOLVED for a in cleared.alerts)
+
+
+# ---------------------------------------------------------------------
+# Activation: test notification and readiness gate
+# ---------------------------------------------------------------------
+
+HOOK = "https://hook.example.net/x"
+
+
+def jwt(role: str) -> str:
+    import base64 as b64
+
+    body = b64.urlsafe_b64encode(json.dumps({"role": role}).encode()).decode().rstrip("=")
+    return f"eyJhbGciOiJIUzI1NiJ9.{body}.signature"
+
+
+def test_supabase_key_kind_from_public_format_only():
+    assert hc.supabase_key_kind("sb_publishable_abc") == "PUBLISHABLE"
+    assert hc.supabase_key_kind("sb_secret_abc") == "SECRET"
+    assert hc.supabase_key_kind(jwt("service_role")) == "SERVICE_ROLE"
+    assert hc.supabase_key_kind(jwt("anon")) == "ANON"
+    assert hc.supabase_key_kind(jwt("tsyc_health_reader")) == "CUSTOM_ROLE"
+    assert hc.supabase_key_kind("garbage") == "UNKNOWN"
+
+
+def test_test_notification_records_fingerprint_not_url(tmp_path):
+    verified = tmp_path / "verified.json"
+    sent: list[dict[str, Any]] = []
+    target = {**CREDS, hc.WEBHOOK_KEY: HOOK}
+    delivery = hc.send_test_notification(target, now=NOW, verified_file=verified,
+                                         http_post=lambda url, **kw: sent.append(kw["json"]) or SimpleNamespace(status_code=204))
+    assert delivery == "SENT" and len(sent) == 1 and "TEST notification" in sent[0]["text"]
+    text = verified.read_text(encoding="utf-8")
+    assert HOOK not in text and json.loads(text)["webhook_sha256"] == hc.webhook_fingerprint(target)
+    failed = hc.send_test_notification(target, now=NOW, verified_file=tmp_path / "v2.json",
+                                       http_post=lambda url, **kw: SimpleNamespace(status_code=404))
+    assert failed == "FAILED (HTTP 404)" and not (tmp_path / "v2.json").exists()
+
+
+def readiness_setup(tmp_path, *, health: dict[str, str] | None, production: dict[str, str], state=None,
+                    verified=None, tasks=None):
+    env = tmp_path / ".env.health"
+    if health is not None:
+        write_env(env, health)
+    prod = write_env(tmp_path / ".env", production)
+    state_file, verified_file = tmp_path / "state.json", tmp_path / "verified.json"
+    if state is not None:
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+    if verified is not None:
+        verified_file.write_text(json.dumps(verified), encoding="utf-8")
+    return hc.readiness(env_file=env, production_env_file=prod, state_file=state_file, verified_file=verified_file,
+                        baseline=committed_baseline(), lock_file=tmp_path / "lock",
+                        task_query=lambda name: (tasks or {}).get(name))
+
+
+def test_readiness_not_ready_without_health_file(tmp_path):
+    verdict, items = readiness_setup(tmp_path, health=None, production=CREDS)
+    status = {name: s for name, s, _ in items}
+    assert verdict == hc.NOT_READY
+    assert status["HEALTH_ENV"] == "FAIL" and status["NOTIFICATION_VERIFIED"] == "FAIL"
+    assert status["SCHEDULED_RUN"] == "FAIL" and status["OWNER_AUTHORIZATION"] == "MANUAL"
+
+
+def test_readiness_refuses_production_woo_key_and_flags_full_privilege_supabase(tmp_path):
+    health = {**CREDS, "SUPABASE_KEY": jwt("service_role"), hc.WEBHOOK_KEY: HOOK}
+    _, items = readiness_setup(tmp_path, health=health, production=CREDS)
+    status = {name: (s, d) for name, s, d in items}
+    assert status["WOO_KEY_SEPARATE"][0] == "FAIL"
+    assert status["SUPABASE_KEY_PRIVILEGE"][0] == "WARN"
+    for _, _, detail in items:  # no credential value ever appears
+        for value in health.values():
+            assert value not in detail or value.startswith("https://db") or value.startswith("https://shop")
+
+
+def test_readiness_ready_when_every_gate_passes(tmp_path):
+    health = {**CREDS, "WOOCOMMERCE_CONSUMER_KEY": "ck_readonly_9876543210", "SUPABASE_KEY": jwt("tsyc_health_reader"),
+              hc.WEBHOOK_KEY: HOOK}
+    verdict, items = readiness_setup(
+        tmp_path, health=health, production=CREDS,
+        state={"last_run_status": hm.RUN_OK, "last_credential_profile": hc.PROFILE_HEALTH, "last_run_at": "t"},
+        verified={"verified_at": "t", "webhook_sha256": hc.webhook_fingerprint(health)})
+    assert verdict == hc.READY, [i for i in items if i[1] == "FAIL"]
+    # A different webhook than the verified one is not verified.
+    verdict, _ = readiness_setup(
+        tmp_path, health={**health, hc.WEBHOOK_KEY: "https://other.example.net/y"}, production=CREDS,
+        state={"last_run_status": hm.RUN_OK, "last_credential_profile": hc.PROFILE_HEALTH},
+        verified={"webhook_sha256": hc.webhook_fingerprint(health)})
+    assert verdict == hc.NOT_READY
+
+
+def test_readiness_requires_a_passing_run_with_the_health_profile(tmp_path):
+    health = {**CREDS, "WOOCOMMERCE_CONSUMER_KEY": "ck_readonly_9876543210", hc.WEBHOOK_KEY: HOOK}
+    verdict, items = readiness_setup(
+        tmp_path, health=health, production=CREDS,
+        state={"last_run_status": hm.RUN_OK, "last_credential_profile": hc.PROFILE_PRODUCTION},
+        verified={"webhook_sha256": hc.webhook_fingerprint(health)}, tasks={"TSYC Health Check": "Ready"})
+    status = {name: s for name, s, _ in items}
+    assert verdict == hc.NOT_READY and status["SCHEDULED_RUN"] == "FAIL"
+    assert status["TASK TSYC Health Check"] == "WARN"
+
+
+def test_state_records_credential_profile(tmp_path):
+    run(tmp_path, collectors(ReadOnlyRepo()))
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["last_credential_profile"] == hc.PROFILE_HEALTH
+
+
+# ---------------------------------------------------------------------
 # Single instance and crash record
 # ---------------------------------------------------------------------
 

@@ -18,7 +18,9 @@
   reads its least-privilege keys from .env.health at run time.
 
   Without -Register this script only prints what it would register and
-  validates the prerequisites. Registering is an owner-authorized step.
+  validates the prerequisites, including `health_check.py --readiness`.
+  -Register refuses unless readiness is READY_TO_REGISTER and -Notify is
+  given. Registering is an owner-authorized step.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File tools\scheduler\register_health_tasks.ps1
@@ -61,11 +63,22 @@ Write-Output "Logon type : $LogonType (current user $env:USERNAME)"
 foreach ($t in $tasks) { Write-Output ("Task       : {0} daily {1} -> {2} {3}" -f $t.Name, $t.Time, $Python, $t.Args) }
 if ($problems.Count) { $problems | ForEach-Object { Write-Output "PREREQUISITE: $_" } }
 
+# Readiness gate (no network, prints no credential): separate read-only Woo key,
+# verified notification delivery, a passing run with .env.health, baseline, lock.
+$ready = $false
+if (Test-Path $Python) {
+    Write-Output "--- Readiness (scripts/health_check.py --readiness)"
+    & $Python $Script --readiness
+    $ready = ($LASTEXITCODE -eq 0)
+}
+
 if (-not $Register) {
     Write-Output "Dry run: nothing registered. Re-run with -Register after the owner authorizes it."
-    exit ([int]($problems.Count -gt 0))
+    exit ([int](($problems.Count -gt 0) -or (-not $ready)))
 }
 if ($problems.Count) { throw "Refusing to register: prerequisites missing." }
+if (-not $ready) { throw "Refusing to register: readiness is NOT_READY (see the list above)." }
+if (-not $Notify) { throw "Refusing to register without -Notify: alerts would reach no one." }
 
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopIfGoingOnBatteries `
     -AllowStartIfOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1) -MultipleInstances IgnoreNew
