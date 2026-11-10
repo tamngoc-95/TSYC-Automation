@@ -425,6 +425,22 @@ only after the owner authorizes the exact Woo IDs:
 - 2026-10-19: package v2 was applied to the 12 published FAHASA-2026-001
   products (#4765–#4789 odd, excluding the trashed #4773).
 
+## Scheduled health monitoring (read-only)
+- `scripts/health_check.py` runs the remote-status, language-mapping, pipeline
+  audit, recovery and connectivity checks and alerts only on NEW findings
+  (accepted ones: `config/health_check_baseline.json`; tracked: CAN-0033 #4858,
+  #4829, #3772, CAN-0031). It makes no writes and does not take the writer lock
+  (it has its own `health_check.lock` against concurrent runs).
+- Scheduled runs use only `.env.health` (read-only keys) and refuse otherwise.
+  `--watchdog` detects missed runs without credentials.
+- Exit 4 = crashed: read `data/output/health/last_crash.txt`.
+  `BASELINE_ENTRY_RESOLVED` = prune that entry from the baseline in a reviewed commit.
+- 2026-11-08: implemented and validated (live run: 22 accepted findings,
+  0 alerts). 2026-11-10: monitor 1.1.0 (crash record, single-instance lock,
+  watchdog notification, one-time stale-baseline alert); live re-run identical.
+  **Not enabled**: needs the read-only keys, a notification URL and
+  owner authorization. See `docs/HEALTH_MONITORING.md`.
+
 ## Git discipline
 `git status`, `git diff --check`, review the exact diff, run relevant tests
 before every commit.

@@ -1,0 +1,172 @@
+{
+ "schema_version": 1,
+ "updated_on": "2026-11-10",
+ "policy": "Accepted findings are never alerted; a finding that is not listed alerts once when it first appears. Tracked items alert whenever their finding set changes. Changing this file is a reviewed commit.",
+ "tracked": [
+  {
+   "id": "CAN-0033",
+   "woo_ids": [
+    4858
+   ],
+   "product_codes": [
+    "TSYC-FB-HIST-2026-IMG-004-CAN-0033"
+   ],
+   "expected_keys": [
+    "mapping:COPIED_OWNERSHIP_META:TSYC-FB-HIST-2026-IMG-004-CAN-0033:-",
+    "mapping:STORED_VI_MISSING:TSYC-FB-HIST-2026-IMG-004-CAN-0033:vi"
+   ],
+   "note": "#4858 carries copied TSYC ownership meta; unmapped, evidence review open (docs/POLYLANG_*). Never adopted automatically."
+  },
+  {
+   "id": "WOO-4829",
+   "woo_ids": [
+    4829
+   ],
+   "product_codes": [
+    "TSYC-FB-HIST-2026-IMG-003-CAN-0034"
+   ],
+   "expected_keys": [
+    "mapping:COPIED_OWNERSHIP_META:TSYC-FB-HIST-2026-IMG-003-CAN-0034:-"
+   ],
+   "note": "#4829 (CAN-0034) carries copied TSYC ownership meta; see runbook 2026-11-07."
+  },
+  {
+   "id": "WOO-3772",
+   "woo_ids": [
+    3772
+   ],
+   "product_codes": [
+    "TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0010"
+   ],
+   "expected_keys": [
+    "mapping:REMOTE_PRESENT_AFTER_REMOVAL:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0010:vi",
+    "mapping:STORED_VI_MISSING:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0010:vi",
+    "remote:OWNER_MODIFIED:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0010:3772"
+   ],
+   "note": "CAN-0010 #3772 restored live after REMOTE_TRASHED; owner decision open."
+  },
+  {
+   "id": "CAN-0031",
+   "woo_ids": [],
+   "product_codes": [
+    "TSYC-FB-HIST-2026-IMG-004-CAN-0031"
+   ],
+   "expected_keys": [
+    "mapping:NO_WOO_ID:TSYC-FB-HIST-2026-IMG-004-CAN-0031:vi"
+   ],
+   "note": "CAN-0031 FAILED create without Woo ID; recovery belongs to recover_historical_woo_create.py. Any change (new remote evidence or resolution) is reported."
+  }
+ ],
+ "accepted": [
+  {
+   "key": "mapping:COPIED_OWNERSHIP_META:TSYC-FB-HIST-2026-IMG-003-CAN-0034:-",
+   "reason": "Carries TSYC ownership meta but is not mapped; never adopted automatically. Open evidence review.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:COPIED_OWNERSHIP_META:TSYC-FB-HIST-2026-IMG-004-CAN-0033:-",
+   "reason": "Carries TSYC ownership meta but is not mapped; never adopted automatically. Open evidence review.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:NO_WOO_ID:TSYC-FB-HIST-2026-IMG-004-CAN-0031:vi",
+   "reason": "CAN-0031: FAILED create without Woo ID; belongs to recover_historical_woo_create.py, never cleared automatically.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:REMOTE_PRESENT_AFTER_REMOVAL:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0010:vi",
+   "reason": "CAN-0010 #3772: same open owner decision as the remote OWNER_MODIFIED finding.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:STORED_VI_MISSING:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0010:vi",
+   "reason": "VI mapping row intentionally not stored: book is blocked (owner decision / copied ownership meta).",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:STORED_VI_MISSING:TSYC-FB-HIST-2026-IMG-004-CAN-0033:vi",
+   "reason": "VI mapping row intentionally not stored: book is blocked (owner decision / copied ownership meta).",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-2026-001-CAN-0003:de",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-2026-001-CAN-0003:en",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-001-CAN-0003:de",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-001-CAN-0003:en",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-001-CAN-0007:de",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-001-CAN-0007:en",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-002-CAN-0006:de",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-002-CAN-0006:en",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0001:de",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0001:en",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0002:en",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0005:de",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0005:en",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0022:de",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "mapping:UNMAPPED_SKU_COPY:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0022:en",
+   "reason": "Owner-made manual EN/DE copy sharing the VI SKU (live Polylang manual copies); a shared SKU is never adopted as a link.",
+   "accepted_on": "2026-11-08"
+  },
+  {
+   "key": "remote:OWNER_MODIFIED:TSYC-FB-HIST-2026-AUTOIMPORT-CAN-0010:3772",
+   "reason": "CAN-0010 #3772: recorded REMOTE_TRASHED, owner restored it live. Open owner decision (manual wp-admin restore); writes refused.",
+   "accepted_on": "2026-11-08"
+  }
+ ]
+}
