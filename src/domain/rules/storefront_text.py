@@ -279,23 +279,30 @@ _AUTHOR_LABEL_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 # A sentence whose only content is "the author is X" (vi/en/de). The name
-# may contain initials ("L. Frank Baum"): a period is part of the name
-# only right after a one-letter token; any other period ends the sentence.
-_AUTHOR_NAME = r"(?:[^.!?\n]|(?<!\w\w)\.){1,120}[.!]?$"
+# may contain initials ("L. Frank Baum") or a personal title ("Dr. Shefali
+# Tsabary", "TS. Nguyễn Văn A"): a period is part of the name only right
+# after a one-letter token or one of these titles; any other period ends
+# the sentence. "St." is deliberately absent (street, saint).
+_NAME_TITLE = r"(?:dr|prof|mr|mrs|ms|ts|ths|pgs|gs|bs)"
+_AUTHOR_NAME = r"(?:\b" + _NAME_TITLE + r"\.|[^.!?\n]|(?<!\w\w)\.){1,120}[.!]?$"
 _AUTHOR_TEMPLATE_SENTENCE_RES = (
     re.compile(
-        r"^tác giả của (?:ấn phẩm|cuốn sách|quyển sách|sách|bộ sách|tác phẩm)(?: này)? là " + _AUTHOR_NAME,
+        r"^(?:các )?tác giả của (?:ấn phẩm|cuốn sách|quyển sách|sách|bộ sách|tác phẩm)(?: này)? là " + _AUTHOR_NAME,
         re.IGNORECASE,
     ),
-    re.compile(r"^the author of (?:this|the) (?:book|publication|title|work) is " + _AUTHOR_NAME, re.IGNORECASE),
+    # 2026-11-14: plural and titled ("Dr.") forms were missed; 8 EN and 2 DE approved rows rendered them.
     re.compile(
-        r"^(?:der autor|die autorin) (?:dieses|des) (?:buches|bandes|werkes|werks|titels) ist " + _AUTHOR_NAME,
+        r"^the authors? of (?:this|the) (?:book|publication|title|work) (?:is|are) " + _AUTHOR_NAME, re.IGNORECASE
+    ),
+    re.compile(
+        r"^(?:der autor|die autorin|die autoren|die autorinnen) (?:dieses|des) "
+        r"(?:buches|bandes|werkes|werks|titels) (?:ist|sind) " + _AUTHOR_NAME,
         re.IGNORECASE,
     ),
     re.compile(r"^dieses buch stammt von " + _AUTHOR_NAME, re.IGNORECASE),
     re.compile(r"^written by " + _AUTHOR_NAME, re.IGNORECASE),
 )
-_INITIAL_END_RE = re.compile(r"(?:^|\s)\w\.$")
+_INITIAL_END_RE = re.compile(r"(?:^|\s)(?:\w|" + _NAME_TITLE + r")\.$", re.IGNORECASE)
 
 
 def _split_sentences_keep_initials(line: str) -> list[str]:

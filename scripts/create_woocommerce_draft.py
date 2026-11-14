@@ -613,6 +613,23 @@ def text_to_html_paragraphs(
     return "\n".join(html_paragraphs)
 
 
+# Section headings per content_language. Before 2026-11-14 the Vietnamese
+# headings were rendered into EN/DE descriptions too. A row without a
+# language is a VI row (the original single-language schema).
+DESCRIPTION_HEADINGS: dict[str, dict[str, str]] = {
+    "vi": {"author": "Tác giả", "details": "Thông tin sản phẩm"},
+    "en": {"author": "About the author", "details": "Product details"},
+    "de": {"author": "Über den Autor / die Autorin", "details": "Produktdetails"},
+}
+
+
+def description_headings(content: dict[str, Any]) -> dict[str, str]:
+    language = str(content.get("content_language") or "vi").strip().lower()
+    if language not in DESCRIPTION_HEADINGS:
+        raise ValueError(f"No description headings for content language {language!r}.")
+    return DESCRIPTION_HEADINGS[language]
+
+
 def build_description(
     content: dict[str, Any],
 ) -> str:
@@ -628,6 +645,7 @@ def build_description(
     list without its author line.
     """
     sections: list[str] = []
+    headings = description_headings(content)
 
     long_description = text_to_html_paragraphs(
         content.get("long_description")
@@ -643,7 +661,7 @@ def build_description(
 
     if author_summary and not storefront_text.is_metadata_only_author_summary(author_summary):
         sections.append(
-            "<h3>Tác giả</h3>"
+            f"<h3>{html.escape(headings['author'])}</h3>"
             f"<p>{html.escape(author_summary)}</p>"
         )
 
@@ -658,7 +676,7 @@ def build_description(
         )
 
         sections.append(
-            "<h3>Thông tin sản phẩm</h3>"
+            f"<h3>{html.escape(headings['details'])}</h3>"
             f"<ul>{detail_items}</ul>"
         )
 
@@ -680,6 +698,14 @@ def build_short_description(
     return (
         f"<p>{html.escape(short_description)}</p>"
     )
+
+
+def render_content(
+    content: dict[str, Any],
+) -> tuple[str, str]:
+    """(description, short_description) of one approved row, any language:
+    the production Renderer of the multilingual adapter (woo_translation_group.Renderer)."""
+    return build_description(content), build_short_description(content)
 
 
 def find_product_by_sku(

@@ -41,6 +41,13 @@ AUTHOR_METADATA_CASES = [
     ("de", "Autorin: Frances Hodgson Burnett"),
     ("de", "Dieses Buch stammt von Thích Nhất Hạnh."),
     ("de", "Der Autor dieses Buches ist Stephen Guise."),
+    # 2026-11-14: approved EN/DE rows rendered these, under a Vietnamese heading.
+    ("en", "The authors of this book are Daniel J. Siegel and Tina Payne Bryson."),
+    ("en", "The author of this book is Dr. Shefali Tsabary."),
+    ("de", "Dieses Buch stammt von Dr. Shefali Tsabary."),
+    ("de", "Die Autoren dieses Buches sind Harvey Karp und Paula Spencer."),
+    ("vi", "Tác giả của cuốn sách là TS. Nguyễn Văn An."),
+    ("vi", "Các tác giả của cuốn sách là Hoài Anh và Mai Hoa."),
 ]
 
 
@@ -76,6 +83,8 @@ def test_label_running_into_prose_is_flagged_but_never_deleted():
         "The Secret Garden is the classic by Frances Hodgson Burnett, loved by generations of readers.",
         "Der geheime Garten ist der Klassiker von Frances Hodgson Burnett.",
         "CHO Hyun-Min là tác giả của cuốn sách, nằm trong bộ Giáo dục giới tính bản quyền Hàn Quốc.",
+        "Dr. Shefali Tsabary is a clinical psychologist who writes about conscious parenting.",
+        "The authors of this book draw on years of work with young families.",
     ],
 )
 def test_narrative_author_mentions_are_kept(narrative):
@@ -163,6 +172,34 @@ def test_substantive_author_note_is_still_rendered():
     note = "CHO Hyun-Min là tác giả của cuốn sách, nằm trong bộ Giáo dục giới tính bản quyền Hàn Quốc."
     description = cwd.build_description({"long_description": "Nội dung sách.", "author_summary": note})
     assert "<h3>Tác giả</h3>" in description and "CHO Hyun-Min" in description
+
+
+@pytest.mark.parametrize(
+    "language, author_heading, details_heading",
+    [("en", "About the author", "Product details"), ("de", "Über den Autor / die Autorin", "Produktdetails")],
+)
+def test_translation_descriptions_use_their_own_language_headings(language, author_heading, details_heading):
+    note = "Dr. Shefali Tsabary is a clinical psychologist who writes about conscious parenting."
+    details = "Number of books: 6\nBook list:\n1. First volume"
+    description = cwd.build_description({"content_language": language, "long_description": "Text.",
+                                         "author_summary": note, "product_details": details})
+    assert f"<h3>{author_heading}</h3>" in description
+    assert f"<h3>{details_heading}</h3>" in description
+    assert "Tác giả" not in description and "Thông tin sản phẩm" not in description
+
+
+@pytest.mark.parametrize("language", ["en", "de"])
+def test_metadata_only_translation_author_summary_is_not_rendered(language):
+    summary = ("The authors of this book are Hoài Anh and Mai Hoa." if language == "en"
+               else "Dieses Buch stammt von Dr. Shefali Tsabary.")
+    description = cwd.build_description({"content_language": language, "long_description": "Text.",
+                                         "author_summary": summary})
+    assert "<h3>" not in description and summary not in description
+
+
+def test_unknown_content_language_is_refused_not_rendered_as_vietnamese():
+    with pytest.raises(ValueError):
+        cwd.build_description({"content_language": "fr", "long_description": "Texte."})
 
 
 def test_combo_list_details_stay_in_description_without_the_author_line():
