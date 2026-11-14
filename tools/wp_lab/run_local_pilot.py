@@ -34,12 +34,15 @@ import requests
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import create_woocommerce_draft as cwd  # noqa: E402  (renderer only: no I/O at import)
 import provision_lab  # noqa: E402
 from src.cli_bootstrap import configure_utf8_console  # noqa: E402
 from src.domain import language_product_mapping as lpm  # noqa: E402
 from src.domain import multilingual_adapter as ma  # noqa: E402
+from src.domain import translation_book_input as tbi  # noqa: E402
 from src.domain import translation_create_state as tcs  # noqa: E402
 from src.domain import woo_translation_group as wtg  # noqa: E402
 from src.services import polylang_bridge_writer as pbw  # noqa: E402
@@ -913,6 +916,73 @@ echo json_encode($out);""")
         expect(setup["terms"]["vi"] not in facts["de"]["categories"], f"DE got the VI term: {facts['de']}")
         return {"copies": facts, "note": "Attribute labels stay Vietnamese on the copy (reported as a warning)."}
 
+    def t15_production_content_path(self) -> dict[str, Any]:
+        """Real-shaped approved product_contents rows -> translation_book_input ->
+        the production renderer -> bridge -> the text WordPress actually stored.
+        The other tests use a toy renderer and a toy content shape."""
+        # Unique per test: the bridge refuses a second product claiming one book and language.
+        code, internal = f"{SKU_PREFIX}CONTENT", "00000000-0000-4000-8000-0000000000f1"
+        _, vi = self.make_book(code, internal)
+        row = lpm.LanguageProduct(
+            internal_product_id=internal, product_code=code, language_code="vi", woocommerce_product_id=int(vi["id"]),
+            origin=lpm.ORIGIN_TSYC_CREATED, mapping_status=lpm.RECORDED, baseline_source=lpm.BASELINE_CREATE_RESPONSE,
+            baseline_modified_gmt=vi["date_modified_gmt"],
+            baseline_text={f: str(vi.get(f) or "") for f in wtg.TRANSLATED_FIELDS})
+        names = {"vi": "Sách thử nghiệm", "en": "Lab Test Book", "de": "Labor-Testbuch"}
+        notes = {"vi": "Tác giả là nhà nghiên cứu giáo dục, từng làm việc nhiều năm với trẻ mầm non.",
+                 "en": "Dr. Lab Author is an education researcher who worked with preschool children for many years.",
+                 "de": "Dr. Lab Author ist Bildungsforscherin und arbeitete viele Jahre mit Vorschulkindern."}
+        rows = [{"product_content_id": f"00000000-0000-4000-8000-0000000000{n}", "internal_product_id": internal,
+                 "content_language": lang, "content_status": "APPROVED", "review_required": False,
+                 "approved_at": f"2026-11-14T10:0{n[-1]}:00.5+00:00", "product_name": names[lang],
+                 "short_description": f"Kurz {lang} & <sicher>.",
+                 "long_description": f"Absatz eins {lang}.\n\nAbsatz zwei {lang}.",
+                 # Metadata-only on purpose for EN: it must never render (TSYC_CONTENT_GUIDE 7a).
+                 "author_summary": "The authors of this book are A. Lab and B. Lab." if lang == "en" else notes[lang],
+                 "product_details": "Book list:\n1. Volume one" if lang != "vi" else "Danh sách:\n1. Tập một"}
+                for lang, n in (("vi", "e1"), ("en", "e2"), ("de", "e3"))]
+        prepared = tbi.build_book_input(row, rows, cwd.render_content)
+        expect(prepared.ready, f"{prepared.refusal}: {prepared.detail}")
+        stale = tbi.build_book_input(row, [{**r, "approved_at": "2026-11-14T09:00:00+00:00"} if r["content_language"] == "de"
+                                           else r for r in rows], cwd.render_content)
+        expect(stale.refusal == tbi.TRANSLATION_PREDATES_VI_APPROVAL, f"stale DE accepted: {stale.refusal}")
+
+        book = tdr.BookInput(internal, code, row, prepared.contents, AUTH_ID)
+        runner = tdr.TranslationDraftRunner(reader=self.reader, writer=self.writer(),
+                                            store=tcs.CheckpointStore(self.run_dir / "t15.json"),
+                                            read_catalog=self.read_catalog, render=cwd.render_content)
+        result = runner.run_book(book, create_authorized=True)
+        stored: dict[str, Any] = {}
+        for lang in ("en", "de"):
+            language = result.languages[lang]
+            expect(language.result == tdr.RESULT_CREATED, f"{lang}: {language.result} {language.code} {language.detail}")
+            pid = int(language.product_id)
+            raw = self.lab.eval_json(f"$p = get_post({pid}); echo json_encode(array('title'=>$p->post_title,"
+                                     f"'content'=>$p->post_content,'excerpt'=>$p->post_excerpt));")
+            want_description, want_short = cwd.render_content(prepared.contents[lang])
+            expect(raw["title"] == names[lang], f"{lang} title {raw['title']!r}")
+            expect(raw["content"].strip() == want_description.strip(), f"{lang} description differs: {raw['content'][:300]!r}")
+            expect(raw["excerpt"].strip() == want_short.strip(), f"{lang} short description {raw['excerpt']!r}")
+            expect("Tác giả" not in raw["content"] and "Thông tin sản phẩm" not in raw["content"],
+                   f"{lang} carries a Vietnamese heading")
+            heading = cwd.DESCRIPTION_HEADINGS[lang]
+            expect(f"<h3>{heading['details']}</h3>" in raw["content"], f"{lang} details heading missing")
+            expect((f"<h3>{heading['author']}</h3>" in raw["content"]) == (lang == "de"),
+                   f"{lang} author section rendered wrongly")
+            product = self.lab.product(pid)
+            expect(product["status"] == "draft" and product["sku"] == "" and product["regular_price"] == "",
+                   f"{lang} shape {product['status']} {product['sku']!r} {product['regular_price']!r}")
+            stored[lang] = {"product_id": pid, "title": raw["title"], "description_matches_renderer": True}
+        group = self.reader.read_group(int(vi["id"]))
+        expect(set(group.translations) == {"vi", "en", "de"}, f"{dict(group.translations)}")
+        problems = lpm.validate_mappings([row, *result.proposed_rows])
+        expect(not problems and len(result.proposed_rows) == 2, f"{[p.as_dict() for p in problems]}")
+        vi_after = self.lab.product(int(vi["id"]))
+        expect(vi_after["date_modified_gmt"] == vi["date_modified_gmt"] and vi_after["name"] == vi["name"],
+               "The VI source changed.")
+        return {"stored": stored, "translations": dict(group.translations), "stale_translation_refused": stale.refusal,
+                "proposed_mapping_rows": len(result.proposed_rows), "written_to_supabase": 0}
+
     def s6_save_translations_semantics(self) -> dict[str, Any]:
         """The Polylang behaviours the bridge is built around, on the real code."""
         data = self.lab.eval_json("""
@@ -961,6 +1031,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lab-dir", type=Path, default=default_lab_dir())
     parser.add_argument("--out", type=Path, default=PROJECT_ROOT / "data" / "output" / "polylang_local")
+    parser.add_argument("--only", action="append", metavar="ID",
+                        help="Run only these self-contained tests (e.g. T15, S7). Tests that build on T01-T04 need the full run.")
     args = parser.parse_args(argv)
     run_dir = args.out / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1001,14 +1073,21 @@ def main(argv: list[str] | None = None) -> int:
             ("S5", "Bridge reports real group defects", pilot.s5_group_defects),
             ("S7", "Concurrent duplicate requests on two PHP servers", pilot.s7_concurrent_duplicates),
             ("S8", "Images, physical facts, contributors, translated terms", pilot.s8_copied_facts),
+            ("T15", "Approved content rows -> loader -> production renderer -> stored EN/DE text", pilot.t15_production_content_path),
             ("T14", "Rollback and cleanup of test products", pilot.t14_rollback),
         ]
+        if args.only:
+            unknown = set(args.only) - {test_id for test_id, _, _ in matrix}
+            if unknown:
+                raise SystemExit(f"Unknown test IDs: {sorted(unknown)}")
+            matrix = [entry for entry in matrix if entry[0] in set(args.only)]
         for test_id, title, fn in matrix:
             pilot.record(test_id, title, fn)
     finally:
         lab.stop_all()
         lab.stop_database()
     report = {"ran_at": datetime.now(timezone.utc).isoformat(), "versions": versions, "database": lab.database,
+              "only": args.only or None,
               "not_in_lab": ["Flatsome + Flatsome Child", "pll-bulk-link-translations v1/v2", "Duplicate Post RB", "production data"],
               "results": pilot.results}
     path = run_dir / "pilot_report.json"

@@ -110,8 +110,22 @@ remote state:
 | `src/services/translation_draft_runner.py` | One book, language by language, failures isolated, except a side-effect stop, which halts the book. Proposes mapping rows; **writes nothing to Supabase** |
 | `src/domain/translation_create_state.py` | Stable request IDs and an atomic per-language checkpoint, written **before** the request leaves |
 | `src/domain/multilingual_adapter.py` | Group resolution and the per-language plan |
+| `src/domain/translation_book_input.py` | Builds the runner's `BookInput` from the real records: the RECORDED VI row with its baseline, plus exactly one APPROVED, final row per language. Refuses, with one code, a missing or ambiguous row, a translation approved before its VI source (`TRANSLATION_PREDATES_VI_APPROVAL`), or text the payload rejects. Renders through `create_woocommerce_draft.render_content`, the VI create path's own renderer |
 | `scripts/discover_translation_candidates.py` | Read-only classification and review queue of existing copies |
-| `scripts/plan_translation_drafts.py` | Read-only dry run: the first blocker per book |
+| `scripts/plan_translation_drafts.py` | Read-only dry run: the first blocker per book, plus whether `translation_book_input` yields a valid input (`content_input`) |
+
+**Content rendering (2026-11-14).** Before this date `build_description` rendered the
+Vietnamese section headings ("Tác giả", "Thông tin sản phẩm") into every language, and the
+author detector missed plural and titled forms ("The authors of this book are X and Y.",
+"Dieses Buch stammt von Dr. X."). Approved rows that would have rendered a Vietnamese
+heading inside an EN/DE description: 8 EN, 2 DE. All were metadata-only and are now dropped.
+EN/DE headings are now "About the author" / "Product details" and "Über den Autor / die Autorin" /
+"Produktdetails". An unknown language is refused. No live product was affected: TSYC has
+never created an EN/DE product. Old and new detectors were compared on all 409 approved rows:
+the `long_description`/`short_description` results are identical, so no approved prose is newly
+flagged. Exactly 11 `author_summary` values changed: the 10 EN/DE rows above, plus one VI row
+`Tác giả của ấn phẩm là TS. X.` (the generated template, missed because of `TS.`). The other 7
+VI author notes still render under "Tác giả".
 | `scripts/inventory_php_hooks.py` | Read-only inventory of the developer's PHP hooks (`POLYLANG_HOOK_INVENTORY.md`) |
 
 Recovery rule: after any uncertain answer the runner reads by request ID. A found
@@ -328,6 +342,7 @@ Passing one stage says nothing about the next.
 2. #4928 and #4930 are trashed: confirm that was intended. They then follow the existing terminal `REMOTE_REMOVED` handling and are never recreated.
 3. CAN-0033 #4858 and CAN-0010 #3772: unchanged, still yours to decide.
 4. Contributor labels ("Tác giả") stay Vietnamese on EN/DE copies (warning `ATTRIBUTE_LABELS_NOT_LOCALIZED`). Decide after seeing how the existing copies show them.
+5. Confirm or change the EN/DE description headings (`DESCRIPTION_HEADINGS` in `scripts/create_woocommerce_draft.py`), especially the German author heading "Über den Autor / die Autorin". They appear only when an approved row has a substantive author note or a non-attribute details list.
 
 ## 10. Acceptance criteria for staging write tests
 
