@@ -1,6 +1,6 @@
 # TSYC Polylang bridge and multilingual integration
 
-Status 2026-11-07, bridge 1.1.0. The bridge has passed on an isolated local WordPress,
+Status 2026-11-15, bridge 1.2.0 (localized EN/DE attribute labels, section 5.3). The bridge has passed on an isolated local WordPress,
 on both SQLite and MariaDB, and was re-run on 2026-11-07 at the versions production
 runs (WordPress 7.1.4, WooCommerce 11.2.1, Polylang 3.9.1, PHP 8.3; section 5.2). It is **not installed on production or any copy of the
 store**, and it has **not met the store's theme hooks**. No EN/DE product, link or mapping
@@ -259,6 +259,47 @@ against `set_object_terms` on a price save would silently stop firing on 11.2.1 
 Still not verified, unchanged: price, stock and backorder sync, parallel ordering, and every
 Flatsome Child, bulk-link and Duplicate Post RB behaviour. Those need the real code (B11–B16).
 
+### 5.3 Localized attribute labels, bridge 1.2.0 (2026-11-15)
+
+**Defect.** Content guide 7a takes the author, publisher, page count and size out of every
+description and shows them only as WooCommerce attributes. 1.1.0 copied the VI source's
+attributes onto an EN/DE copy unchanged, so an English or German page would have shown them
+only under "Tác giả", "Nhà xuất bản" and "Số trang". The shop's existing hand-made EN/DE copies
+have **no attributes at all** (read-only sample of 120 linked groups), so there was no house
+convention to copy. Only TSYC-created VI products carry attributes.
+
+**Change.** The request may carry two optional lists. Both hold labels only:
+
+- `attribute_labels`: `{value, label}`, taken from the approved EN/DE row's own `product_details` lines ("Publisher: Kim Đồng").
+- `attribute_vocabulary`: `{source_label, label, label_plural}`, the fixed fallback in `woo_presentation.ATTRIBUTE_LABEL_VOCABULARY`.
+
+The bridge still copies every attribute value from the VI source on the server, and it never calls `set_options`. A custom attribute takes:
+
+1. the approved label for its exact value, when no other attribute has the same value;
+2. otherwise the vocabulary label for its VI name, in the plural form when it has more than one option;
+3. otherwise its VI name, and the copy is reported `ATTRIBUTE_LABELS_NOT_LOCALIZED`.
+
+Further rules:
+
+- A planned name that two attributes would share is not used, because WooCommerce keys attributes by name.
+- Taxonomy attributes are never renamed.
+- "Định dạng", "Ngôn ngữ" and "Bản quyền" are deliberately left out of the vocabulary, because their values are Vietnamese words.
+- Strict validation: 1–40 entries per list, exact keys, bounded strings, no repeats. A bad list is refused with `tsyc_bad_attribute_labels`.
+- The fingerprint includes a list only when it is sent, so a request without labels keeps its 1.1.0 fingerprint.
+
+**Evidence.**
+
+- Offline: `tests/test_localized_attribute_labels.py`, plus a reconcile-replay test confirming the replay sends identical lists.
+- Real-data simulation, read-only, over the 64 books with a ready content input: 240/240 attributes localized in EN and in DE, 64/64 books fully localized, no name collisions. Approved labels alone covered only 46/240, which is why the vocabulary exists.
+- Lab: T16 covers approved-label precedence (DE "Autorin"), the vocabulary fallback, plural, an unlocalizable label kept and reported, an idempotent replay and the VI source unchanged. S8 now expects vocabulary labels on toy content.
+- Base pilot at production versions with bridge 1.2.0: **25 `PASS_REAL_LOCAL`, 2 `BLOCKED_MISSING_DEPENDENCY` (T11, T12B), 0 `FAIL`, on SQLite (`polylang_local/20261115T065853Z`) and on MariaDB 11.4.5 (`polylang_local/20261115T070900Z`)**.
+- A first SQLite run failed T16 at its replay step. The attribute checks had already passed. The test rebuilt the replay with the pilot's toy renderer, so the bridge correctly refused it as `tsyc_request_conflict`. That was a test defect, fixed by passing the renderer through `_request_for`.
+- Hardening pilot, MariaDB, bridge 1.2.0 (`polylang_hardening/20261115T072012Z`): 12 `PASS_REAL_LOCAL`, 8 `PASS_SYNTHETIC_HOOK`, 6 `BLOCKED_MISSING_SOURCE`, **1 `FAIL` (H11)**.
+  - H11 is not a wrong answer. A plain `GET wc/v3/products/{id}` to the lab's PHP built-in server timed out after 180 s.
+  - H11 alone then passed (`polylang_hardening/20261115T092638Z`).
+  - **Second intermittent lab stall, and the first on MariaDB** (2026-11-07: H09 on SQLite). The SQLite single-writer explanation therefore does not cover it. It is still unexplained, so it is not excused.
+  - Before staging, capture which request blocks: PHP server log plus a slow-request trace.
+
 ## 6. Price, stock and pre-orders
 
 | Field | Source of truth | Status |
@@ -341,7 +382,7 @@ Passing one stage says nothing about the next.
 1. Should automation ever add EN/DE to already published VI books? Today: no, and 84 of 86 books are in that state.
 2. #4928 and #4930 are trashed: confirm that was intended. They then follow the existing terminal `REMOTE_REMOVED` handling and are never recreated.
 3. CAN-0033 #4858 and CAN-0010 #3772: unchanged, still yours to decide.
-4. Contributor labels ("Tác giả") stay Vietnamese on EN/DE copies (warning `ATTRIBUTE_LABELS_NOT_LOCALIZED`). Decide after seeing how the existing copies show them.
+4. ~~Contributor labels stay Vietnamese on EN/DE copies.~~ Resolved in bridge 1.2.0 (section 5.3). Only the wording is yours to review: `ATTRIBUTE_LABEL_VOCABULARY` in `src/domain/rules/woo_presentation.py`. The German author default "Autor / Autorin" follows heading 5. Recommended alternative if you prefer the common German retail form: "Autor" / "Autoren". An approved row's own "Autorin: X" line always wins over the default.
 5. Confirm or change the EN/DE description headings (`DESCRIPTION_HEADINGS` in `scripts/create_woocommerce_draft.py`), especially the German author heading "Über den Autor / die Autorin". They appear only when an approved row has a substantive author note or a non-attribute details list.
 
 ## 10. Acceptance criteria for staging write tests

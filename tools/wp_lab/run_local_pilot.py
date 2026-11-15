@@ -409,14 +409,20 @@ echo json_encode(array('keys'=>$keys,'language'=>pll_get_post_language({new_id})
         return {"products_before": before, "products_after": after, "replay_http": replay.http_status,
                 "other_request": second.code, "same_id_other_body": third.code}
 
-    def _request_for(self, operation: tcs.LanguageOperation, book: tdr.BookInput | None = None) -> pbw.CreateRequest:
+    def _request_for(self, operation: tcs.LanguageOperation, book: tdr.BookInput | None = None,
+                     renderer: Any = None) -> pbw.CreateRequest:
+        """The exact request the runner sent: the same renderer is required,
+        or the bridge rightly refuses the replay as tsyc_request_conflict."""
         book = book or self.book
+        renderer = renderer or render
         return pbw.CreateRequest(
             source_id=operation.source_id, lang=operation.lang, request_id=operation.request_id,
             authorization_id=AUTH_ID, internal_product_id=operation.internal_product_id,
             product_code=operation.product_code,
             expected_source_modified_gmt=operation.expected_source_modified_gmt or "",
-            content=ma.build_text_payload(book.contents[operation.lang], operation.lang, render))
+            content=ma.build_text_payload(book.contents[operation.lang], operation.lang, renderer),
+            attribute_labels=ma.build_attribute_labels(book.contents[operation.lang], operation.lang),
+            attribute_vocabulary=ma.build_attribute_vocabulary(operation.lang))
 
     def t08_lost_response(self) -> dict[str, Any]:
         book, vi = self.make_book(f"{SKU_PREFIX}0008", "00000000-0000-4000-8000-000000000008")
@@ -909,12 +915,14 @@ echo json_encode($out);""")
             copy = facts[lang]
             expect(int(copy["image"]) == setup["cover"] and copy["gallery"] == [setup["gallery"]], f"{lang} images {copy}")
             expect(copy["weight"] == "0.3" and copy["length"] == "20", f"{lang} physical {copy}")
-            expect(copy["attributes"].get("Tác giả") == ["Tác giả tổng hợp"], f"{lang} attributes {copy}")
+            # No approved details here: the vocabulary label applies, the value is the source's.
+            label = {"en": "Author", "de": "Autor / Autorin"}[lang]
+            expect(copy["attributes"] == {label: ["Tác giả tổng hợp"]}, f"{lang} attributes {copy}")
             expect(copy["sku"] == "" and copy["price"] == "", f"{lang} {copy}")
         expect(facts["en"]["categories"] == [setup["terms"]["en"]], f"EN category {facts['en']}")
         expect(any(w.startswith("CATEGORY_NOT_TRANSLATED") for w in facts["de"]["warnings"]), f"DE warnings {facts['de']}")
         expect(setup["terms"]["vi"] not in facts["de"]["categories"], f"DE got the VI term: {facts['de']}")
-        return {"copies": facts, "note": "Attribute labels stay Vietnamese on the copy (reported as a warning)."}
+        return {"copies": facts, "note": "Bridge 1.2.0: the VI attribute takes the vocabulary label; its value is unchanged."}
 
     def t15_production_content_path(self) -> dict[str, Any]:
         """Real-shaped approved product_contents rows -> translation_book_input ->
@@ -982,6 +990,78 @@ echo json_encode($out);""")
                "The VI source changed.")
         return {"stored": stored, "translations": dict(group.translations), "stale_translation_refused": stale.refusal,
                 "proposed_mapping_rows": len(result.proposed_rows), "written_to_supabase": 0}
+
+    def t16_localized_attribute_labels(self) -> dict[str, Any]:
+        """Bridge 1.2.0: the copied VI attributes keep their values. Each takes the
+        label the approved EN/DE details text gives its value, else the fixed
+        vocabulary label (plural for several names), else keeps its VI label
+        and the copy is reported."""
+        code, internal = f"{SKU_PREFIX}ATTR", "00000000-0000-4000-8000-0000000000f2"
+        _, vi = self.make_book(code, internal)
+        vi_attributes = {"Tác giả": ["Lab Author A"], "Minh họa": ["Lab Ill B", "Lab Ill C"], "Nhà xuất bản": ["Kim Đồng"],
+                         "Số trang": ["64"], "Kích thước": ["20 x 20 cm"], "Định dạng": ["Bìa mềm"]}
+        setup = self.lab.eval_json(f"""
+$product = wc_get_product({vi['id']});
+$list = array();
+foreach (json_decode('{json.dumps(vi_attributes, ensure_ascii=True)}', true) as $name => $options) {{
+  $a = new WC_Product_Attribute(); $a->set_name($name); $a->set_options($options); $a->set_visible(true); $list[] = $a;
+}}
+$product->set_attributes($list);
+$product->save();
+echo json_encode(array('modified'=>str_replace(' ','T',get_post($product->get_id())->post_modified_gmt)));""")
+        row = lpm.LanguageProduct(
+            internal_product_id=internal, product_code=code, language_code="vi", woocommerce_product_id=int(vi["id"]),
+            origin=lpm.ORIGIN_TSYC_CREATED, mapping_status=lpm.RECORDED, baseline_source=lpm.BASELINE_CREATE_RESPONSE,
+            baseline_modified_gmt=setup["modified"],
+            baseline_text={f: str(vi.get(f) or "") for f in wtg.TRANSLATED_FIELDS})
+        details = {"vi": "Tác giả: Lab Author A\nNhà xuất bản: Kim Đồng\nSố trang: 64\nKích thước: 20 x 20 cm",
+                   # EN deliberately has no dimensions line: that attribute must stay VI and be reported.
+                   "en": "Author: Lab Author A\nPublisher: Kim Đồng\nPages: 64",
+                   "de": "Autorin: Lab Author A\nVerlag: Kim Đồng\nSeiten: 64\nFormat: 20 x 20 cm"}
+        rows = [{"product_content_id": f"00000000-0000-4000-8000-0000000000{n}", "internal_product_id": internal,
+                 "content_language": lang, "content_status": "APPROVED", "review_required": False,
+                 "approved_at": f"2026-11-15T10:0{n[-1]}:00+00:00", "product_name": f"Attr {lang}",
+                 "short_description": f"Kurz {lang}.", "long_description": f"Absatz {lang}.",
+                 "author_summary": "", "product_details": details[lang]}
+                for lang, n in (("vi", "f4"), ("en", "f5"), ("de", "f6"))]
+        prepared = tbi.build_book_input(row, rows, cwd.render_content)
+        expect(prepared.ready, f"{prepared.refusal}: {prepared.detail}")
+        book = tdr.BookInput(internal, code, row, prepared.contents, AUTH_ID)
+        store = tcs.CheckpointStore(self.run_dir / "t16.json")
+        result = tdr.TranslationDraftRunner(reader=self.reader, writer=self.writer(), store=store,
+                                            read_catalog=self.read_catalog, render=cwd.render_content
+                                            ).run_book(book, create_authorized=True)
+        # EN dimensions and both illustrator entries come from the vocabulary; DE "Autorin" is the
+        # approved text's own word and wins over the vocabulary; "Định dạng" has no safe label.
+        want = {"en": {"Author": ["Lab Author A"], "Illustrators": ["Lab Ill B", "Lab Ill C"], "Publisher": ["Kim Đồng"],
+                       "Pages": ["64"], "Dimensions": ["20 x 20 cm"], "Định dạng": ["Bìa mềm"]},
+                "de": {"Autorin": ["Lab Author A"], "Illustration": ["Lab Ill B", "Lab Ill C"], "Verlag": ["Kim Đồng"],
+                       "Seiten": ["64"], "Format": ["20 x 20 cm"], "Định dạng": ["Bìa mềm"]}}
+        stored: dict[str, Any] = {}
+        for lang in ("en", "de"):
+            language = result.languages[lang]
+            expect(language.result == tdr.RESULT_CREATED, f"{lang}: {language.result} {language.code} {language.detail}")
+            pid = int(language.product_id)
+            copy = self.lab.eval_json(f"""
+$p = wc_get_product({pid}); $out = array();
+foreach ($p->get_attributes('edit') as $a) {{ $out[] = array($a->get_name(), $a->get_options()); }}
+echo json_encode(array('attributes'=>$out,'warnings'=>get_post_meta({pid},'_tsyc_bridge_warnings',true)));""")
+            got = {name: options for name, options in copy["attributes"]}
+            expect(got == want[lang], f"{lang} attributes {copy['attributes']}")
+            expect("ATTRIBUTE_LABELS_NOT_LOCALIZED" in (copy["warnings"] or []), f"{lang} warnings {copy['warnings']}")
+            expect([name for name, _ in copy["attributes"]] == list(want[lang]), f"{lang} order {copy['attributes']}")
+            stored[lang] = copy
+        before = self.lab.lab_skus_count()
+        replay = self.writer().create_translation_draft(
+            self._request_for(store.get(internal, "en"), book, renderer=cwd.render_content))
+        expect(replay.kind == pbw.CONFIRMED and replay.replayed and replay.product_id == result.languages["en"].product_id,
+               f"replay {replay}")
+        expect(self.lab.lab_skus_count() == before, "The replay created a product.")
+        vi_after = self.lab.eval_json(f"$p = wc_get_product({vi['id']}); $o = array();"
+                                      f"foreach ($p->get_attributes('edit') as $a) {{ $o[$a->get_name()] = $a->get_options(); }}"
+                                      f"echo json_encode(array('attributes'=>$o,'modified'=>str_replace(' ','T',get_post({vi['id']})->post_modified_gmt)));")
+        expect(vi_after["attributes"] == vi_attributes and vi_after["modified"] == setup["modified"], f"VI changed: {vi_after}")
+        return {"copies": stored, "replayed": replay.replayed, "vi_unchanged": True}
 
     def s6_save_translations_semantics(self) -> dict[str, Any]:
         """The Polylang behaviours the bridge is built around, on the real code."""
@@ -1074,6 +1154,7 @@ def main(argv: list[str] | None = None) -> int:
             ("S7", "Concurrent duplicate requests on two PHP servers", pilot.s7_concurrent_duplicates),
             ("S8", "Images, physical facts, contributors, translated terms", pilot.s8_copied_facts),
             ("T15", "Approved content rows -> loader -> production renderer -> stored EN/DE text", pilot.t15_production_content_path),
+            ("T16", "Copied attributes take the approved EN/DE labels, values unchanged", pilot.t16_localized_attribute_labels),
             ("T14", "Rollback and cleanup of test products", pilot.t14_rollback),
         ]
         if args.only:

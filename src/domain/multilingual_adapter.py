@@ -48,6 +48,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from src.domain import polylang_link_graph as plg
 from src.domain import woo_translation_group as wtg
+from src.domain.rules import woo_presentation
 
 # Group resolution.
 RESOLVED = "RESOLVED"              # every member proven by agreeing evidence
@@ -407,6 +408,21 @@ def build_text_payload(content: Mapping[str, Any], lang: str, render: wtg.Render
     payload = {"name": name, "description": description, "short_description": short_description}
     assert_text_only(payload)
     return payload
+
+
+def build_attribute_labels(content: Mapping[str, Any], lang: str) -> tuple[tuple[str, str], ...]:
+    """(value, label) pairs from one approved translation's own details text.
+    Labels only: the bridge keeps every attribute value from the VI source."""
+    if str(content.get("content_language") or "").lower() != lang:
+        raise ValueError(f"Content language {content.get('content_language')!r} is not {lang!r}.")
+    return tuple(woo_presentation.localized_attribute_labels(content.get("product_details")))
+
+
+def build_attribute_vocabulary(lang: str) -> tuple[tuple[str, str, str], ...]:
+    """(VI label, singular, plural): the fallback when the approved text does not label a value."""
+    if lang not in wtg.TRANSLATION_LANGUAGES:
+        raise ValueError(f"No attribute vocabulary for {lang!r}.")
+    return tuple(woo_presentation.attribute_label_vocabulary(lang))
 
 
 def assert_text_only(payload: Mapping[str, Any]) -> None:

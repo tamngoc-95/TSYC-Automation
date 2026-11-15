@@ -47,13 +47,20 @@ class CreateRequest:
     expected_source_modified_gmt: str
     content: Mapping[str, str]
     inventory_profile: str = INVENTORY_PROFILE_FAHASA_PREORDER
+    # (value, label): rename the copied VI attribute whose value is exactly
+    # this to the approved translation's label. Never a value, never a new
+    # attribute (multilingual_adapter.build_attribute_labels).
+    attribute_labels: tuple[tuple[str, str], ...] = ()
+    # (VI label, singular, plural): fallback for a value the translation does
+    # not label (woo_presentation.ATTRIBUTE_LABEL_VOCABULARY).
+    attribute_vocabulary: tuple[tuple[str, str, str], ...] = ()
 
     def as_body(self) -> dict[str, Any]:
         ma.assert_text_only(self.content)
         unknown = set(self.content) - set(wtg.TRANSLATED_FIELDS)
         if unknown:
             raise ValueError(f"Content carries fields beyond the text: {sorted(unknown)}")
-        return {
+        body = {
             "source_id": int(self.source_id),
             "lang": self.lang,
             "request_id": self.request_id,
@@ -64,6 +71,14 @@ class CreateRequest:
             "inventory_profile": self.inventory_profile,
             "content": {name: str(self.content[name]) for name in wtg.TRANSLATED_FIELDS},
         }
+        if self.attribute_labels:
+            # Omitted when empty: older bridges reject unknown fields, and an
+            # empty map must keep the request fingerprint it always had.
+            body["attribute_labels"] = [{"value": str(v), "label": str(l)} for v, l in self.attribute_labels]
+        if self.attribute_vocabulary:
+            body["attribute_vocabulary"] = [{"source_label": str(s), "label": str(one), "label_plural": str(many)}
+                                            for s, one, many in self.attribute_vocabulary]
+        return body
 
 
 @dataclass(frozen=True)

@@ -201,7 +201,8 @@ class TranslationDraftRunner:
             authorization_id=book.authorization_id, internal_product_id=book.internal_product_id,
             product_code=book.product_code,
             expected_source_modified_gmt=operation.expected_source_modified_gmt,
-            content=payload)
+            content=payload, attribute_labels=ma.build_attribute_labels(content, lang),
+            attribute_vocabulary=ma.build_attribute_vocabulary(lang))
         operation.move(tcs.REQUEST_SENT)
         self.store.put(operation)  # On disk before the request leaves.
         outcome = self.writer.create_translation_draft(request)
@@ -253,7 +254,9 @@ class TranslationDraftRunner:
             authorization_id=book.authorization_id, internal_product_id=operation.internal_product_id,
             product_code=operation.product_code,
             expected_source_modified_gmt=operation.expected_source_modified_gmt or "",
-            content=ma.build_text_payload(content, operation.lang, self.render))
+            content=ma.build_text_payload(content, operation.lang, self.render),
+            attribute_labels=ma.build_attribute_labels(content, operation.lang),
+            attribute_vocabulary=ma.build_attribute_vocabulary(operation.lang))
         outcome = self.writer.create_translation_draft(request)
         return self._apply(operation, outcome, RESULT_RECONCILED)
 

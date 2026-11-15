@@ -123,6 +123,85 @@ def build_attributes(
     return attributes
 
 
+def attribute_value_key(value: str) -> str:
+    """Whitespace- and case-insensitive key of one attribute value (the
+    bridge computes the same key on the server)."""
+    return " ".join(str(value).split()).casefold()
+
+
+def localized_attribute_labels(product_details: str | None) -> list[tuple[str, str]]:
+    """[(value, label)] for an EN/DE translation draft, from that language's
+    own APPROVED product_details ("Publisher: Kim Đồng", "Seiten: 64").
+
+    The bridge copies the VI source's attributes (values unchanged) and
+    renames an attribute only when its joined options equal one of these
+    values exactly. Nothing is translated here: the label is the approved
+    text's own wording. A value given two different labels is ambiguous and
+    left out, so that attribute keeps its VI label and is reported.
+    """
+    labels: dict[str, tuple[str, str]] = {}
+    ambiguous: set[str] = set()
+    for line in _detail_lines(product_details):
+        parsed = parse_detail_line(line)
+        if parsed is None:
+            continue
+        label, value = parsed
+        key = attribute_value_key(value)
+        if key in labels and labels[key][1] != label:
+            ambiguous.add(key)
+        labels.setdefault(key, (" ".join(value.split()), label))
+    return [pair for key, pair in labels.items() if key not in ambiguous]
+
+
+# Fallback labels for an EN/DE copy, keyed by the VI attribute label, used by
+# the bridge only when the approved translation does not label that value
+# itself. Presentation vocabulary only: the value is never touched. Limited
+# to labels whose values are language-neutral (names, publisher names,
+# numbers, sizes, ISBN, series names); "Định dạng", "Ngôn ngữ", "Bản quyền"
+# hold Vietnamese words and are deliberately absent, so they keep their VI
+# label and are reported. (singular, plural): plural when the attribute has
+# more than one option. The DE author form follows the existing DE heading
+# convention ("Über den Autor / die Autorin"); it is an owner-adjustable
+# wording, not a fact.
+ATTRIBUTE_LABEL_VOCABULARY: dict[str, dict[str, tuple[str, str]]] = {
+    "en": {
+        "Tác giả": ("Author", "Authors"),
+        "Đồng tác giả": ("Co-author", "Co-authors"),
+        "Nguyên tác": ("Original author", "Original authors"),
+        "Người kể lại": ("Retold by", "Retold by"),
+        "Người dịch": ("Translator", "Translators"),
+        "Dịch giả": ("Translator", "Translators"),
+        "Minh họa": ("Illustrator", "Illustrators"),
+        "Nhà xuất bản": ("Publisher", "Publisher"),
+        "Số trang": ("Pages", "Pages"),
+        "Kích thước": ("Dimensions", "Dimensions"),
+        "Trọng lượng": ("Weight", "Weight"),
+        "ISBN": ("ISBN", "ISBN"),
+        "Bộ sách": ("Series", "Series"),
+    },
+    "de": {
+        "Tác giả": ("Autor / Autorin", "Autorinnen / Autoren"),
+        "Đồng tác giả": ("Co-Autor / Co-Autorin", "Co-Autorinnen / Co-Autoren"),
+        "Nguyên tác": ("Originalvorlage", "Originalvorlage"),
+        "Người kể lại": ("Nacherzählung", "Nacherzählung"),
+        "Người dịch": ("Übersetzung", "Übersetzung"),
+        "Dịch giả": ("Übersetzung", "Übersetzung"),
+        "Minh họa": ("Illustration", "Illustration"),
+        "Nhà xuất bản": ("Verlag", "Verlag"),
+        "Số trang": ("Seiten", "Seiten"),
+        "Kích thước": ("Format", "Format"),
+        "Trọng lượng": ("Gewicht", "Gewicht"),
+        "ISBN": ("ISBN", "ISBN"),
+        "Bộ sách": ("Reihe", "Reihe"),
+    },
+}
+
+
+def attribute_label_vocabulary(lang: str) -> list[tuple[str, str, str]]:
+    """[(VI label, singular, plural)] for one translation language."""
+    return [(vi, one, many) for vi, (one, many) in ATTRIBUTE_LABEL_VOCABULARY.get(lang, {}).items()]
+
+
 def comparable_attributes(attributes: Any) -> list[tuple[str, tuple[str, ...]]]:
     """Order-preserving (name, options) pairs for comparing what TSYC
     sent with what WooCommerce stored (ids/positions/slugs ignored)."""

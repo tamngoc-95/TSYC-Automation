@@ -2,7 +2,7 @@
 /**
  * Plugin Name: TSYC Polylang Bridge
  * Description: Authenticated read of Polylang's product translation links. Write routes exist only on an explicitly enabled non-production site.
- * Version: 1.1.0
+ * Version: 1.2.0
  * Requires PHP: 7.4
  *
  * Install as a must-use plugin. Uses Polylang's public PHP API only
@@ -26,7 +26,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-const TSYC_BRIDGE_VERSION = '1.1.0';
+const TSYC_BRIDGE_VERSION = '1.2.0';
 const TSYC_BRIDGE_MECHANISM = 'tsyc/v1 translations endpoint';
 const TSYC_BRIDGE_NAMESPACE = 'tsyc/v1';
 const TSYC_BRIDGE_PRODUCTION_HOSTS = array('tiemsachyeucon.com');
@@ -346,7 +346,8 @@ function tsyc_bridge_validate_create(array $body)
 {
     $allowed = array('source_id', 'lang', 'request_id', 'authorization_id', 'internal_product_id', 'product_code',
                      'expected_source_modified_gmt', 'inventory_profile', 'content');
-    $unknown = array_diff(array_keys($body), $allowed);
+    $optional = array('attribute_labels', 'attribute_vocabulary');
+    $unknown = array_diff(array_keys($body), $allowed, $optional);
     if (!empty($unknown)) {
         // Price, stock, status, SKU and anything else simply cannot be sent.
         return tsyc_bridge_error('tsyc_forbidden_fields', 'Unknown fields: ' . implode(', ', $unknown), 400);
@@ -387,7 +388,107 @@ function tsyc_bridge_validate_create(array $body)
     if (trim($content['name']) === '') {
         return tsyc_bridge_error('tsyc_bad_content', 'content.name is empty.', 400);
     }
+    // Labels only, never values: see tsyc_bridge_localized_attributes().
+    $label_lists = array(
+        'attribute_labels'     => array('value', array('value', 'label')),
+        'attribute_vocabulary' => array('source_label', array('source_label', 'label', 'label_plural')),
+    );
+    foreach ($label_lists as $field => list($key_field, $fields)) {
+        if (!array_key_exists($field, $body)) {
+            continue;
+        }
+        $entries = $body[$field];
+        if (!is_array($entries) || empty($entries) || count($entries) > 40 || array_values($entries) !== $entries) {
+            return tsyc_bridge_error('tsyc_bad_attribute_labels', "$field must be a list of 1-40 entries.", 400);
+        }
+        $seen = array();
+        foreach ($entries as $entry) {
+            if (!is_array($entry) || array_diff(array_keys($entry), $fields) || count($entry) !== count($fields)) {
+                return tsyc_bridge_error('tsyc_bad_attribute_labels', "Each $field entry holds exactly: " . implode(', ', $fields), 400);
+            }
+            foreach ($fields as $name) {
+                if (!is_string($entry[$name]) || trim($entry[$name]) === '' || strlen($entry[$name]) > ($name === 'value' ? 600 : 120)) {
+                    return tsyc_bridge_error('tsyc_bad_attribute_labels', "$field.$name must be a non-empty, bounded string.", 400);
+                }
+            }
+            $key = tsyc_bridge_attribute_key($entry[$key_field]);
+            if (isset($seen[$key])) {
+                return tsyc_bridge_error('tsyc_bad_attribute_labels', "Repeated $field entry.", 400);
+            }
+            $seen[$key] = true;
+        }
+    }
     return $body;
+}
+
+/** Whitespace- and case-insensitive key of one attribute value (woo_presentation.attribute_value_key). */
+function tsyc_bridge_attribute_key(string $value): string
+{
+    $collapsed = trim((string) preg_replace('/\s+/u', ' ', $value));
+    return function_exists('mb_strtolower') ? mb_strtolower($collapsed, 'UTF-8') : strtolower($collapsed);
+}
+
+/**
+ * The source's attributes with their values unchanged; only names change.
+ * A custom attribute takes, in order:
+ *   1. the label the approved translation gives exactly its value
+ *      (attribute_labels), when no other attribute has that same value;
+ *   2. else the fixed vocabulary label for its VI name (attribute_vocabulary),
+ *      plural when it has more than one option;
+ *   3. else it keeps its VI name.
+ * A planned name another attribute would also get is not used (WooCommerce
+ * keys attributes by name: one would be lost). Taxonomy attributes are never
+ * renamed. Any attribute left on its VI name -> ATTRIBUTE_LABELS_NOT_LOCALIZED.
+ */
+function tsyc_bridge_localized_attributes(array $source_attributes, array $labels, array $vocabulary, array &$warnings): array
+{
+    $by_value = array();
+    foreach ($labels as $entry) {
+        $by_value[tsyc_bridge_attribute_key($entry['value'])] = trim($entry['label']);
+    }
+    $by_source_label = array();
+    foreach ($vocabulary as $entry) {
+        $by_source_label[tsyc_bridge_attribute_key($entry['source_label'])] = array(trim($entry['label']), trim($entry['label_plural']));
+    }
+    $value_count = array();
+    foreach ($source_attributes as $attribute) {
+        $key = tsyc_bridge_attribute_key(implode(', ', $attribute->get_options()));
+        $value_count[$key] = ($value_count[$key] ?? 0) + 1;
+    }
+    $planned = array();
+    foreach ($source_attributes as $index => $attribute) {
+        $planned[$index] = null;
+        if ($attribute->is_taxonomy()) {
+            continue;
+        }
+        $key = tsyc_bridge_attribute_key(implode(', ', $attribute->get_options()));
+        $source_key = tsyc_bridge_attribute_key($attribute->get_name());
+        if (isset($by_value[$key]) && $value_count[$key] === 1) {
+            $planned[$index] = $by_value[$key];
+        } elseif (isset($by_source_label[$source_key])) {
+            $planned[$index] = $by_source_label[$source_key][count($attribute->get_options()) > 1 ? 1 : 0];
+        }
+    }
+    $name_count = array();
+    foreach ($source_attributes as $index => $attribute) {
+        $name_key = tsyc_bridge_attribute_key($planned[$index] ?? $attribute->get_name());
+        $name_count[$name_key] = ($name_count[$name_key] ?? 0) + 1;
+    }
+    $result = array();
+    $unlocalized = false;
+    foreach ($source_attributes as $index => $attribute) {
+        $copy = clone $attribute;
+        if ($planned[$index] !== null && $name_count[tsyc_bridge_attribute_key($planned[$index])] === 1) {
+            $copy->set_name($planned[$index]);
+        } else {
+            $unlocalized = true;
+        }
+        $result[] = $copy;
+    }
+    if ($unlocalized) {
+        $warnings[] = 'ATTRIBUTE_LABELS_NOT_LOCALIZED';
+    }
+    return $result;
 }
 
 function tsyc_bridge_error(string $code, string $message, int $status, array $extra = array()): WP_Error
@@ -398,11 +499,18 @@ function tsyc_bridge_error(string $code, string $message, int $status, array $ex
 function tsyc_bridge_fingerprint(array $body): string
 {
     // authorization_id and the expected timestamp may legitimately differ on a resume.
-    return hash('sha256', (string) wp_json_encode(array(
+    $parts = array(
         (int) $body['source_id'], $body['lang'], $body['internal_product_id'], $body['product_code'],
         $body['inventory_profile'], $body['content']['name'], $body['content']['description'],
         $body['content']['short_description'],
-    )));
+    );
+    // Only when sent: a request without labels keeps its pre-1.2.0 fingerprint.
+    foreach (array('attribute_labels', 'attribute_vocabulary') as $field) {
+        if (!empty($body[$field])) {
+            $parts[] = array($field, $body[$field]);
+        }
+    }
+    return hash('sha256', (string) wp_json_encode($parts));
 }
 
 /**
@@ -827,11 +935,11 @@ function tsyc_bridge_insert_draft(array $body, WC_Product $source, string $finge
     $product->set_length($source->get_length('edit'));
     $product->set_width($source->get_width('edit'));
     $product->set_height($source->get_height('edit'));
-    $product->set_attributes($source->get_attributes('edit'));
+    // Values from the source; only labels may come from the request.
     $warnings = array();
-    if (!empty($source->get_attributes('edit'))) {
-        $warnings[] = 'ATTRIBUTE_LABELS_NOT_LOCALIZED';
-    }
+    $product->set_attributes(tsyc_bridge_localized_attributes(
+        array_values($source->get_attributes('edit')), $body['attribute_labels'] ?? array(),
+        $body['attribute_vocabulary'] ?? array(), $warnings));
     $product->set_category_ids(tsyc_bridge_translated_terms($source->get_category_ids('edit'), (string) $body['lang'], 'CATEGORY', $warnings));
     $product->set_tag_ids(tsyc_bridge_translated_terms($source->get_tag_ids('edit'), (string) $body['lang'], 'TAG', $warnings));
     $product->update_meta_data('_tsyc_bridge_warnings', array_values(array_unique($warnings)));

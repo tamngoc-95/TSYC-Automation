@@ -303,6 +303,22 @@ def test_a_lost_answer_reconciles_without_a_duplicate(bridge: FakeBridge, tmp_pa
     assert tcs.CheckpointStore(path).get(BOOK, "en").state == tcs.CONFIRMED
 
 
+def test_the_reconcile_replay_sends_the_same_attribute_labels(bridge: FakeBridge, tmp_path: Path) -> None:
+    # A different label map on the replay would change the bridge fingerprint
+    # and turn a safe replay into tsyc_request_conflict.
+    path = tmp_path / "c.json"
+    labelled = book("en")
+    labelled.contents["en"]["product_details"] = "Author: Lab A\nPublisher: Kim Đồng\nPages: 64"
+    bridge.fail_post_with = requests.ConnectionError("lost")
+    bridge.land_then_fail = True
+    runner_for(bridge, tcs.CheckpointStore(path)).run_book(labelled, create_authorized=True)
+    second = runner_for(bridge, tcs.CheckpointStore(path)).run_book(labelled, create_authorized=True)
+    assert second.languages["en"].result == tdr.RESULT_RECONCILED
+    sent = [post["attribute_labels"] for post in bridge.posts]
+    assert len(sent) == 2 and sent[0] == sent[1] == [
+        {"value": "Lab A", "label": "Author"}, {"value": "Kim Đồng", "label": "Publisher"}, {"value": "64", "label": "Pages"}]
+
+
 def test_explicit_absence_allows_the_same_request_to_be_sent_once_more(bridge: FakeBridge, tmp_path: Path) -> None:
     path = tmp_path / "c.json"
     bridge.fail_post_with = requests.ConnectionError("never arrived")
