@@ -435,9 +435,12 @@ echo json_encode(array('keys'=>$keys,'language'=>pll_get_post_language({new_id})
         expect(operation.state == tcs.UNCERTAIN, operation.state)
         found = self.reader.read_request(operation.request_id)
         expect(found.found and found.state == "LINKED", f"{found}")
-        # DE must wait: the unreconciled EN draft carries this book's meta, so
-        # the group is a CONFLICT until EN is recorded.
-        expect(first.languages["de"].action == ma.REFUSE, f"DE while EN is uncertain: {first.languages['de']}")
+        # DE must wait: the runner sends nothing for a second language while
+        # the first is unreconciled (and the unrecorded EN draft would make
+        # the group a CONFLICT anyway).
+        expect(first.languages["de"].action == ma.RECONCILE_FIRST
+               and first.languages["de"].code == tdr.WAITING_FOR_UNRECONCILED_LANGUAGE,
+               f"DE while EN is uncertain: {first.languages['de']}")
         count_mid = self.lab.lab_skus_count()
         expect(count_mid == before + 1, f"{before} -> {count_mid}")
         second = self.runner(self.writer(), store).run_book(book, create_authorized=True)

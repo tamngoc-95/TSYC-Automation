@@ -10,9 +10,10 @@ Order of one language:
   3. REQUEST_SENT is written to disk, then one POST is sent.
   4. The result is stored. An UNCERTAIN result is never retried in this run.
 
-A failure in one language or book never stops the others, with one exception:
-a side-effect stop halts that whole book, in this run and every later one,
-because the store changed products TSYC must not touch. Nothing here writes
+A failure in one language or book never stops the others, with two exceptions.
+A side-effect stop halts that whole book, in this run and every later one,
+because the store changed products TSYC must not touch. And while one language
+is unreconciled, the other language of the same book waits. Nothing here writes
 to Supabase: confirmed creates are returned as proposed mapping rows, for a
 separately authorized writer.
 """
@@ -38,6 +39,7 @@ RESULT_REFUSED = "REFUSED"
 RESULT_SKIPPED = "SKIPPED"
 RESULT_ERROR = "ERROR"
 BOOK_STOPPED_SIDE_EFFECT = "BOOK_STOPPED_SIDE_EFFECT"
+WAITING_FOR_UNRECONCILED_LANGUAGE = "WAITING_FOR_UNRECONCILED_LANGUAGE"
 
 
 class CatalogReader(Protocol):
@@ -111,12 +113,15 @@ class TranslationDraftRunner:
 
     def run_book(self, book: BookInput, *, create_authorized: bool) -> BookResult:
         result = BookResult(book.product_code)
-        for lang in wtg.TRANSLATION_LANGUAGES:
+        outcomes: dict[str, LanguageResult] = {}
+        # A pending language is reconciled before any other language is touched.
+        for lang in sorted(wtg.TRANSLATION_LANGUAGES, key=lambda code: not self._pending(book, code)):
             try:
-                stopped = self._side_effect_stop(book, lang)
-                result.languages[lang] = stopped or self._run_language(book, lang, create_authorized, result)
+                stopped = self._side_effect_stop(book, lang) or self._waiting(book, lang)
+                outcomes[lang] = stopped or self._run_language(book, lang, create_authorized, result)
             except Exception as error:  # noqa: BLE001 - isolate one language from the rest
-                result.languages[lang] = LanguageResult(lang, RESULT_ERROR, code=type(error).__name__, detail=str(error))
+                outcomes[lang] = LanguageResult(lang, RESULT_ERROR, code=type(error).__name__, detail=str(error))
+        result.languages = {lang: outcomes[lang] for lang in wtg.TRANSLATION_LANGUAGES}
         result.proposed_rows = [_baseline_row(op) for lang in wtg.TRANSLATION_LANGUAGES
                                 if (op := self.store.get(book.internal_product_id, lang)) is not None
                                 and op.state == tcs.CONFIRMED]
@@ -128,6 +133,28 @@ class TranslationDraftRunner:
                 return LanguageResult(lang, RESULT_REFUSED, code=BOOK_STOPPED_SIDE_EFFECT,
                                       detail=f"{operation.lang} #{operation.product_id}: {operation.reason}",
                                       product_id=operation.product_id if operation.lang == lang else None)
+        return None
+
+    def _pending(self, book: BookInput, lang: str) -> bool:
+        operation = self.store.get(book.internal_product_id, lang)
+        return operation is not None and operation.state in tcs.NEEDS_RECONCILE
+
+    def _waiting(self, book: BookInput, lang: str) -> LanguageResult | None:
+        """One language at a time. While another language of this book is
+        unreconciled, nothing is sent for this one: its half-made draft may
+        not be linked yet, so the group read cannot show it, and a second
+        create would be judged against a group the first is still changing
+        (lab, 2026-11-16: the second stopped as a side effect and the book
+        needed a person). A language that is itself pending never waits: it
+        only reads and finishes its own request, so two pending languages
+        cannot block each other."""
+        if self._pending(book, lang):
+            return None
+        for other in wtg.TRANSLATION_LANGUAGES:
+            if other != lang and self._pending(book, other):
+                operation = self.store.get(book.internal_product_id, other)
+                return LanguageResult(lang, RESULT_SKIPPED, action=ma.RECONCILE_FIRST, code=WAITING_FOR_UNRECONCILED_LANGUAGE,
+                                      detail=f"{other} request {operation.request_id} is {operation.state}; reconcile it first.")
         return None
 
     def _rows(self, book: BookInput) -> list[lpm.LanguageProduct]:

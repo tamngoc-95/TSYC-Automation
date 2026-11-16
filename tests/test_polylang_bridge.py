@@ -398,8 +398,69 @@ def test_de_waits_while_en_is_unreconciled(bridge: FakeBridge, tmp_path: Path) -
     bridge.land_then_fail = True
     result = runner_for(bridge, tcs.CheckpointStore(tmp_path / "c.json")).run_book(book(), create_authorized=True)
     assert result.languages["en"].result == tdr.RESULT_UNCERTAIN
-    assert result.languages["de"].action == ma.REFUSE
+    assert result.languages["de"].action == ma.RECONCILE_FIRST
+    assert result.languages["de"].code == tdr.WAITING_FOR_UNRECONCILED_LANGUAGE
     assert "de" not in bridge.group
+
+
+def test_no_second_language_is_sent_while_the_first_never_arrived(bridge: FakeBridge, tmp_path: Path) -> None:
+    """Lab, 2026-11-16: EN died before it was linked, so the group read could
+    not show it. DE was sent in the same run, and on resume DE stopped as a
+    side effect and halted the book. One language at a time: DE sends nothing
+    until EN is settled."""
+    bridge.fail_post_with = requests.ConnectionError("lost before the link")
+    store = tcs.CheckpointStore(tmp_path / "c.json")
+    first = runner_for(bridge, store).run_book(book(), create_authorized=True)
+    assert first.languages["en"].result == tdr.RESULT_UNCERTAIN
+    assert first.languages["de"].result == tdr.RESULT_SKIPPED
+    assert first.languages["de"].code == tdr.WAITING_FOR_UNRECONCILED_LANGUAGE
+    assert [post["lang"] for post in bridge.posts] == ["en"]
+    assert store.get(BOOK, "de") is None
+
+    # The next run reconciles EN first ("absent" -> sent once), then DE goes.
+    bridge.fail_post_with = None
+    second = runner_for(bridge, tcs.CheckpointStore(tmp_path / "c.json")).run_book(book(), create_authorized=True)
+    assert second.languages["en"].result == tdr.RESULT_CREATED
+    assert second.languages["de"].result == tdr.RESULT_CREATED
+    assert [post["lang"] for post in bridge.posts] == ["en", "en", "de"]
+    assert set(bridge.group) == {"vi", "en", "de"}
+
+
+def test_two_pending_languages_do_not_block_each_other(bridge: FakeBridge, tmp_path: Path) -> None:
+    """A checkpoint written before the one-at-a-time rule can hold both
+    languages pending. Each still reconciles its own request."""
+    store = tcs.CheckpointStore(tmp_path / "c.json")
+    for lang in ("en", "de"):
+        operation = tcs.LanguageOperation(
+            request_id=tcs.make_request_id(BOOK, lang, f"content-{lang}"), internal_product_id=BOOK, product_code=CODE,
+            lang=lang, source_id=SOURCE, product_content_id=f"content-{lang}", expected_source_modified_gmt=BASELINE)
+        operation.move(tcs.UNCERTAIN, code="UNEXPECTED_ANSWER")
+        store.put(operation)
+    done = runner_for(bridge, store).run_book(book(), create_authorized=True)
+    assert {lang: r.result for lang, r in done.languages.items()} == {"en": tdr.RESULT_CREATED, "de": tdr.RESULT_CREATED}
+    assert set(bridge.group) == {"vi", "en", "de"}
+
+
+def test_a_pending_second_language_is_reconciled_before_the_first_is_sent(bridge: FakeBridge, tmp_path: Path) -> None:
+    """Only DE is pending (an earlier DE-only run): EN must not be sent
+    around it, and a failed reconciliation read keeps both languages still."""
+    store = tcs.CheckpointStore(tmp_path / "c.json")
+    bridge.fail_post_with = requests.ConnectionError("lost")
+    runner_for(bridge, store).run_book(book("de"), create_authorized=True)
+    assert store.get(BOOK, "de").state == tcs.UNCERTAIN
+    bridge.fail_post_with = None
+    bridge.fail_get_with = requests.ConnectionError("read failed")
+    sent_before = len(bridge.posts)
+    blocked = runner_for(bridge, store).run_book(book(), create_authorized=True)
+    assert blocked.languages["de"].code == "RECONCILE_READ_FAILED"
+    assert blocked.languages["en"].code == tdr.WAITING_FOR_UNRECONCILED_LANGUAGE
+    assert len(bridge.posts) == sent_before
+    assert list(blocked.languages) == ["en", "de"]
+
+    bridge.fail_get_with = None
+    done = runner_for(bridge, store).run_book(book(), create_authorized=True)
+    assert {lang: r.result for lang, r in done.languages.items()} == {"en": tdr.RESULT_CREATED, "de": tdr.RESULT_CREATED}
+    assert [post["lang"] for post in bridge.posts[sent_before:]] == ["de", "en"]
 
 
 # ------------------------------------------------------------ checkpoints
