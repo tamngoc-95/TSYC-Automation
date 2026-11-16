@@ -6,6 +6,11 @@ runs (WordPress 7.1.4, WooCommerce 11.2.1, Polylang 3.9.1, PHP 8.3; section 5.2)
 store**, and it has **not met the store's theme hooks**. No EN/DE product, link or mapping
 row exists because of it. Staging write tests are not yet allowed: see section 10.
 
+**2026-11-16:** the new pre-order workflow is now separated from the existing-product workflow, and Stage D is
+split into Gate A (draft creation safety) and Gate B (live commerce synchronization). Gate A passed in the local
+lab; Gate B is blocked. See `PREORDER_MULTILINGUAL_WORKFLOW.md`, which this file's sections 8 and 10 now defer to
+for the pre-order workflow.
+
 ## 1. Confirmed architecture
 
 From the website developer (context; checked independently where section 2 says so):
@@ -107,7 +112,7 @@ remote state:
 |---|---|
 | `src/services/polylang_link_reader.py` | Strict read client. Any failure raises; it never means "no translations" or "absent" |
 | `src/services/polylang_bridge_writer.py` | Sorts each answer into `CONFIRMED`, `REFUSED` or `UNCERTAIN`. Never retries. Refuses the production host |
-| `src/services/translation_draft_runner.py` | One book, language by language, failures isolated, except a side-effect stop, which halts the book. Proposes mapping rows; **writes nothing to Supabase** |
+| `src/services/translation_draft_runner.py` | One book, **one language at a time**: a pending language is reconciled first and the other sends nothing until then (`WAITING_FOR_UNRECONCILED_LANGUAGE`, 2026-11-16). Failures isolated, except a side-effect stop, which halts the book. Proposes mapping rows; **writes nothing to Supabase** |
 | `src/domain/translation_create_state.py` | Stable request IDs and an atomic per-language checkpoint, written **before** the request leaves |
 | `src/domain/multilingual_adapter.py` | Group resolution and the per-language plan |
 | `src/domain/translation_book_input.py` | Builds the runner's `BookInput` from the real records: the RECORDED VI row with its baseline, plus exactly one APPROVED, final row per language. Refuses, with one code, a missing or ambiguous row, a translation approved before its VI source (`TRANSLATION_PREDATES_VI_APPROVAL`), or text the payload rejects. Renders through `create_woocommerce_draft.render_content`, the VI create path's own renderer |
@@ -131,8 +136,9 @@ VI author notes still render under "Tác giả".
 Recovery rule: after any uncertain answer the runner reads by request ID. A found
 product is finished through the same request ID (it cannot create a second one). An
 explicit "absent" allows the same request again. A failed read sends nothing. While one
-language is unreconciled, the other waits, because the unrecorded draft makes the group
-a `CONFLICT`.
+language is unreconciled, the other waits. Until 2026-11-16 that relied on the unrecorded
+draft making the group a `CONFLICT`, which a draft that died before its link does not do;
+the runner now enforces the wait itself (`PREORDER_MULTILINGUAL_WORKFLOW.md` section 3).
 
 ## 5. Local lab results
 
@@ -363,13 +369,15 @@ may ever do that is an owner decision (section 9).
 | A. Existing architecture verified | Hook list with fields and direction, from the real source | **Partial:** Polylang and WooCommerce verified; tooling ready; Flatsome Child and bulk-link not read |
 | B. Polylang read-only integration | Bridge read and client pass real tests; a read returns the same IDs as production hreflang | **Local only** (H13). Not installed anywhere real |
 | C. Local WordPress pilot | Matrix passes on real plugins | **Passed on the native stack, on SQLite and MariaDB, at production's versions (2026-11-07; one intermittent SQLite H09 stall, section 5.2)** |
-| D. Price, stock, backorders with the real customization | B11–B16 run with the real theme on MariaDB and are read by a person | **Blocked: developer source** |
+| D-A. Gate A, draft creation safety | 13 checks in the lab, then A05/A07/A08/A11 on an isolated copy of the real site through the black-box package | **Lab: passed 2026-11-16. Real copy: not run** |
+| D-B. Gate B, price, stock, backorders, orders with the real customization | B01–B07 observed on a real copy (black-box package), or B11–B16 with the source in the lab; read by a person | **Blocked: needs the developer** |
 | E. Controlled create interface | Stage D passes with no sibling side effect | Not started |
 | F. One authorized logical-book pilot, isolated copy | Owner authorization; isolation proof | Not started |
 | G. Production proposal and limited pilot | Separate owner authorization; write-guard change reviewed with the developer | Not started |
 | H. VI/EN/DE drafts in the standard Fahasa workflow | Several clean pilot batches | Not started |
 
-Passing one stage says nothing about the next.
+Passing one stage says nothing about the next. Gate A never counts as Gate B. Stages E to H for the
+pre-order workflow need Gate A on a real copy; anything touching a published product, a price or stock needs Gate B.
 
 ## 9. Open items
 
@@ -386,6 +394,11 @@ Passing one stage says nothing about the next.
 5. Confirm or change the EN/DE description headings (`DESCRIPTION_HEADINGS` in `scripts/create_woocommerce_draft.py`), especially the German author heading "Über den Autor / die Autorin". They appear only when an approved row has a substantive author note or a non-attribute details list.
 
 ## 10. Acceptance criteria for staging write tests
+
+Source-independent path (2026-11-16): where the developer cannot hand over source, group A below (source read)
+and group B (real code in TSYC's lab) are replaced by the developer running `tools/site_blackbox/` on their own
+isolated copy. Groups C, D and E still apply to that copy unchanged. The source path stays the stronger evidence,
+because a black-box run cannot see deferred or out-of-table writes.
 
 All must hold before `TSYC_BRIDGE_ENABLE_WRITES` is set on any site other than the local
 lab. **None is met yet except where marked.**

@@ -26,6 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from src.cli_bootstrap import configure_utf8_console  # noqa: E402
+from src.domain import product_workflow as pw  # noqa: E402
 from src.domain import translation_book_input as tbi  # noqa: E402
 from src.domain import translation_draft_plan as tdp  # noqa: E402
 
@@ -34,7 +35,7 @@ import create_woocommerce_draft as cwd  # noqa: E402  (renderer only)
 configure_utf8_console()
 
 REPORT_DIR = PROJECT_ROOT / "data" / "output" / "language_mapping" / "plan"
-CATALOG_FIELDS = "id,sku,status,manage_stock,stock_quantity,backorders,regular_price,sale_price"
+CATALOG_FIELDS = "id,sku,status,manage_stock,stock_quantity,backorders,regular_price,sale_price,meta_data"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,6 +55,10 @@ def main(argv: list[str] | None = None) -> int:
         for content in repository.client.table("product_contents").select(
                 ", ".join(tbi.CONTENT_COLUMNS)).execute().data or []:
             contents.setdefault(str(content["internal_product_id"]), []).append(content)
+        internal = {str(p["internal_product_id"]): p for p in repository.client.table("internal_products").select(
+            "internal_product_id, product_code, candidate_id, product_metadata").execute().data or []}
+        candidates = {str(c["candidate_id"]): c for c in repository.client.table("product_candidates").select(
+            "candidate_id, candidate_code, source_evidence").execute().data or []}
         reader = wrs_cli.build_reader(os.environ)
         catalog: dict[int, dict] = {}
         page, pages = 1, 1
@@ -72,15 +77,25 @@ def main(argv: list[str] | None = None) -> int:
     # Would the runner get a valid input from TSYC's own records? Independent
     # of the Woo-side blocker above: both must clear before any create.
     inputs = [tbi.build_book_input(row, contents.get(row.internal_product_id, []), cwd.render_content) for row in rows]
-    details = [{**plan.as_dict(), "content_input": {"ready": prepared.ready, "refusal": prepared.refusal,
-                                                     "detail": prepared.detail}}
-               for plan, prepared in zip(plans, inputs)]
+    # Which of the two workflows each book belongs to (src/domain/product_workflow.py).
+    # "Eligible" is about TSYC's records only; it authorizes nothing.
+    workflows = []
+    for row in rows:
+        product = internal.get(row.internal_product_id)
+        workflows.append(pw.classify(
+            row, catalog.get(int(row.woocommerce_product_id or 0)), contents.get(row.internal_product_id, []),
+            candidate=candidates.get(str((product or {}).get("candidate_id"))),
+            catalog_conflict=pw.catalog_conflict_from_marker(product)))
+    details = [{**plan.as_dict(), "workflow": decision.as_dict(),
+                "content_input": {"ready": prepared.ready, "refusal": prepared.refusal, "detail": prepared.detail}}
+               for plan, prepared, decision in zip(plans, inputs, workflows)]
     report = {"checked_at": datetime.now(timezone.utc).isoformat(), **tdp.summarize(plans),
+              "workflows": pw.summarize(workflows),
               "content_input": tbi.summarize(inputs), "books_detail": details}
     path = args.json_out or REPORT_DIR / f"plan_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
-    print(json.dumps({k: report[k] for k in ("checked_at", "books", "by_blocker", "all_languages_approved",
+    print(json.dumps({k: report[k] for k in ("checked_at", "books", "by_blocker", "workflows", "all_languages_approved",
                                              "content_input", "creates_possible_today")},
                      ensure_ascii=False, indent=1))
     print("Nothing was created, linked or modified.")

@@ -228,6 +228,11 @@ On 2026-11-07: 0 errors, 2 `WOO_STATUS_STALE_TERMINAL` (IMG-002-CAN-0019 existin
   - `scripts/discover_translation_candidates.py`: the review queue of existing copies.
   - `scripts/audit_language_product_mapping.py --remote`: exits 1 by design while CAN-0033 stays unresolved.
 - Local lab, synthetic data only: `tools/wp_lab/provision_lab.py`, then `tools/wp_lab/run_local_pilot.py`. A pass there is not evidence about the live theme hooks.
+- Pre-order first (2026-11-16), reference `PREORDER_MULTILINGUAL_WORKFLOW.md`:
+  - Two workflows. `NEW_PREORDER_PRODUCT`: a new Fahasa pre-order book whose VI product is still TSYC's unpriced draft. `EXISTING_PUBLISHED_PRODUCT`: everything live, where automation creates, links and edits nothing. `plan_translation_drafts.py` reports both (`workflows`).
+  - Two gates. Gate A (draft creation safety): `tools/wp_lab/run_preorder_gate_a.py`, passed in the lab only. Gate B (price, stock, orders on the real site): blocked. **Gate A never counts as Gate B, and a lab pass never enables a production write.**
+  - Run the lab pilots one at a time: they share one loopback port.
+  - For the developer: `tools/site_blackbox/` (its own README), run on an isolated copy only.
 
 ## 8. Recovery
 `RECOVERY_REQUIRED` means remote state could not be confirmed. Never retry
