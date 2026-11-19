@@ -125,6 +125,10 @@ def all_a(status: str = ig.CHECK_PASS) -> list[ig.CheckResult]:
     return [ig.CheckResult(cid, status) for cid in ig.GATE_A_CHECKS]
 
 
+def a_with(check_id: str, status: str) -> list[ig.CheckResult]:
+    return [ig.CheckResult(cid, status if cid == check_id else ig.CHECK_PASS) for cid in ig.GATE_A_CHECKS]
+
+
 def all_b(status: str) -> list[ig.CheckResult]:
     return [ig.CheckResult(cid, status, "seen") for cid in ig.GATE_B_CHECKS]
 
@@ -134,8 +138,8 @@ def test_gate_a_passes_only_with_every_check_passed() -> None:
     assert ig.evaluate_gate_a(all_a()[:-1], environment=ig.ENV_GENERIC_LOCAL_LAB).status == ig.GATE_INCOMPLETE
     assert ig.evaluate_gate_a([], environment=ig.ENV_GENERIC_LOCAL_LAB).status == ig.GATE_INCOMPLETE
     for bad, wanted in ((ig.CHECK_FAIL, ig.GATE_FAIL), (ig.CHECK_BLOCKED, ig.GATE_BLOCKED), (ig.CHECK_OBSERVED, ig.GATE_FAIL)):
-        results = all_a()[:-1] + [ig.CheckResult("A13", bad)]
-        assert ig.evaluate_gate_a(results, environment=ig.ENV_GENERIC_LOCAL_LAB).status == wanted
+        for check_id in ("A13", "A14", "A15"):
+            assert ig.evaluate_gate_a(a_with(check_id, bad), environment=ig.ENV_GENERIC_LOCAL_LAB).status == wanted
 
 
 def test_gate_results_refuse_unknown_and_repeated_checks() -> None:
@@ -169,20 +173,22 @@ def test_gate_b_never_passes_even_on_the_real_site() -> None:
 
 def test_a_lab_pass_of_gate_a_does_not_open_a_production_pilot() -> None:
     lab = ig.evaluate_gate_a(all_a(), environment=ig.ENV_GENERIC_LOCAL_LAB)
-    unmet = ig.production_pilot_requirements(gate_a_lab=lab, gate_a_site_copy=None,
-                                             developer_reviewed_bridge=True, owner_authorized_pilot=True)
-    assert unmet == ["Gate A has not been run on an isolated copy of the real site."]
+
+    def unmet(**overrides: Any) -> list[str]:
+        values = dict(gate_a_lab=lab, gate_a_site_copy=None, developer_reviewed_bridge=True, owner_authorized_pilot=True,
+                      scope=ig.DRAFT_ONLY_PILOT)
+        return ig.production_pilot_requirements(**{**values, **overrides})
+
+    missing = unmet()
+    assert len(missing) == 1 and missing[0].startswith(ig.BLOCKED_REAL_SITE_TEST)
     # A lab result handed in as the site-copy result is not accepted.
-    assert ig.production_pilot_requirements(gate_a_lab=lab, gate_a_site_copy=lab, developer_reviewed_bridge=True,
-                                            owner_authorized_pilot=True) == unmet
+    assert unmet(gate_a_site_copy=lab) == ["Gate A has not been run on an isolated copy of the real site."]
     site = ig.evaluate_gate_a(all_a(), environment=ig.ENV_ACTUAL_SITE_COPY)
-    assert ig.production_pilot_requirements(gate_a_lab=lab, gate_a_site_copy=site, developer_reviewed_bridge=True,
-                                            owner_authorized_pilot=True) == []
-    assert len(ig.production_pilot_requirements(gate_a_lab=lab, gate_a_site_copy=site, developer_reviewed_bridge=False,
-                                                owner_authorized_pilot=False)) == 2
-    failed = ig.evaluate_gate_a(all_a()[:-1] + [ig.CheckResult("A13", ig.CHECK_FAIL)], environment=ig.ENV_ACTUAL_SITE_COPY)
-    assert ig.production_pilot_requirements(gate_a_lab=lab, gate_a_site_copy=failed, developer_reviewed_bridge=True,
-                                            owner_authorized_pilot=True)
+    assert unmet(gate_a_site_copy=site) == []
+    assert len(unmet(gate_a_site_copy=site, developer_reviewed_bridge=False, owner_authorized_pilot=False)) == 2
+    failed = ig.evaluate_gate_a(a_with("A11", ig.CHECK_FAIL), environment=ig.ENV_ACTUAL_SITE_COPY)
+    assert unmet(gate_a_site_copy=failed)
+    assert unmet(gate_a_lab=None, gate_a_site_copy=site) == ["Gate A has not been run in the local lab."]
 
 
 def test_gate_a_never_stands_in_for_gate_b() -> None:
@@ -267,3 +273,74 @@ def test_a_missing_member_fails_every_check() -> None:
     products = trio()
     del products["de"]
     assert all(verify(products).values())
+
+
+# ------------------------------------------- Gate B deferral (owner decision)
+
+
+def test_gate_b_is_deferred_only_for_a_strictly_draft_only_pilot_and_never_passed() -> None:
+    blocked = ig.evaluate_gate_b([], environment=ig.ENV_GENERIC_LOCAL_LAB)
+    deferred = ig.defer_gate_b(blocked, ig.DRAFT_ONLY_PILOT)
+    assert deferred.status == ig.GATE_DEFERRED and deferred.status != ig.GATE_PASS
+    assert "Not passed" in deferred.reasons[0] and ig.GATE_BLOCKED in deferred.reasons[1]
+    assert ig.defer_gate_b(None, ig.DRAFT_ONLY_PILOT).status == ig.GATE_DEFERRED
+    # A Gate A result handed in is not Gate B.
+    gate_a = ig.evaluate_gate_a(all_a(), environment=ig.ENV_ACTUAL_SITE_COPY)
+    assert ig.defer_gate_b(gate_a, ig.DRAFT_ONLY_PILOT).gate == ig.GATE_B
+    # A Gate B that FAILED on the real site is never hidden behind a deferral.
+    failed = ig.evaluate_gate_b(all_b(ig.CHECK_OBSERVED)[:-1] + [ig.CheckResult("B07", ig.CHECK_FAIL)],
+                                environment=ig.ENV_ACTUAL_SITE_COPY)
+    assert ig.defer_gate_b(failed, ig.DRAFT_ONLY_PILOT).status == ig.GATE_FAIL
+
+
+SCOPE_FIELDS = ("creates_new_vi_en_de_drafts_only", "all_prices_left_empty", "nothing_published",
+                "no_customer_orders_accepted", "no_existing_published_product_modified",
+                "no_owner_maintained_product_updated", "inventory_sync_not_relied_on")
+
+
+def test_the_scope_has_exactly_the_seven_conditions_of_the_owner_decision() -> None:
+    assert tuple(ig.DraftOnlyPilotScope.__dataclass_fields__) == SCOPE_FIELDS
+    assert ig.DRAFT_ONLY_PILOT.violations() == []
+    assert len(ig.DraftOnlyPilotScope().violations()) == 7      # nothing is assumed
+
+
+@pytest.mark.parametrize("field", SCOPE_FIELDS)
+def test_any_step_outside_the_scope_brings_gate_b_back(field: str) -> None:
+    scope = ig.DraftOnlyPilotScope(**{name: name != field for name in SCOPE_FIELDS})
+    assert len(scope.violations()) == 1
+    blocked = ig.evaluate_gate_b([], environment=ig.ENV_GENERIC_LOCAL_LAB)
+    kept = ig.defer_gate_b(blocked, scope)
+    assert kept.status == ig.GATE_BLOCKED and any("Not deferrable" in reason for reason in kept.reasons)
+    lab = ig.evaluate_gate_a(all_a(), environment=ig.ENV_GENERIC_LOCAL_LAB)
+    site = ig.evaluate_gate_a(all_a(), environment=ig.ENV_ACTUAL_SITE_COPY)
+    unmet = ig.production_pilot_requirements(gate_a_lab=lab, gate_a_site_copy=site, developer_reviewed_bridge=True,
+                                             owner_authorized_pilot=True, scope=scope, gate_b=blocked)
+    assert len(unmet) == 2 and "Gate B is BLOCKED, and it is required" in unmet[1]
+
+
+def test_without_a_stated_scope_gate_b_is_required() -> None:
+    lab = ig.evaluate_gate_a(all_a(), environment=ig.ENV_GENERIC_LOCAL_LAB)
+    site = ig.evaluate_gate_a(all_a(), environment=ig.ENV_ACTUAL_SITE_COPY)
+    unmet = ig.production_pilot_requirements(gate_a_lab=lab, gate_a_site_copy=site, developer_reviewed_bridge=True,
+                                             owner_authorized_pilot=True)
+    assert len(unmet) == 8
+
+
+def test_deferring_gate_b_never_weakens_gate_a() -> None:
+    lab = ig.evaluate_gate_a(a_with("A14", ig.CHECK_FAIL), environment=ig.ENV_GENERIC_LOCAL_LAB)
+    unmet = ig.production_pilot_requirements(gate_a_lab=lab, gate_a_site_copy=None, developer_reviewed_bridge=True,
+                                             owner_authorized_pilot=True, scope=ig.DRAFT_ONLY_PILOT)
+    assert any("Gate A in the local lab is FAIL" in text for text in unmet)
+    assert any(text.startswith(ig.BLOCKED_REAL_SITE_TEST) for text in unmet)
+
+
+def test_a_site_copy_needs_its_own_subset_and_any_failure_counts() -> None:
+    site = ig.ENV_ACTUAL_SITE_COPY
+    subset = [ig.CheckResult(cid, ig.CHECK_PASS) for cid in ig.GATE_A_SITE_CHECKS]
+    assert ig.evaluate_gate_a(subset, environment=site).status == ig.GATE_PASS
+    assert ig.evaluate_gate_a(subset, environment=ig.ENV_GENERIC_LOCAL_LAB).status == ig.GATE_INCOMPLETE
+    assert ig.evaluate_gate_a(subset[:-1], environment=site).status == ig.GATE_INCOMPLETE
+    assert ig.evaluate_gate_a(subset[:-1] + [ig.CheckResult("A15", ig.CHECK_BLOCKED)], environment=site).status == ig.GATE_BLOCKED
+    # A failed check outside the subset still fails the gate.
+    assert ig.evaluate_gate_a(subset + [ig.CheckResult("A12", ig.CHECK_FAIL)], environment=site).status == ig.GATE_FAIL
+    assert set(ig.GATE_A_SITE_CHECKS) < set(ig.GATE_A_CHECKS) and {"A11", "A15"} <= set(ig.GATE_A_SITE_CHECKS)

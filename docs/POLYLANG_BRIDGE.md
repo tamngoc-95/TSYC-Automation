@@ -8,8 +8,20 @@ row exists because of it. Staging write tests are not yet allowed: see section 1
 
 **2026-11-16:** the new pre-order workflow is now separated from the existing-product workflow, and Stage D is
 split into Gate A (draft creation safety) and Gate B (live commerce synchronization). Gate A passed in the local
-lab; Gate B is blocked. See `PREORDER_MULTILINGUAL_WORKFLOW.md`, which this file's sections 8 and 10 now defer to
-for the pre-order workflow.
+lab (15 of 15 checks); Gate B is blocked, and by the owner's decision of 2026-11-16 it is `DEFERRED`, not passed,
+for a draft-only pilot. Gate A on the real site is `BLOCKED_REAL_SITE_TEST`. See `PREORDER_MULTILINGUAL_WORKFLOW.md`,
+which this file's sections 8 and 10 now defer to for the pre-order workflow.
+
+**The two "unexplained" lab stalls of sections 5.2 and 5.3 are explained** (same file, section 3.1): the laptop
+entered Modern Standby during H09 on 2026-11-07 and during H11 on 2026-11-15, as the Windows event log shows to
+the second. The wording "not explained" below is kept as written at the time; it is superseded. The pilots now ask
+Windows to stay awake, mark a test that overlapped a suspension `INVALID_HOST_SUSPENDED`, and keep PHP and database
+logs per run, which also covers the "PHP server log plus a slow-request trace" asked for in section 5.3.
+
+**2026-11-19 re-run, bridge 1.2.0, unchanged code, one pilot at a time:** Gate A `PASS` 15 of 15 on MariaDB and on
+SQLite; base pilot 25 `PASS_REAL_LOCAL`, 2 `BLOCKED_MISSING_DEPENDENCY`; hardening pilot 13 `PASS_REAL_LOCAL`, 8
+`PASS_SYNTHETIC_HOOK`, 6 `BLOCKED_MISSING_SOURCE`; 0 `FAIL`, 0 host suspensions, no stall (H09 84 s). Details and
+report folders: `PREORDER_MULTILINGUAL_WORKFLOW.md` section 3. Nothing was installed on any real site.
 
 ## 1. Confirmed architecture
 
@@ -369,8 +381,8 @@ may ever do that is an owner decision (section 9).
 | A. Existing architecture verified | Hook list with fields and direction, from the real source | **Partial:** Polylang and WooCommerce verified; tooling ready; Flatsome Child and bulk-link not read |
 | B. Polylang read-only integration | Bridge read and client pass real tests; a read returns the same IDs as production hreflang | **Local only** (H13). Not installed anywhere real |
 | C. Local WordPress pilot | Matrix passes on real plugins | **Passed on the native stack, on SQLite and MariaDB, at production's versions (2026-11-07; one intermittent SQLite H09 stall, section 5.2)** |
-| D-A. Gate A, draft creation safety | 13 checks in the lab, then A05/A07/A08/A11 on an isolated copy of the real site through the black-box package | **Lab: passed 2026-11-16. Real copy: not run** |
-| D-B. Gate B, price, stock, backorders, orders with the real customization | B01–B07 observed on a real copy (black-box package), or B11–B16 with the source in the lab; read by a person | **Blocked: needs the developer** |
+| D-A. Gate A, draft creation safety | 15 checks in the lab, then A05/A06/A07/A08/A10/A11/A15 on an isolated copy of the real site through the black-box package | **Lab: passed 2026-11-16. Real copy: `BLOCKED_REAL_SITE_TEST`** |
+| D-B. Gate B, price, stock, backorders, orders with the real customization | B01–B07 observed on a real copy (black-box package), or B11–B16 with the source in the lab; read by a person | **Blocked: needs the developer. `DEFERRED`, not passed, for a draft-only pilot (owner decision 2026-11-16)** |
 | E. Controlled create interface | Stage D passes with no sibling side effect | Not started |
 | F. One authorized logical-book pilot, isolated copy | Owner authorization; isolation proof | Not started |
 | G. Production proposal and limited pilot | Separate owner authorization; write-guard change reviewed with the developer | Not started |

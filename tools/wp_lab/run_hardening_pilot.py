@@ -770,6 +770,12 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     lab = Lab(args.lab_dir.resolve())
+    with base.lab_diagnostics.session(lab.dir, run_dir) as guard:
+        return _run(args, lab, run_dir, guard)
+
+
+def _run(args: argparse.Namespace, lab: Lab, run_dir: Path, guard: Any) -> int:
+    lab.diagnostics, lab.log_dir = guard, guard.log_dir
     lab.start_database()
     lab.wipe_products()
     lab.auth = ("lab-admin", lab.wp("user", "application-password", "create", "lab-admin", f"hardening-{time.time()}", "--porcelain"))
@@ -833,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
     lab.stop_database()
     report = {"ran_at": datetime.now(timezone.utc).isoformat(), "versions": versions, "database": lab.database,
               "not_in_lab": ["Flatsome + Flatsome Child", "pll-bulk-link-translations v1/v2", "Duplicate Post RB", "production data"],
-              "measured_hook_events": pilot.traces, "results": pilot.results}
+              "host": guard.summary(), "measured_hook_events": pilot.traces, "results": pilot.results}
     path = run_dir / "hardening_report.json"
     path.write_text(json.dumps(report, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
     if args.update_fixture:
@@ -844,8 +850,9 @@ def main(argv: list[str] | None = None) -> int:
     for item in pilot.results:
         counts[item["status"]] = counts.get(item["status"], 0) + 1
     print(json.dumps(counts))
+    print(json.dumps({"host_suspensions": len(report["host"]["host_suspensions"]), "cleanup_clean": report["host"]["cleanup"]["clean"]}))
     print(f"Report: {path}")
-    return 1 if counts.get(base.FAIL) else 0
+    return 1 if any(counts.get(status) for status in base.NOT_PASSED) or not report["host"]["cleanup"]["clean"] else 0
 
 
 if __name__ == "__main__":

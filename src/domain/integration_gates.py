@@ -18,6 +18,12 @@ Rules this module enforces, so no report can blur them:
     never PASS. With evidence it is OBSERVED: a person decides, never this code.
   * Nothing here enables a write. `production_pilot_requirements` only lists
     what is still unmet.
+
+Owner decision, 2026-11-16: Gate B is not required before an UNPRICED,
+UNPUBLISHED, draft-only multilingual pilot. That is a scope decision, not an
+authorization to write to production. Gate B is then DEFERRED, never PASSED,
+and only while the pilot stays inside `DraftOnlyPilotScope`. Gate A stays
+mandatory, in the lab and on a copy of the real site.
 """
 from __future__ import annotations
 
@@ -46,6 +52,9 @@ GATE_FAIL = "FAIL"
 GATE_BLOCKED = "BLOCKED"
 GATE_INCOMPLETE = "INCOMPLETE"
 GATE_OBSERVED_PENDING_DECISION = "OBSERVED_PENDING_DECISION"
+GATE_DEFERRED = "DEFERRED"                         # Gate B only: out of a draft-only pilot's scope. Never a pass.
+# Gate A on the real site when no isolated copy has been tested. Never a pass.
+BLOCKED_REAL_SITE_TEST = "BLOCKED_REAL_SITE_TEST"
 
 GATE_A_CHECKS: Mapping[str, str] = {
     "A01": "A genuinely new synthetic logical book is selected (workflow NEW_PREORDER_PRODUCT)",
@@ -61,7 +70,13 @@ GATE_A_CHECKS: Mapping[str, str] = {
     "A11": "No other product was created, changed or removed (whole-catalog snapshot)",
     "A12": "A repeated run sends nothing and creates no duplicate",
     "A13": "Interruption recovery and rollback leave no duplicate and no stray change",
+    "A14": "Catalog identity check: exact book and edition, no Woo or Facebook duplicate, no owner-removed match",
+    "A15": "Creating and linking EN/DE changed nothing on the VI draft (price, stock, backorders, SKU, images, status, owner fields)",
 }
+
+# What a copy of the real site can show through before/after snapshots. The
+# other checks are properties of TSYC's own code and records, proven in the lab.
+GATE_A_SITE_CHECKS = ("A05", "A06", "A07", "A08", "A10", "A11", "A15")
 
 GATE_B_CHECKS: Mapping[str, str] = {
     "B01": "Price synchronization between language copies with the site's customization",
@@ -118,12 +133,15 @@ def _collect(gate: str, results: Sequence[CheckResult]) -> dict[str, CheckResult
 
 
 def evaluate_gate_a(results: Sequence[CheckResult], *, environment: str) -> GateResult:
-    """PASS only when every check passed. OBSERVED is not accepted here: Gate
-    A checks are exact comparisons."""
+    """PASS only when every required check passed. OBSERVED is not accepted
+    here: Gate A checks are exact comparisons. In the lab every check is
+    required; on a copy of the real site, GATE_A_SITE_CHECKS."""
     if environment not in ENVIRONMENTS:
         raise ValueError(f"Unknown environment {environment!r}.")
     checks = _collect(GATE_A, results)
-    by = lambda status: sorted(cid for cid, c in checks.items() if c.status == status)  # noqa: E731
+    required = set(GATE_A_SITE_CHECKS) if environment == ENV_ACTUAL_SITE_COPY else set(GATE_A_CHECKS)
+    by = lambda status: sorted(cid for cid, c in checks.items()  # noqa: E731
+                               if c.status == status and (cid in required or status == CHECK_FAIL))
     if by(CHECK_FAIL):
         return GateResult(GATE_A, environment, GATE_FAIL, checks, tuple(f"{cid} failed" for cid in by(CHECK_FAIL)))
     if by(CHECK_OBSERVED):
@@ -164,22 +182,76 @@ def evaluate_gate_b(results: Sequence[CheckResult], *, environment: str) -> Gate
                       ("Every check was observed on the real customization; the owner and developer decide.",))
 
 
+@dataclass(frozen=True)
+class DraftOnlyPilotScope:
+    """The only pilot for which Gate B may be deferred (owner decision
+    2026-11-16). Every field must be True; anything else needs Gate B."""
+
+    creates_new_vi_en_de_drafts_only: bool = False
+    all_prices_left_empty: bool = False
+    nothing_published: bool = False
+    no_customer_orders_accepted: bool = False
+    no_existing_published_product_modified: bool = False
+    no_owner_maintained_product_updated: bool = False
+    inventory_sync_not_relied_on: bool = False
+
+    def violations(self) -> list[str]:
+        wording = {
+            "creates_new_vi_en_de_drafts_only": "The pilot does more than create new VI/EN/DE drafts.",
+            "all_prices_left_empty": "A price would be set.",
+            "nothing_published": "Something would be published.",
+            "no_customer_orders_accepted": "Real customer orders could be accepted.",
+            "no_existing_published_product_modified": "An existing published product would be modified.",
+            "no_owner_maintained_product_updated": "An owner-maintained product would be updated.",
+            "inventory_sync_not_relied_on": "The pilot relies on production inventory synchronization, which is untested.",
+        }
+        return [text for name, text in wording.items() if getattr(self, name) is not True]
+
+
+DRAFT_ONLY_PILOT = DraftOnlyPilotScope(True, True, True, True, True, True, True)
+
+
+def defer_gate_b(gate_b: GateResult | None, scope: DraftOnlyPilotScope) -> GateResult:
+    """Gate B as it stands for one pilot. DEFERRED only when the pilot is
+    strictly draft-only; otherwise the gate keeps whatever status it has
+    (BLOCKED when it was never run). DEFERRED is not a pass and is never
+    returned for a gate that FAILED on the real site."""
+    current = gate_b if gate_b is not None and gate_b.gate == GATE_B else GateResult(
+        GATE_B, ENV_GENERIC_LOCAL_LAB, GATE_BLOCKED, _collect(GATE_B, []), ("Gate B was never run.",))
+    violations = scope.violations()
+    if violations or current.status == GATE_FAIL:
+        return current if not violations else GateResult(
+            GATE_B, current.environment, current.status, current.checks,
+            current.reasons + tuple(f"Not deferrable: {text}" for text in violations))
+    return GateResult(GATE_B, current.environment, GATE_DEFERRED, current.checks,
+                      ("Deferred by owner decision 2026-11-16 for a draft-only pilot. Not passed.",
+                       f"Underlying status: {current.status}."))
+
+
 def production_pilot_requirements(
     *,
     gate_a_lab: GateResult | None,
     gate_a_site_copy: GateResult | None,
     developer_reviewed_bridge: bool,
     owner_authorized_pilot: bool,
+    scope: DraftOnlyPilotScope = DraftOnlyPilotScope(),
+    gate_b: GateResult | None = None,
 ) -> list[str]:
     """What still stands between today and one authorized production pilot of
     the NEW_PREORDER_PRODUCT workflow (three unpriced drafts). Empty means the
     owner may be asked for the go-ahead; it does not enable anything.
 
-    Gate B is deliberately not in this list: an unpriced draft cannot be
-    bought, and this workflow never writes a price or stock value afterwards.
-    Gate B stays required for any automation that touches a published
-    product, a price or stock, and for any claim about the site's sync."""
+    Gate B is not required for a pilot inside DraftOnlyPilotScope (owner
+    decision 2026-11-16): an unpriced draft cannot be bought, and this
+    workflow never writes a price or stock value afterwards. A pilot outside
+    that scope needs Gate B observed and decided, like any automation that
+    touches a published product, a price or stock."""
     unmet: list[str] = []
+    for text in scope.violations():
+        unmet.append(f"Outside the draft-only scope, so Gate B applies: {text}")
+    if scope.violations() or (gate_b is not None and gate_b.status == GATE_FAIL):
+        if gate_b is None or gate_b.status != GATE_OBSERVED_PENDING_DECISION:
+            unmet.append(f"Gate B is {gate_b.status if gate_b else GATE_BLOCKED}, and it is required for this pilot.")
 
     def need(result: GateResult | None, environment: str, label: str) -> None:
         if result is None or result.gate != GATE_A or result.environment != environment:
@@ -188,7 +260,10 @@ def production_pilot_requirements(
             unmet.append(f"Gate A {label} is {result.status}: {'; '.join(result.reasons) or 'see report'}.")
 
     need(gate_a_lab, ENV_GENERIC_LOCAL_LAB, "in the local lab")
-    need(gate_a_site_copy, ENV_ACTUAL_SITE_COPY, "on an isolated copy of the real site")
+    if gate_a_site_copy is None:
+        unmet.append(f"{BLOCKED_REAL_SITE_TEST}: Gate A has not been run on an isolated copy of the real site.")
+    else:
+        need(gate_a_site_copy, ENV_ACTUAL_SITE_COPY, "on an isolated copy of the real site")
     if not developer_reviewed_bridge:
         unmet.append("The developer has not reviewed the exact bridge file (by commit).")
     if not owner_authorized_pilot:

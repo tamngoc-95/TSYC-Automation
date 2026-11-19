@@ -49,6 +49,11 @@ def member(lang: str, *, bridge: bool = True, **overrides: Any) -> dict[str, Any
 BYSTANDERS = [product(1), product(2, language="en", translations={"en": 2})]
 
 
+def vi_alone(**overrides: Any) -> dict[str, Any]:
+    """The VI draft as it is before any translation exists."""
+    return member("vi", **{"translations": {"vi": TRIO["vi"]}, **overrides})
+
+
 def trio_products(**per_language: dict[str, Any]) -> list[dict[str, Any]]:
     bridge = per_language.pop("bridge", True)
     return [member(lang, bridge=bridge, **per_language.get(lang, {})) for lang in TRIO]
@@ -67,7 +72,8 @@ def statuses(report: dict[str, Any], key: str) -> dict[str, str]:
 
 def full_run(**changes: Any) -> dict[str, list[dict[str, Any]]]:
     """Every step, on a site that syncs nothing between copies."""
-    steps = {"00_baseline": list(BYSTANDERS), "01_trio_created": BYSTANDERS + trio_products()}
+    steps = {"00_baseline": list(BYSTANDERS), "00b_vi_created": BYSTANDERS + [vi_alone()],
+             "01_trio_created": BYSTANDERS + trio_products()}
     state = {lang: {} for lang in TRIO}
 
     def add(stem: str, lang: str, **fields: Any) -> None:
@@ -149,7 +155,7 @@ def test_complete_bridge_run_passes_gate_a_checks_and_only_observes_gate_b(tmp_p
 
 def test_a_site_that_syncs_prices_is_described_not_judged(tmp_path: Path) -> None:
     steps = full_run()
-    for stem in list(steps)[2:]:
+    for stem in list(steps)[3:]:
         for item in steps[stem]:
             if item["id"] in (TRIO["en"], TRIO["de"]) and stem == "02_price_on_vi":
                 item["regular_price"] = "111000"
@@ -161,7 +167,7 @@ def test_a_site_that_syncs_prices_is_described_not_judged(tmp_path: Path) -> Non
 
 def test_an_overwritten_owner_price_is_reported(tmp_path: Path) -> None:
     steps = full_run()
-    for stem in list(steps)[3:-1]:
+    for stem in list(steps)[4:-1]:
         for item in steps[stem]:
             if item["id"] == TRIO["vi"]:
                 item["regular_price"] = "222000"
@@ -185,7 +191,7 @@ def test_missing_steps_are_blocked_never_passed(tmp_path: Path) -> None:
 def test_a_change_outside_the_trio_fails_isolation(tmp_path: Path) -> None:
     steps = full_run()
     steps["04_stock_on_vi"][0]["stock_quantity"] = "3"   # a bystander lost stock
-    for stem in list(steps)[5:]:
+    for stem in list(steps)[6:]:
         steps[stem][0]["stock_quantity"] = "3"
     report = bbx.evaluate(write_run(tmp_path, steps))
     assert statuses(report, "gate_a_site_checks")["A11"] == bbx.FAIL
@@ -199,6 +205,7 @@ def test_a_price_or_wrong_inventory_on_the_new_drafts_fails(tmp_path: Path) -> N
         en={"regular_price": "5", "price": "5"}, de={"backorders": "no"})}
     site = statuses(bbx.evaluate(write_run(tmp_path, steps)), "gate_a_site_checks")
     assert site["A08"] == bbx.FAIL and site["A07"] == bbx.FAIL and site["A05"] == bbx.PASS
+    assert site["A15"] == bbx.BLOCKED       # no VI-only snapshot was taken
 
 
 def test_a_hand_made_trio_is_an_observation_not_a_gate_a_result(tmp_path: Path) -> None:
@@ -286,5 +293,192 @@ def test_the_driver_refuses_production_and_never_prices_or_publishes() -> None:
 def test_the_comparison_tool_needs_nothing_but_the_standard_library() -> None:
     source = (PACKAGE / "site_blackbox.py").read_text(encoding="utf-8")
     imports = set(re.findall(r"^(?:from|import)\s+([\w.]+)", source, flags=re.M))
-    assert imports <= {"__future__", "argparse", "json", "sys", "pathlib", "typing"}, imports
-    assert "requests" not in source and "urllib" not in source and "socket" not in source
+    assert imports <= {"__future__", "argparse", "json", "os", "shlex", "subprocess", "sys", "time", "pathlib", "typing"}, imports
+    assert "requests" not in source and "urllib" not in source and "socket" not in source and "http" not in source.lower()
+
+
+# ------------------------------------ did creating EN/DE change anything?
+
+
+def test_an_untouched_vi_draft_and_catalog_read_as_unchanged_in_every_group(tmp_path: Path) -> None:
+    report = bbx.evaluate(write_run(tmp_path, {k: v for k, v in full_run().items() if k < "02"}))
+    assert statuses(report, "gate_a_site_checks") == {cid: bbx.PASS for cid in ig.GATE_A_SITE_CHECKS}
+    assert report["real_site_compatibility"] == bbx.PASS
+    vi, others = report["compatibility"]["vi_draft"], report["compatibility"]["every_other_product"]
+    assert set(vi) == set(others) == set(bbx.FIELD_GROUPS)
+    assert vi["translation_links"] == "UNCHANGED apart from the two new links"
+    assert {value for group, value in vi.items() if group != "translation_links"} == {"UNCHANGED"}
+    assert set(others.values()) == {"UNCHANGED"}
+    gate = ig.evaluate_gate_a(ig.check_results(report["gate_a_site_checks"]), environment=ig.ENV_ACTUAL_SITE_COPY)
+    assert gate.status == ig.GATE_PASS
+
+
+@pytest.mark.parametrize("change, group", [
+    ({"regular_price": "50000", "price": "50000"}, "price"),
+    ({"stock_quantity": "3"}, "stock"),
+    ({"backorders": "no"}, "backorders"),
+    ({"sku": "CHANGED"}, "sku"),
+    ({"image_id": 99}, "images"),
+    ({"status": "publish"}, "status"),
+    ({"title": "Renamed"}, "owner_maintained_fields"),
+    ({"content_sha256": "other"}, "owner_maintained_fields"),
+    ({"modified_gmt": "2026-11-16 09:00:00"}, "saved_again"),
+])
+def test_a_change_to_the_vi_draft_during_the_create_fails_and_names_the_group(tmp_path: Path, change: dict[str, Any], group: str) -> None:
+    steps = {"00_baseline": BYSTANDERS, "00b_vi_created": BYSTANDERS + [vi_alone()],
+             "01_trio_created": BYSTANDERS + trio_products(vi=change)}
+    report = bbx.evaluate(write_run(tmp_path, steps))
+    assert statuses(report, "gate_a_site_checks")["A15"] == bbx.FAIL
+    assert report["compatibility"]["vi_draft"][group].startswith("CHANGED")
+    assert report["real_site_compatibility"] == bbx.FAIL
+
+
+def test_a_vi_draft_that_lost_or_gained_other_links_fails(tmp_path: Path) -> None:
+    steps = {"00_baseline": BYSTANDERS, "00b_vi_created": BYSTANDERS + [vi_alone(translations={"vi": TRIO["vi"], "en": 2})],
+             "01_trio_created": BYSTANDERS + trio_products()}
+    report = bbx.evaluate(write_run(tmp_path, steps))
+    assert statuses(report, "gate_a_site_checks")["A15"] == bbx.PASS     # it ended exactly as the trio
+    broken = {**steps, "01_trio_created": BYSTANDERS + trio_products(vi={"language": "en"})}
+    assert bbx.evaluate(write_run(tmp_path / "b", broken))["status"] == "TRIO_NOT_DETECTED"
+
+
+@pytest.mark.parametrize("field, group", [("regular_price", "price"), ("stock_quantity", "stock"), ("backorders", "backorders"),
+                                         ("sku", "sku"), ("image_id", "images"), ("status", "status"),
+                                         ("translations", "translation_links"), ("slug", "owner_maintained_fields")])
+def test_a_change_to_any_other_product_during_the_create_is_named_by_group(tmp_path: Path, field: str, group: str) -> None:
+    touched = copy.deepcopy(BYSTANDERS)
+    touched[0][field] = {"vi": 1, "en": 2} if field == "translations" else "x9"
+    steps = {"00_baseline": BYSTANDERS, "00b_vi_created": BYSTANDERS + [vi_alone()],
+             "01_trio_created": touched + trio_products()}
+    report = bbx.evaluate(write_run(tmp_path, steps))
+    assert report["compatibility"]["every_other_product"][group] == "CHANGED on #1"
+    assert statuses(report, "gate_a_site_checks")["A11"] == bbx.FAIL and report["real_site_compatibility"] == bbx.FAIL
+
+
+def test_copies_that_are_another_book_or_lost_the_image_fail(tmp_path: Path) -> None:
+    def run(folder: str, **per_language: Any) -> dict[str, str]:
+        steps = {"00_baseline": BYSTANDERS, "00b_vi_created": BYSTANDERS + [vi_alone()],
+                 "01_trio_created": BYSTANDERS + trio_products(**per_language)}
+        return statuses(bbx.evaluate(write_run(tmp_path / folder, steps)), "gate_a_site_checks")
+
+    assert run("sku", en={"sku": "OTHER-BOOK"})["A06"] == bbx.FAIL
+    assert run("copied", en={"sku": "NEW-1"})["A06"] == bbx.PASS            # the VI SKU copied by the site: one book
+    assert run("image", de={"image_id": 0})["A10"] == bbx.FAIL
+    assert run("gallery", de={"gallery_image_ids": [3]})["A10"] == bbx.FAIL
+
+
+@pytest.mark.parametrize("steps", [{}, {"00_baseline": BYSTANDERS},
+                                   {"00_baseline": BYSTANDERS, "01_trio_created": BYSTANDERS + trio_products()},
+                                   {"00_baseline": BYSTANDERS, "00b_vi_created": BYSTANDERS + [vi_alone()],
+                                    "01_trio_created": BYSTANDERS + trio_products(bridge=False)}])
+def test_without_a_complete_bridge_run_the_real_site_test_is_blocked_never_passed(tmp_path: Path, steps: dict[str, Any]) -> None:
+    report = bbx.evaluate(write_run(tmp_path, steps))
+    assert report["real_site_compatibility"] == bbx.BLOCKED_REAL_SITE_TEST
+    # The exit code must say the same: a blocked run (missing step, trio made by hand)
+    # is never 0, the code a script would read as PASS.
+    assert bbx.main(["evaluate", str(tmp_path)]) == 4
+
+
+# ------------------------------------------------- the one-command harness
+
+
+class FakeSite:
+    """Stands in for WP-CLI on a site copy: answers the snapshot and driver calls."""
+
+    def __init__(self, host: str = HOST, translate_ok: bool = True, change_bystander: bool = False) -> None:
+        self.host, self.translate_ok, self.change_bystander = host, translate_ok, change_bystander
+        self.products = copy.deepcopy(BYSTANDERS)
+        self.calls: list[list[str]] = []
+
+    def __call__(self, command: list[str], **_kwargs: Any) -> Any:
+        self.calls.append(list(command))
+        at = command.index("eval-file")      # after whatever starts WP-CLI on this machine
+        script, arguments = Path(command[at + 1]).name, command[at + 2:]
+        out, code = "", 0
+        if script == "tsyc-site-snapshot.php":
+            out = json.dumps(snapshot(self.products, self.host, arguments[0]))
+        elif arguments[0] == "create-vi":
+            self.products.append(vi_alone())
+            out = json.dumps({"tsyc_driver": 1, "ok": True, "trio": {"vi": TRIO["vi"]}, "answers": {}})
+        elif arguments[0] == "translate":
+            if self.translate_ok:
+                self.products = self.products[:2] + trio_products()
+                if self.change_bystander:
+                    self.products[0]["stock_quantity"] = "1"
+                out = json.dumps({"tsyc_driver": 1, "ok": True, "trio": TRIO, "answers": {}})
+            else:
+                out, code = json.dumps({"tsyc_driver": 1, "ok": False, "trio": {"vi": TRIO["vi"]},
+                                        "answers": {"en": {"http_status": 409, "code": "tsyc_sibling_side_effect"}}}), 4
+        elif arguments[0] == "cleanup":
+            for item in self.products[2:]:
+                item["status"] = "trash"
+            out = json.dumps({"tsyc_driver": 1, "ok": True, "trashed": TRIO})
+        return type("Done", (), {"stdout": ("Notice: x\n" + out + "\n").encode("utf-8"), "stderr": b"", "returncode": code})()
+
+    def writes(self) -> list[str]:
+        return [call[call.index("eval-file") + 2] for call in self.calls
+                if Path(call[call.index("eval-file") + 1]).name == "tsyc-bridge-trio-driver.php"]
+
+
+def harness(tmp_path: Path, site: FakeSite, **options: Any) -> dict[str, Any]:
+    waits: list[float] = []
+    report = bbx.run_gate_a(tmp_path / "run", wp=["wp", "--path=/copy"], user="admin", run=site, sleep=waits.append,
+                            say=lambda _line: None, **options)
+    report["_waits"] = waits
+    return report
+
+
+def test_harness_runs_the_whole_gate_a_site_test_in_order(tmp_path: Path) -> None:
+    site = FakeSite()
+    report = harness(tmp_path, site)
+    assert report["real_site_compatibility"] == bbx.PASS and report["_waits"] == [120.0]
+    assert site.writes() == ["create-vi", "translate", "cleanup"]
+    assert sorted(p.stem for p in (tmp_path / "run").glob("*.json")) == [
+        "00_baseline", "00b_vi_created", "01_trio_created", "10_cleanup", "blackbox_report"]
+    assert all(call[:3] == ["wp", "--path=/copy", "eval-file"] for call in site.calls)
+    assert all("--user=admin" in call for call in site.calls if "driver" in call[3])
+
+
+def test_harness_writes_nothing_on_the_production_host(tmp_path: Path) -> None:
+    site = FakeSite(host="tiemsachyeucon.com")
+    with pytest.raises(bbx.HarnessError, match="production host"):
+        harness(tmp_path, site)
+    assert site.writes() == []
+
+
+def test_harness_reports_a_bridge_stop_as_the_finding_and_retries_nothing(tmp_path: Path) -> None:
+    site = FakeSite(translate_ok=False)
+    report = harness(tmp_path, site)
+    assert site.writes().count("translate") == 1
+    assert report["real_site_compatibility"] != bbx.PASS and report["status"] == "TRIO_NOT_DETECTED"
+    assert report["harness"]["translate"]["answers"]["en"]["code"] == "tsyc_sibling_side_effect"
+
+
+def test_harness_fails_when_the_site_changed_another_product(tmp_path: Path) -> None:
+    report = harness(tmp_path, FakeSite(change_bystander=True))
+    assert report["real_site_compatibility"] == bbx.FAIL
+    assert report["compatibility"]["every_other_product"]["stock"] == "CHANGED on #1"
+
+
+def test_harness_never_mixes_two_runs_in_one_folder(tmp_path: Path) -> None:
+    harness(tmp_path, FakeSite())
+    again = FakeSite()
+    with pytest.raises(bbx.HarnessError, match="already holds snapshots"):
+        harness(tmp_path, again)
+    assert again.calls == []
+
+
+def test_harness_cli_reports_a_refusal_as_blocked_real_site_test(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                 capsys: pytest.CaptureFixture[str]) -> None:
+    site = FakeSite(host="www.tiemsachyeucon.com")
+    monkeypatch.setattr(bbx.subprocess, "run", site)
+    assert bbx.main(["run-gate-a", str(tmp_path / "r"), "--user", "admin", "--wait", "0"]) == 4
+    assert bbx.BLOCKED_REAL_SITE_TEST in capsys.readouterr().err
+    assert site.writes() == [] and site.calls[0][0] == "wp"     # the default command, and nothing written
+
+
+def test_the_driver_splits_into_two_steps_without_a_second_write_path() -> None:
+    code = php("tsyc-bridge-trio-driver.php")
+    assert code.count("function tsyc_bbx_translate(") == 1 and code.count("tsyc_bbx_bridge_post('translations'") == 1
+    assert code.count("new WC_Product_Simple") == 1
+    assert code.index("tsyc_bbx_guard();") < code.index("=== 'translate'") < code.index("=== 'create-vi'")

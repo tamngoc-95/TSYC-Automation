@@ -80,12 +80,14 @@ def provision_mariadb(lab: Path) -> Path:
     return home
 
 
-def start_mariadb(lab: Path) -> subprocess.Popen[bytes]:
-    """Loopback only. The caller stops it."""
+def start_mariadb(lab: Path, log: Path | None = None) -> subprocess.Popen[bytes]:
+    """Loopback only. The caller stops it. `log` keeps the server's console
+    output (its error log) for the run instead of discarding it."""
     home, data = lab / "mariadb", lab / "mariadb-data"
+    sink = open(log, "ab") if log is not None else subprocess.DEVNULL  # noqa: SIM115 - lives as long as the server
     server = subprocess.Popen([str(home / "bin" / "mariadbd.exe"), f"--datadir={data}", f"--port={MARIADB_PORT}",
                                "--bind-address=127.0.0.1", "--skip-name-resolve", "--console"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                              stdout=sink, stderr=sink)
     client = str(home / "bin" / "mariadb.exe")
     for _ in range(120):
         probe = subprocess.run([client, "-h127.0.0.1", f"-P{MARIADB_PORT}", "-uroot", "-e", "SELECT 1"], capture_output=True, timeout=30)

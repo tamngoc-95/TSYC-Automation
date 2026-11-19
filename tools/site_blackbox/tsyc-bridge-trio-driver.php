@@ -14,6 +14,9 @@
  *   wp eval-file tsyc-bridge-trio-driver.php create --user=ADMIN_LOGIN
  *       One synthetic VI draft (stock 0, backorders allowed, no price), then
  *       an EN and a DE draft through the bridge's own create route.
+ *   wp eval-file tsyc-bridge-trio-driver.php create-vi --user=ADMIN_LOGIN
+ *   wp eval-file tsyc-bridge-trio-driver.php translate VI_ID --user=ADMIN_LOGIN
+ *       The same in two steps, so a snapshot can be taken in between.
  *   wp eval-file tsyc-bridge-trio-driver.php cleanup VI_ID --user=ADMIN_LOGIN
  *       Moves that synthetic trio to the trash. Only products this driver made.
  *
@@ -81,27 +84,9 @@ function tsyc_bbx_bridge_post(string $route, array $body): array
 tsyc_bbx_guard();
 $tsyc_bbx_command = isset($args[0]) ? (string) $args[0] : '';
 
-if ($tsyc_bbx_command === 'create') {
-    $run = gmdate('Ymd-His');
-    $code = TSYC_BBX_SKU_PREFIX . $run;
-    $internal = wp_generate_uuid4();
-    $product = new WC_Product_Simple();
-    $product->set_name('TSYC blackbox test book ' . $run);
-    $product->set_status('draft');
-    $product->set_sku($code);
-    $product->set_description('<p>Synthetic test text (vi).</p>');
-    $product->set_short_description('Synthetic test (vi).');
-    $product->set_manage_stock(true);
-    $product->set_stock_quantity(0);
-    $product->set_backorders('yes');
-    $product->update_meta_data('_tsyc_internal_product_id', $internal);
-    $product->update_meta_data('_tsyc_product_code', $code);
-    $vi = $product->save();
-    if (!pll_get_post_language($vi)) {
-        pll_set_post_language($vi, pll_default_language());
-    }
-    $out = array('tsyc_driver' => 1, 'ok' => true, 'product_code' => $code, 'internal_product_id' => $internal,
-                 'trio' => array('vi' => $vi), 'answers' => array());
+/** EN then DE through the bridge. A refusal or a side-effect stop ends it: nothing is retried or repaired. */
+function tsyc_bbx_translate(int $vi, string $code, string $internal, string $run, array $out): array
+{
     foreach (array('en', 'de') as $lang) {
         clean_post_cache($vi);
         $modified = str_replace(' ', 'T', get_post($vi)->post_modified_gmt);
@@ -133,6 +118,47 @@ if ($tsyc_bbx_command === 'create') {
             break;
         }
     }
+    return $out;
+}
+
+if ($tsyc_bbx_command === 'translate') {
+    $vi = isset($args[1]) ? (int) $args[1] : 0;
+    $source = $vi > 0 ? wc_get_product($vi) : null;
+    $code = $source ? (string) $source->get_sku('edit') : '';
+    if (!$source || strpos($code, TSYC_BBX_SKU_PREFIX) !== 0) {
+        tsyc_bbx_stop('NOT_A_DRIVER_PRODUCT', "#$vi was not made by this driver (SKU prefix " . TSYC_BBX_SKU_PREFIX . ').');
+    }
+    $out = tsyc_bbx_translate($vi, $code, (string) get_post_meta($vi, '_tsyc_internal_product_id', true),
+        substr($code, strlen(TSYC_BBX_SKU_PREFIX)),
+        array('tsyc_driver' => 1, 'ok' => true, 'product_code' => $code, 'trio' => array('vi' => $vi), 'answers' => array()));
+    echo wp_json_encode($out) . "\n";
+    exit($out['ok'] ? 0 : 4);
+}
+
+if ($tsyc_bbx_command === 'create' || $tsyc_bbx_command === 'create-vi') {
+    $run = gmdate('Ymd-His');
+    $code = TSYC_BBX_SKU_PREFIX . $run;
+    $internal = wp_generate_uuid4();
+    $product = new WC_Product_Simple();
+    $product->set_name('TSYC blackbox test book ' . $run);
+    $product->set_status('draft');
+    $product->set_sku($code);
+    $product->set_description('<p>Synthetic test text (vi).</p>');
+    $product->set_short_description('Synthetic test (vi).');
+    $product->set_manage_stock(true);
+    $product->set_stock_quantity(0);
+    $product->set_backorders('yes');
+    $product->update_meta_data('_tsyc_internal_product_id', $internal);
+    $product->update_meta_data('_tsyc_product_code', $code);
+    $vi = $product->save();
+    if (!pll_get_post_language($vi)) {
+        pll_set_post_language($vi, pll_default_language());
+    }
+    $out = array('tsyc_driver' => 1, 'ok' => true, 'product_code' => $code, 'internal_product_id' => $internal,
+                 'trio' => array('vi' => $vi), 'answers' => array());
+    if ($tsyc_bbx_command === 'create') {
+        $out = tsyc_bbx_translate($vi, $code, $internal, $run, $out);
+    }
     echo wp_json_encode($out) . "\n";
     exit($out['ok'] ? 0 : 4);
 }
@@ -159,4 +185,4 @@ if ($tsyc_bbx_command === 'cleanup') {
     exit(0);
 }
 
-tsyc_bbx_stop('USAGE', 'Commands: create | cleanup VI_ID');
+tsyc_bbx_stop('USAGE', 'Commands: create | create-vi | translate VI_ID | cleanup VI_ID');

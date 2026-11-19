@@ -40,6 +40,8 @@ sys.path.insert(0, str(HERE.parent / "site_blackbox"))
 import run_local_pilot as base  # noqa: E402
 from run_local_pilot import AUTH_ID, HTTP_TIMEOUT, STORE, Check, Lab, Pilot, expect  # noqa: E402
 
+import catalog_identity_loader as cil  # noqa: E402  (the production catalog reader, pointed at the lab)
+import lab_diagnostics  # noqa: E402
 import site_blackbox as bbx  # noqa: E402
 
 from src.domain import candidate_origin  # noqa: E402
@@ -50,7 +52,9 @@ from src.domain import preorder_trio_verification as ptv  # noqa: E402
 from src.domain import product_workflow as pw  # noqa: E402
 from src.domain import translation_book_input as tbi  # noqa: E402
 from src.domain import translation_create_state as tcs  # noqa: E402
+from src.domain import woo_catalog_identity as wci  # noqa: E402
 from src.domain import woo_translation_group as wtg  # noqa: E402
+from src.domain.rules import catalog_identity_index as idx  # noqa: E402
 from src.domain.rules import preorder_inventory_rules as pir  # noqa: E402
 from src.services import polylang_bridge_writer as pbw  # noqa: E402
 from src.services import translation_draft_runner as tdr  # noqa: E402
@@ -61,6 +65,11 @@ SNAPSHOT_PHP = BLACKBOX_DIR / "tsyc-site-snapshot.php"
 DRIVER_PHP = BLACKBOX_DIR / "tsyc-bridge-trio-driver.php"
 
 CODE_PREFIX = f"{candidate_origin.FAHASA_DISCOVERY_CODE_PREFIX}LAB-CAN-"
+# Bystander titles the identity check must find again (owner style: "Title – Author").
+OWNER_LIVE_TITLE = "Chuyện Kể Phòng Thí Nghiệm Của Bé Na"
+OWNER_TRASHED_TITLE = "Những Người Bạn Trong Vườn Thí Nghiệm"
+OWNER_REMOVED_TITLE = "Bí Mật Của Chiếc Ống Nghiệm Nhỏ"
+FACEBOOK_TITLE = "Hành Trình Của Giọt Nước Thí Nghiệm"
 
 
 def uid(number: int) -> str:
@@ -91,6 +100,7 @@ class GateA(Pilot):
         self.checks: list[ig.CheckResult] = []
         self.extra: list[dict[str, Any]] = []
         self.snapshots: dict[str, dict[str, Any]] = {}
+        self.invalid: list[str] = []
 
     # ---- helpers ----------------------------------------------------------
 
@@ -104,12 +114,20 @@ class GateA(Pilot):
 
     def step(self, check_id: str, fn: Callable[[], dict[str, Any]], *, gate: bool = True) -> bool:
         started = time.time()
+        guard = self.lab.diagnostics
+        mark = guard.mark() if guard else None
         try:
             evidence, status = fn(), ig.CHECK_PASS
         except Check as error:
             evidence, status = {"failed": str(error)}, ig.CHECK_FAIL
         except Exception as error:  # noqa: BLE001 - one check never stops the run
             evidence, status = {"error": f"{type(error).__name__}: {error}", "trace": traceback.format_exc()[-1500:]}, ig.CHECK_FAIL
+        if guard and mark:
+            judged, evidence = base.judge_with_host_state(guard, mark, check_id, status, evidence, ig.CHECK_FAIL)
+            if judged == lab_diagnostics.INVALID_HOST_SUSPENDED:
+                # Not a product result: the check did not run to a verdict. Never a pass.
+                status = ig.CHECK_NOT_RUN
+                self.invalid.append(check_id)
         text = json.dumps(evidence, ensure_ascii=False, default=str)
         title = ig.GATE_A_CHECKS.get(check_id, check_id)
         if gate:
@@ -117,7 +135,7 @@ class GateA(Pilot):
         else:
             self.extra.append({"id": check_id, "status": status, "evidence": evidence})
         print(f"{status:<6} {check_id:<4} {title}  ({time.time() - started:.1f}s)", flush=True)
-        if status == ig.CHECK_FAIL:
+        if status != ig.CHECK_PASS:
             print(text[:2500], flush=True)
         return status == ig.CHECK_PASS
 
@@ -161,10 +179,35 @@ echo json_encode($out);""")
         return {"code": code, "internal": internal, "rows": rows, "media": media, "candidate": candidate,
                 "payload": payload, "vi": vi, "row": row}
 
+    # ---- catalog identity -------------------------------------------------
+
+    def catalog(self, auth: Any = "default") -> wci.CatalogSnapshot:
+        """The lab catalog through the production reader: every status, trash included."""
+        products, complete, reason = cil.load_woo_catalog(
+            products_url=f"{STORE}/wp-json/wc/v3/products", auth=self.lab.auth if auth == "default" else auth,
+            headers={"Accept": "application/json"}, timeout=HTTP_TIMEOUT)
+        return wci.CatalogSnapshot(
+            woo_products=products, complete=complete, incomplete_reason=reason,
+            # What TSYC's own records add: an owner-removed product whose Woo ID is gone, and a Facebook-derived candidate.
+            removed_entries=[idx.IndexEntry(origin=idx.ORIGIN_WOO_SYNC, ref="lab-removed-1", title=OWNER_REMOVED_TITLE,
+                                            remote_removed=True, status="REMOTE_DELETED")],
+            local_entries=[idx.IndexEntry(origin=idx.ORIGIN_CANDIDATE, ref="FB-HIST-LAB-CAN-0001", title=FACEBOOK_TITLE,
+                                          author="Lab Author F")])
+
+    def identity(self, title: str, code: str, *, author: str | None = "Lab Author A", auth: Any = "default") -> wci.CreateCheck:
+        return wci.check_before_create(idx.Listing(title=title, author=author), product_code=code, snapshot=self.catalog(auth))
+
+    def internal_with(self, check: wci.CreateCheck, code: str) -> dict[str, Any]:
+        return {"product_code": code, "product_metadata": {wci.MARKER_KEY: check.marker(
+            product_code=code, checked_at="2026-11-16T00:00:00+00:00", checked_by="lab")}}
+
     # ---- Gate A -----------------------------------------------------------
 
     def a01_new_book(self) -> dict[str, Any]:
         code = f"{CODE_PREFIX}0001"
+        self.new_check = self.identity(content_rows(uid(1), 1)[0]["product_name"], code)
+        expect(self.new_check.classification == wci.NEW_CONFIRMED,
+               f"The new book is {self.new_check.classification}: {self.new_check.reason}")
         candidate = {"candidate_code": code, "source_evidence": {"origin": candidate_origin.FAHASA_DISCOVERY_ORIGIN,
                                                                  "supply_status": pir.PREORDER_SUPPLY_STATUS}}
         expect(pir.is_fahasa_preorder_candidate(candidate), "Not a pre-order candidate.")
@@ -184,8 +227,11 @@ echo json_encode($out);""")
         expect(payload["status"] == "draft", payload["status"])
         group = self.reader.read_group(vi["id"])
         expect(group.lang == "vi" and dict(group.translations) == {"vi": vi["id"]}, f"{group}")
-        decision = pw.classify(self.b1["row"], vi, self.b1["rows"], candidate=self.b1["candidate"], catalog_conflict=False)
+        conflict = pw.catalog_conflict_from_marker(self.internal_with(self.new_check, self.b1["code"]))
+        expect(conflict is False, f"The stored NEW_CONFIRMED check reads as {conflict!r}.")
+        decision = pw.classify(self.b1["row"], vi, self.b1["rows"], candidate=self.b1["candidate"], catalog_conflict=conflict)
         expect(decision.eligible, f"Workflow: {decision.as_dict()}")
+        self.snapshot("s0b_vi_created")
         unchecked = pw.classify(self.b1["row"], vi, self.b1["rows"], candidate=self.b1["candidate"], catalog_conflict=None)
         expect(not unchecked.eligible, "A book without a catalog check was eligible.")
         return {"vi_product_id": vi["id"], "sku": vi["sku"], "status": vi["status"], "workflow": decision.workflow,
@@ -241,6 +287,52 @@ echo json_encode($out);""")
             expect(not problems, "; ".join(problems))
             return evidence()
         return run
+
+    def a14_catalog_identity(self) -> dict[str, Any]:
+        """The mandatory identity check, on the real lab catalog, for every
+        way a book can turn out not to be new. Only NEW_CONFIRMED may be created."""
+        code, other = self.b1["code"], f"{CODE_PREFIX}0099"
+        cases = {
+            "already_in_woo_published": (self.identity(OWNER_LIVE_TITLE, other, author="Lab Author B"), {wci.EXISTING_PRODUCT}),
+            "another_edition_of_a_live_book": (self.identity(f"{OWNER_LIVE_TITLE} (Tái bản 2026)", other, author="Lab Author B"),
+                                               {wci.EXISTING_PRODUCT, wci.DISTINCT_EDITION, wci.POSSIBLE_DUPLICATE}),
+            "owner_trashed_in_woo": (self.identity(OWNER_TRASHED_TITLE, other, author="Lab Author C"), {wci.REMOTE_REMOVED}),
+            # Without the author the owner's "Title – Author" name is only contained, not equal: a person decides.
+            "owner_trashed_author_unknown": (self.identity(OWNER_TRASHED_TITLE, other, author=None),
+                                             {wci.REMOTE_REMOVED, wci.POSSIBLE_DUPLICATE}),
+            "owner_removed_woo_id_gone": (self.identity(OWNER_REMOVED_TITLE, other, author=None), {wci.REMOTE_REMOVED}),
+            "facebook_derived_candidate": (self.identity(FACEBOOK_TITLE, other, author="Lab Author F"),
+                                           {wci.EXISTING_PRODUCT, wci.POSSIBLE_DUPLICATE}),
+            "same_sku_after_the_create": (self.identity(self.b1["rows"][0]["product_name"], code), {wci.EXISTING_PRODUCT}),
+            "catalog_read_failed": (self.identity("Một Cuốn Sách Hoàn Toàn Khác", other, auth=("lab-admin", "wrong wrong wrong")),
+                                    {wci.CATALOG_UNAVAILABLE}),
+            "no_usable_title": (self.identity("", other), {wci.IDENTITY_CONFLICT}),
+        }
+        evidence: dict[str, Any] = {"new_book": self.new_check.classification}
+        for name, (check, allowed) in cases.items():
+            expect(check.classification in allowed, f"{name}: {check.classification} ({check.reason})")
+            expect(not check.create_allowed, f"{name}: a create would be allowed.")
+            conflict = pw.catalog_conflict_from_marker(self.internal_with(check, other))
+            decision = pw.classify(self.b1["row"], self.b1["vi"], self.b1["rows"], candidate=self.b1["candidate"],
+                                   catalog_conflict=conflict)
+            expect(not decision.eligible, f"{name}: the workflow stayed eligible with catalog_conflict={conflict!r}.")
+            evidence[name] = {"classification": check.classification, "workflow_blockers": list(decision.blockers)}
+        return evidence
+
+    def a15_vi_unchanged(self) -> dict[str, Any]:
+        """Creating and linking EN and DE must leave the VI draft exactly as it was."""
+        vi_id = str(self.b1["ids"]["vi"])
+        was = bbx.normalize(self.snapshots["s0b_vi_created"]["products"][vi_id])
+        now = bbx.normalize(self.snapshots["s1_after_create"]["products"][vi_id])
+        changed = {name: [was.get(name), now.get(name)] for name in sorted(set(was) | set(now)) if was.get(name) != now.get(name)}
+        expect(set(changed) == {"translations"}, f"The VI draft changed beyond its links: {changed}")
+        expect(now["translations"] == self.b1["ids"], f"{now['translations']}")
+        rest = self.lab.product(int(vi_id))
+        expect(rest["date_modified_gmt"] == self.b1["vi"]["date_modified_gmt"], "The VI draft was saved again.")
+        groups = {group: "UNCHANGED" for group in bbx.FIELD_GROUPS}
+        groups["translation_links"] = "UNCHANGED apart from the two new links"
+        return {"vi_product_id": int(vi_id), "fields_compared": len(was), "by_group": groups,
+                "modified_gmt": rest["date_modified_gmt"]}
 
     def a11_nothing_else(self) -> dict[str, Any]:
         delta = bbx.diff_snapshots(self.snapshots["s0_before"], self.snapshot("s1_after_create"))
@@ -330,12 +422,18 @@ echo json_encode(count($ids));""")
 
     def x01_blackbox_package(self) -> dict[str, Any]:
         folder = self.run_dir / "blackbox"
-        self.snapshot("00_baseline", folder)
-        raw = self.lab.wp("eval-file", str(DRIVER_PHP), "create", "--user=lab-admin")
-        driver = json.loads(raw.strip().splitlines()[-1])
-        expect(driver.get("ok") and set(driver["trio"]) == {"vi", "en", "de"}, f"driver: {driver}")
-        trio = {k: int(v) for k, v in driver["trio"].items()}
-        self.snapshot("01_trio_created", folder)
+        # The developer's one command, exactly as they would run it (a short wait: the lab has no delayed jobs).
+        wp = [str(self.lab.php), "-c", str(self.lab.ini), str(self.lab.cli), f"--path={self.lab.site}"]
+        first = bbx.run_gate_a(folder, wp=wp, user="lab-admin", wait_seconds=2, cleanup=False, say=lambda _line: None)
+        expect(first["real_site_compatibility"] == bbx.PASS, f"harness: {first['real_site_compatibility']} {first['gate_a_site_checks']}")
+        expect(set(first["compatibility"]["every_other_product"].values()) - {first["compatibility"]["other_products_compared"]}
+               == {"UNCHANGED"}, f"{first['compatibility']}")
+        trio = {k: int(v) for k, v in first["trio"].items()}
+        try:
+            bbx.run_gate_a(folder, wp=wp, user="lab-admin", wait_seconds=0, say=lambda _line: None)
+            raise Check("The harness reused a folder that already held snapshots.")
+        except bbx.HarnessError:
+            pass
         # Native baseline for Gate B: plain REST saves, no theme. Orders are not placed.
         for label, lang, body in (("02_price_on_vi", "vi", {"regular_price": "111000"}),
                                   ("03_price_on_en", "en", {"regular_price": "222000"}),
@@ -352,11 +450,15 @@ echo json_encode(count($ids));""")
         expect(report["status"] == "EVALUATED" and report["trio"] == trio, f"{report['status']} {report['trio']}")
         expect(report["created_by"] == bbx.CREATED_BY_BRIDGE, report["created_by"])
         site = {c["id"]: c["status"] for c in report["gate_a_site_checks"]}
-        expect(site == {"A05": bbx.PASS, "A07": bbx.PASS, "A08": bbx.PASS, "A11": bbx.PASS}, f"{report['gate_a_site_checks']}")
+        expect(site == {cid: bbx.PASS for cid in ig.GATE_A_SITE_CHECKS}, f"{report['gate_a_site_checks']}")
+        as_site = ig.evaluate_gate_a(ig.check_results(report["gate_a_site_checks"]), environment=ig.ENV_ACTUAL_SITE_COPY)
+        expect(as_site.status == ig.GATE_PASS, f"The package's checks do not add up to a site-copy Gate A: {as_site.reasons}")
         observed = {c["id"]: c["status"] for c in report["gate_b_checks"]}
         expect(observed["B04"] == bbx.BLOCKED and observed["B05"] == bbx.BLOCKED, f"Order steps were not run: {observed}")
         self.blackbox_report = report
         return {"driver_trio": trio, "package_gate_a_checks": site, "package_gate_b_checks": observed,
+                "one_command_harness": first["real_site_compatibility"], "compatibility": first["compatibility"],
+                "second_run_into_same_folder": "refused",
                 "note": "Lab stack only. On this stack the package's Gate B lines are the native baseline, never the store's."}
 
     def x02_driver_guards(self) -> dict[str, Any]:
@@ -379,6 +481,12 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     lab = Lab(args.lab_dir.resolve())
+    with lab_diagnostics.session(lab.dir, run_dir) as guard:
+        return _run(lab, run_dir, guard)
+
+
+def _run(lab: Lab, run_dir: Path, guard: lab_diagnostics.Session) -> int:
+    lab.diagnostics, lab.log_dir = guard, guard.log_dir
     lab.start_database()
     lab.wipe_products()
     lab.auth = ("lab-admin", lab.wp("user", "application-password", "create", "lab-admin", f"gate-a-{time.time()}", "--porcelain"))
@@ -393,7 +501,16 @@ def main(argv: list[str] | None = None) -> int:
         # trio and an unrelated TSYC draft of another book.
         owner_trio = gate._published_group("BYSTANDER", "lab-bystander")
         _other_book, other_vi = gate.make_book(f"{base.SKU_PREFIX}OTHER", uid(900))
-        gate.bystanders = {"owner_published_trio": owner_trio, "unrelated_tsyc_draft": other_vi["id"]}
+        # The owner's own books, for the identity check: one live, one in the trash.
+        made = {}
+        for key, title, author in (("live", OWNER_LIVE_TITLE, "Lab Author B"), ("trashed", OWNER_TRASHED_TITLE, "Lab Author C")):
+            response = lab.wc("POST", "products", json={"name": f"{title} – {author}", "status": "publish", "type": "simple",
+                                                        "regular_price": "99000"})
+            expect(response.status_code == 201, f"bystander {key}: {response.status_code}")
+            made[key] = response.json()["id"]
+        expect(lab.wc("DELETE", f"products/{made['trashed']}").status_code == 200, "The bystander could not be trashed.")
+        gate.bystanders = {"owner_published_trio": owner_trio, "unrelated_tsyc_draft": other_vi["id"],
+                           "owner_live_book": made["live"], "owner_trashed_book": made["trashed"]}
         gate.b1 = {}
 
         gate.step("A01", gate.a01_new_book)
@@ -413,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
                                                                "attributes": {a["name"]: a["options"] for a in p["attributes"]},
                                                                "weight": p.get("weight")} for k, p in b1["products"].items()}))
             gate.step("A11", gate.a11_nothing_else)
+            gate.step("A15", gate.a15_vi_unchanged)
+            gate.step("A14", gate.a14_catalog_identity)
             gate.step("A12", gate.a12_repeat)
             gate.step("A13", gate.a13_recovery_and_rollback)
             gate.step("X01", gate.x01_blackbox_package, gate=False)
@@ -422,25 +541,36 @@ def main(argv: list[str] | None = None) -> int:
         lab.stop_all()
         lab.stop_database()
 
+    host = guard.summary()
     gate_a = ig.evaluate_gate_a(gate.checks, environment=ig.ENV_GENERIC_LOCAL_LAB)
     baseline = ig.check_results(getattr(gate, "blackbox_report", {}).get("gate_b_checks", []))
     gate_b = ig.evaluate_gate_b(baseline, environment=ig.ENV_GENERIC_LOCAL_LAB)
+    deferred = ig.defer_gate_b(gate_b, ig.DRAFT_ONLY_PILOT)
     report = {
         "ran_at": datetime.now(timezone.utc).isoformat(), "versions": versions, "database": lab.database,
         "not_in_lab": ["Flatsome + Flatsome Child", "pll-bulk-link-translations v1/v2", "Duplicate Post RB", "production data"],
-        "gate_a": gate_a.as_dict(), "gate_b": gate_b.as_dict(), "blackbox_package_self_test": gate.extra,
+        "host": host, "checks_invalid_host_suspended": gate.invalid,
+        "gate_a": gate_a.as_dict(), "gate_b": gate_b.as_dict(),
+        "gate_b_for_a_draft_only_pilot": {"status": deferred.status, "reasons": list(deferred.reasons)},
+        "real_site_gate_a": ig.BLOCKED_REAL_SITE_TEST,
+        "blackbox_package_self_test": gate.extra,
         "production_pilot_unmet": ig.production_pilot_requirements(
-            gate_a_lab=gate_a, gate_a_site_copy=None, developer_reviewed_bridge=False, owner_authorized_pilot=False),
+            gate_a_lab=gate_a, gate_a_site_copy=None, developer_reviewed_bridge=False, owner_authorized_pilot=False,
+            scope=ig.DRAFT_ONLY_PILOT, gate_b=gate_b),
         "production_writes": {"woo": 0, "polylang_links": 0, "price_or_stock": 0, "publish": 0},
     }
     path = run_dir / "gate_report.json"
     path.write_text(json.dumps(report, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
     print(f"GATE A ({gate_a.environment}): {gate_a.status}  {list(gate_a.reasons)}")
     print(f"GATE B ({gate_b.environment}): {gate_b.status}  {list(gate_b.reasons)}")
+    print(f"GATE B for a draft-only pilot: {deferred.status} (not passed)")
+    print(f"GATE A on the real site: {ig.BLOCKED_REAL_SITE_TEST}")
+    print(json.dumps({"host_suspensions": len(host["host_suspensions"]), "invalid_checks": gate.invalid,
+                      "cleanup_clean": host["cleanup"]["clean"], "stay_awake": host["stay_awake_accepted"]}))
     print(f"Black-box package self-test: { {item['id']: item['status'] for item in gate.extra} }")
     print(f"Report: {path}")
     package_ok = all(item["status"] == ig.CHECK_PASS for item in gate.extra) and len(gate.extra) == 2
-    return 0 if gate_a.status == ig.GATE_PASS and package_ok else 1
+    return 0 if gate_a.status == ig.GATE_PASS and package_ok and host["cleanup"]["clean"] else 1
 
 
 if __name__ == "__main__":

@@ -4,15 +4,21 @@ Standard library only: this file runs on its own, without the TSYC repository,
 a database, a network connection or any credential. It reads snapshot JSON
 files and writes a report. It never contacts a website.
 
-  diff      what changed between two snapshots
-  evaluate  judge a scenario folder (README.md) against Gate A (site copy)
-            and record what was observed for Gate B
+  run-gate-a  one command: snapshot, create a synthetic trio through the TSYC
+              bridge, snapshot again, clean up, and judge (needs WP-CLI)
+  diff        what changed between two snapshots
+  evaluate    judge a scenario folder (README.md) against Gate A (site copy)
+              and record what was observed for Gate B
 
 A step whose snapshot is missing is BLOCKED, never PASS. A Gate B result is an
 OBSERVED fact for a person to read, never a machine pass. Snapshots taken on
 the production host are refused: the scenario writes test products.
 
+The only thing run-gate-a starts is the WP-CLI command you give it, with the
+two PHP files next to this one. It opens no network connection itself.
+
 Usage:
+  python site_blackbox.py run-gate-a RUN_FOLDER --user ADMIN_LOGIN [--wp "wp --path=/var/www/copy"]
   python site_blackbox.py diff BEFORE.json AFTER.json
   python site_blackbox.py evaluate RUN_FOLDER [--json-out REPORT.json]
 """
@@ -20,9 +26,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
+import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 SNAPSHOT_VERSION = 1
 PRODUCTION_HOSTS = frozenset({"tiemsachyeucon.com", "www.tiemsachyeucon.com"})
@@ -35,10 +45,27 @@ COMMERCE_FIELDS = ("status", "regular_price", "sale_price", "price", "manage_sto
 LANGUAGES = ("vi", "en", "de")
 
 PASS, FAIL, BLOCKED, OBSERVED = "PASS", "FAIL", "BLOCKED", "OBSERVED"
+# No valid test on a copy of the real site exists. Never a pass.
+BLOCKED_REAL_SITE_TEST = "BLOCKED_REAL_SITE_TEST"
+
+# What "did creating the EN/DE drafts change anything?" is answered for, field by field.
+FIELD_GROUPS: Mapping[str, tuple[str, ...]] = {
+    "price": ("regular_price", "sale_price", "price"),
+    "stock": ("manage_stock", "stock_quantity", "stock_status", "total_sales"),
+    "backorders": ("backorders",),
+    "sku": ("sku",),
+    "images": ("image_id", "gallery_image_ids"),
+    "status": ("status", "type"),
+    "translation_links": ("language", "translations"),
+    "owner_maintained_fields": ("title", "slug", "content_sha256", "excerpt_sha256", "category_ids", "attributes_sha256",
+                                "upsell_ids", "cross_sell_ids", "weight", "tsyc_internal_product_id", "tsyc_language"),
+    "saved_again": ("modified_gmt",),
+}
 
 # Scenario steps, in order: file stem -> what the tester did just before it.
 STEPS: tuple[tuple[str, str], ...] = (
     ("00_baseline", "Nothing yet: the isolated copy as it is"),
+    ("00b_vi_created", "The new VI draft only (stock 0, backorders allowed, no price), before any translation"),
     ("01_trio_created", "New VI draft (stock 0, backorders allowed, no price), then + EN and + DE, all saved as drafts"),
     ("02_price_on_vi", "Regular price 111000 entered on the VI product only"),
     ("03_price_on_en", "Regular price 222000 entered on the EN product only"),
@@ -181,13 +208,14 @@ def evaluate(run_dir: Path) -> dict[str, Any]:
     hosts = sorted({str(s["site"].get("host") or "") for s in snapshots.values()})
     report: dict[str, Any] = {"run_dir": str(run_dir), "hosts": hosts, "snapshot_problems": problems,
                               "steps_present": sorted(snapshots), "site": next(iter(snapshots.values()), {}).get("site"),
-                              "status": "EVALUATED", "trio": None, "isolation": {},
+                              "status": "EVALUATED", "trio": None, "isolation": {}, "compatibility": {},
+                              "real_site_compatibility": BLOCKED_REAL_SITE_TEST,
                               "gate_a_site_checks": [], "gate_b_checks": []}
 
     def check(target: str, check_id: str, status: str, evidence: str) -> None:
         report[target].append({"id": check_id, "status": status, "evidence": evidence})
 
-    a_ids = ("A05", "A07", "A08", "A11")
+    a_ids = ("A05", "A06", "A07", "A08", "A10", "A11", "A15")
     b_ids = ("B01", "B02", "B03", "B04", "B05", "B06", "B07")
 
     def block_all(reason: str) -> dict[str, Any]:
@@ -225,6 +253,24 @@ def evaluate(run_dir: Path) -> dict[str, Any]:
 
     # ---- Gate A on the site copy: what creating and linking the trio did.
     check("gate_a_site_checks", "A05", PASS, f"Three new products, one per language, each linked to the other two: {trio}.")
+    members = {lang: normalize(created["products"][str(pid)]) for lang, pid in trio.items()}
+    vi = members["vi"]
+    same_book = [f"{lang} #{trio[lang]}: {why}" for lang in ("en", "de") for why in (
+        "carries another internal product ID" if members[lang].get("tsyc_internal_product_id") != vi.get("tsyc_internal_product_id") else "",
+        f"language mark is {members[lang].get('tsyc_language')!r}" if members[lang].get("tsyc_language") != lang else "",
+        f"has a different SKU {members[lang].get('sku')!r}" if members[lang].get("sku") not in ("", vi.get("sku")) else "",
+        f"is a {members[lang].get('type')!r} product" if members[lang].get("type") != vi.get("type") else "") if why]
+    if not vi.get("tsyc_internal_product_id"):
+        same_book.insert(0, "the VI draft carries no TSYC internal product ID")
+    check("gate_a_site_checks", "A06", FAIL if same_book else PASS,
+          ("Not one sellable book: " + " | ".join(same_book)) if same_book
+          else f"Same internal product on all three, language marks right, copies have no SKU or the VI SKU ({vi.get('sku')!r}).")
+    media = [f"{lang} #{trio[lang]} {name}: {members[lang].get(name)!r}, VI has {vi.get(name)!r}"
+             for lang in ("en", "de") for name in ("image_id", "gallery_image_ids", "weight")
+             if members[lang].get(name) != vi.get(name)]
+    check("gate_a_site_checks", "A10", FAIL if media else PASS,
+          ("Copies differ from the VI draft: " + " | ".join(media)) if media
+          else f"Both copies carry the VI draft's main image ({vi.get('image_id')}), gallery and weight.")
     shape = _fields(created, trio, ["status", "manage_stock", "stock_quantity", "backorders", "sku"])
     wrong = [f"{lang}: {values}" for lang, values in shape.items()
              if not (values.get("status") == "draft" and values.get("manage_stock") is True
@@ -248,6 +294,46 @@ def evaluate(run_dir: Path) -> dict[str, Any]:
     check("gate_a_site_checks", "A11", FAIL if leaks else PASS,
           ("Products outside the trio changed. " + " | ".join(leaks)) if leaks
           else f"No product outside the trio differs across {len(present)} snapshots ({len(base['products'])} products in the baseline).")
+
+    # Did creating and linking EN/DE change the VI draft itself? Needs the VI-only snapshot.
+    vi_changes: dict[str, list[Any]] | None = None
+    if "00b_vi_created" in snapshots and str(trio["vi"]) in snapshots["00b_vi_created"]["products"]:
+        was, now = normalize(snapshots["00b_vi_created"]["products"][str(trio["vi"])]), members["vi"]
+        vi_changes = {name: [was.get(name), now.get(name)] for name in sorted(set(was) | set(now))
+                      if was.get(name) != now.get(name) and name != "translations"}
+        if now.get("translations") != trio:
+            vi_changes["translations"] = [was.get("translations"), now.get("translations")]
+        check("gate_a_site_checks", "A15", FAIL if vi_changes else PASS,
+              (f"The VI draft #{trio['vi']} changed while EN/DE were created: {vi_changes}") if vi_changes
+              else f"The VI draft #{trio['vi']} is identical before and after, apart from its two new translation links.")
+    else:
+        check("gate_a_site_checks", "A15", BLOCKED, "Snapshot 00b_vi_created (the VI draft before any translation) is missing.")
+
+    # Field by field: what creating the drafts did to the VI draft and to every other product.
+    creation = [stem for stem in ("00_baseline", "00b_vi_created", "01_trio_created") if stem in snapshots]
+    others: dict[str, set[str]] = {}
+    for previous, current in zip(creation, creation[1:]):
+        for pid, fields in outside_changes(diff_snapshots(snapshots[previous], snapshots[current]), trio_ids)["changed"].items():
+            for name in fields:
+                others.setdefault(name, set()).add(pid)
+
+    def vi_verdict(names: Sequence[str]) -> str:
+        if vi_changes is None:
+            return BLOCKED
+        hit = [name for name in names if name in vi_changes]
+        return "CHANGED: " + ", ".join(hit) if hit else "UNCHANGED"
+
+    def others_verdict(names: Sequence[str]) -> str:
+        hit = sorted({pid for name in names for pid in others.get(name, ())}, key=int)
+        return "CHANGED on #" + ", #".join(hit) if hit else "UNCHANGED"
+
+    report["compatibility"] = {
+        "vi_draft": {group: vi_verdict(names) for group, names in FIELD_GROUPS.items()},
+        "every_other_product": {group: others_verdict(names) for group, names in FIELD_GROUPS.items()},
+        "other_products_compared": len(base["products"]),
+    }
+    if vi_changes is not None and "translations" not in vi_changes and "language" not in vi_changes:
+        report["compatibility"]["vi_draft"]["translation_links"] = "UNCHANGED apart from the two new links"
 
     # ---- Gate B: observations only.
     def step(stem: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
@@ -304,6 +390,8 @@ def evaluate(run_dir: Path) -> dict[str, Any]:
             item["evidence"] = (f"Trio made by hand with Polylang's +, not by the TSYC bridge, so this is not a Gate A "
                                 f"result. Observed ({item['status']}): {item['evidence']}")
             item["status"] = BLOCKED
+    site = {item["status"] for item in report["gate_a_site_checks"]}
+    report["real_site_compatibility"] = FAIL if FAIL in site else BLOCKED_REAL_SITE_TEST if site != {PASS} else PASS
     return report
 
 
@@ -325,6 +413,10 @@ def created_by(snapshot: Mapping[str, Any], trio: Mapping[str, int]) -> str:
 def _print_report(report: Mapping[str, Any]) -> None:
     print(f"Status: {report['status']}   host: {', '.join(report['hosts']) or '-'}   trio: {report['trio']}   "
           f"created by: {report.get('created_by', '-')}")
+    print(f"Draft creation on this site (Gate A): {report['real_site_compatibility']}")
+    for scope, groups in report.get("compatibility", {}).items():
+        if isinstance(groups, dict):
+            print(f"  {scope}: " + "; ".join(f"{group} {value}" for group, value in groups.items()))
     for title, key in (("GATE A on this site copy (PREORDER_DRAFT_CREATION_SAFETY)", "gate_a_site_checks"),
                        ("GATE B (LIVE_COMMERCE_SYNCHRONIZATION_SAFETY): observations for a person", "gate_b_checks")):
         print(f"\n{title}")
@@ -332,9 +424,92 @@ def _print_report(report: Mapping[str, Any]) -> None:
             print(f"  {item['status']:<9} {item['id']}  {item['evidence']}")
 
 
+class HarnessError(RuntimeError):
+    """The one-command run stopped. Nothing is retried."""
+
+
+def _json_line(text: str, marker: str) -> dict[str, Any]:
+    line = next((ln for ln in text.splitlines() if ln.lstrip().startswith(marker)), None)
+    if line is None:
+        raise HarnessError(f"No answer from WP-CLI. Output was: {text.strip()[-600:]}")
+    return json.loads(line)
+
+
+def _text(raw: Any) -> str:
+    return _decode(raw) if isinstance(raw, bytes) else str(raw or "")
+
+
+def run_gate_a(
+    run_dir: Path, *, wp: Sequence[str], user: str, wait_seconds: float = 120.0, cleanup: bool = True,
+    run: Callable[..., Any] | None = None, sleep: Callable[[float], None] = time.sleep,
+    say: Callable[[str], None] = print, timeout: int = 900,
+) -> dict[str, Any]:
+    """Snapshot, create one synthetic trio through the TSYC bridge, snapshot,
+    clean up, judge. Every write is made by tsyc-bridge-trio-driver.php, which
+    refuses the production host and any environment but local or staging; this
+    function also refuses as soon as the first snapshot names the production host."""
+    here = Path(__file__).resolve().parent
+    run_dir = Path(run_dir)
+    run = run or subprocess.run
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if any(run_dir.glob("*.json")):
+        raise HarnessError(f"{run_dir} already holds snapshots. Use a new, empty folder for each run.")
+
+    def call(*arguments: str) -> str:
+        done = run([*wp, *arguments], capture_output=True, timeout=timeout)
+        out = _text(done.stdout)
+        if done.returncode not in (0, 3, 4):
+            raise HarnessError(f"WP-CLI failed ({done.returncode}) on {arguments[:3]}: {(out + _text(done.stderr)).strip()[-600:]}")
+        return out
+
+    def snapshot(stem: str) -> dict[str, Any]:
+        say(f"snapshot {stem} ...")
+        (run_dir / f"{stem}.json").write_text(call("eval-file", str(here / "tsyc-site-snapshot.php"), stem), encoding="utf-8")
+        return load_snapshot(run_dir / f"{stem}.json")
+
+    def driver(*arguments: str) -> dict[str, Any]:
+        answer = _json_line(call("eval-file", str(here / "tsyc-bridge-trio-driver.php"), *arguments, f"--user={user}"),
+                            '{"tsyc_driver"')
+        (run_dir / f"driver_{arguments[0]}.txt").write_text(json.dumps(answer, ensure_ascii=False, indent=1), encoding="utf-8")
+        return answer
+
+    first = snapshot("00_baseline")
+    host = str(first["site"].get("host") or "")
+    if host in PRODUCTION_HOSTS:
+        raise HarnessError("This is the production host. Nothing was written. Run this only on an isolated copy.")
+    say(f"site {host}, {len(first['products'])} products, environment {first['site'].get('environment_type')!r}")
+
+    made = driver("create-vi")
+    if not made.get("ok"):
+        raise HarnessError(f"The driver refused to start: {made.get('code')}: {made.get('message')}")
+    vi_id = int(made["trio"]["vi"])
+    snapshot("00b_vi_created")
+    translated = driver("translate", str(vi_id))
+    if not translated.get("ok"):
+        # A refusal or a side-effect stop is the finding. Snapshot it; retry nothing.
+        say(f"The bridge stopped: {translated.get('answers')}")
+    say(f"waiting {wait_seconds:.0f} s so delayed jobs on the site can run ...")
+    sleep(wait_seconds)
+    snapshot("01_trio_created")
+    if cleanup:
+        cleaned = driver("cleanup", str(vi_id))
+        say(f"test products moved to the trash: {cleaned.get('trashed')}")
+        snapshot("10_cleanup")
+    report = evaluate(run_dir)
+    report["harness"] = {"vi_id": vi_id, "translate": translated, "waited_seconds": wait_seconds, "cleaned_up": cleanup}
+    (run_dir / "blackbox_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    return report
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
+    harness = commands.add_parser("run-gate-a", help="One command: snapshot, create a test trio through the bridge, judge.")
+    harness.add_argument("run_dir", type=Path)
+    harness.add_argument("--user", required=True, help="A WordPress login that may edit products.")
+    harness.add_argument("--wp", default="wp", help='How to start WP-CLI here, e.g. "wp --path=/var/www/copy".')
+    harness.add_argument("--wait", type=float, default=120.0, help="Seconds to wait before the after-snapshot (default 120).")
+    harness.add_argument("--keep", action="store_true", help="Leave the test products in place (for the price and stock steps).")
     diff = commands.add_parser("diff", help="What changed between two snapshots.")
     diff.add_argument("before", type=Path)
     diff.add_argument("after", type=Path)
@@ -347,6 +522,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
     try:
+        if args.command == "run-gate-a":
+            try:
+                report = run_gate_a(args.run_dir, wp=shlex.split(args.wp, posix=os.name != "nt"), user=args.user,
+                                    wait_seconds=args.wait, cleanup=not args.keep)
+            except HarnessError as error:
+                print(f"{BLOCKED_REAL_SITE_TEST}: {error}", file=sys.stderr)
+                return 4
+            _print_report(report)
+            print(f"\nReport: {args.run_dir / 'blackbox_report.json'}")
+            return {PASS: 0, FAIL: 1}.get(report["real_site_compatibility"], 4)
         if args.command == "diff":
             print(json.dumps(diff_snapshots(load_snapshot(args.before), load_snapshot(args.after)), ensure_ascii=False, indent=1))
             return 0
@@ -360,7 +545,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"\nReport: {out}")
     if report["status"] != "EVALUATED":
         return 4
-    return 1 if any(item["status"] == FAIL for item in report["gate_a_site_checks"]) else 0
+    # Same rule as run-gate-a: only PASS is 0. A blocked run (missing step, trio made
+    # by hand) must never exit with the code a script reads as success.
+    return {PASS: 0, FAIL: 1}.get(report["real_site_compatibility"], 4)
 
 
 if __name__ == "__main__":

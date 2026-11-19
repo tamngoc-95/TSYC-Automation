@@ -38,6 +38,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import create_woocommerce_draft as cwd  # noqa: E402  (renderer only: no I/O at import)
+import lab_diagnostics  # noqa: E402
 import provision_lab  # noqa: E402
 from src.cli_bootstrap import configure_utf8_console  # noqa: E402
 from src.domain import language_product_mapping as lpm  # noqa: E402
@@ -55,6 +56,9 @@ configure_utf8_console()
 PASS_REAL = "PASS_REAL_LOCAL"
 BLOCKED = "BLOCKED_MISSING_DEPENDENCY"
 FAIL = "FAIL"
+# The machine was suspended during the test: not a product result, never a pass. Re-run it.
+INVALID_HOST_SUSPENDED = lab_diagnostics.INVALID_HOST_SUSPENDED
+NOT_PASSED = (FAIL, INVALID_HOST_SUSPENDED)
 
 PORT = 8765
 PORT2 = 8766
@@ -94,6 +98,9 @@ class Lab:
         self.auth: tuple[str, str] = ("lab-admin", "")
         self.servers: list[subprocess.Popen[bytes]] = []
         self.database_server: subprocess.Popen[bytes] | None = None
+        # Set by lab_diagnostics.session: where this run's server and database logs go.
+        self.log_dir: Path | None = None
+        self.diagnostics: lab_diagnostics.Session | None = None
 
     @property
     def database(self) -> str:
@@ -101,7 +108,8 @@ class Lab:
 
     def start_database(self) -> None:
         if self.database == "mariadb":
-            self.database_server = provision_lab.start_mariadb(self.dir)
+            self.database_server = provision_lab.start_mariadb(
+                self.dir, self.log_dir / "mariadb.log" if self.log_dir else None)
 
     def wp(self, *arguments: str, check: bool = True) -> str:
         done = subprocess.run([str(self.php), "-c", str(self.ini), str(self.cli), f"--path={self.site}", *arguments],
@@ -122,9 +130,14 @@ class Lab:
         return json.loads(output.strip().splitlines()[-1])
 
     def start_server(self, port: int = PORT, env: Mapping[str, str] | None = None) -> subprocess.Popen[bytes]:
+        # PHP's built-in server writes one line per request (accepted, answered,
+        # closed) to stderr: kept per run, it is the slow-request trace.
+        sink: Any = subprocess.DEVNULL
+        if self.log_dir is not None:
+            sink = open(self.log_dir / f"php_server_{port}.log", "ab")  # noqa: SIM115 - lives as long as the server
         server = subprocess.Popen(
             [str(self.php), "-c", str(self.ini), "-S", f"127.0.0.1:{port}", "-t", str(self.site),
-             str(self.dir / "router.php")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+             str(self.dir / "router.php")], stdout=sink, stderr=sink,
             env={**os.environ, **(env or {})})
         self.servers.append(server)
         for _ in range(60):
@@ -197,6 +210,24 @@ foreach ($ids as $id) { wp_delete_post($id, true); }
 echo json_encode(count($ids));""")
 
 
+def judge_with_host_state(guard: lab_diagnostics.Session, mark: dict[str, Any], test_id: str, status: str,
+                          evidence: Any, fail: str) -> tuple[str, Any]:
+    """A failure that overlapped a host suspension is not a product result:
+    it becomes INVALID_HOST_SUSPENDED (still not a pass). Every failure gets a
+    diagnostics capture. A pass that overlapped a suspension stays a pass, with
+    the suspension recorded."""
+    gaps = guard.suspended_since(mark)
+    evidence = dict(evidence) if isinstance(evidence, dict) else {"evidence": evidence}
+    if gaps:
+        evidence["host_suspended_during_test"] = gaps
+    if status == fail:
+        if gaps:
+            status = INVALID_HOST_SUSPENDED
+            evidence["rerun"] = "The machine was suspended during this test. Re-run it; this is neither a pass nor a product failure."
+        evidence["diagnostics"] = guard.capture(test_id, mark, "host suspended" if gaps else "test failed")
+    return status, evidence
+
+
 class Pilot:
     def __init__(self, lab: Lab, run_dir: Path) -> None:
         self.lab = lab
@@ -243,6 +274,8 @@ class Pilot:
 
     def record(self, test_id: str, title: str, fn: Callable[[], dict[str, Any] | tuple[str, dict[str, Any]]]) -> None:
         started = time.time()
+        guard = self.lab.diagnostics
+        mark = guard.mark() if guard else None
         try:
             outcome = fn()
             status, evidence = outcome if isinstance(outcome, tuple) else (PASS_REAL, outcome)
@@ -250,10 +283,12 @@ class Pilot:
             status, evidence = FAIL, {"failed": str(error)}
         except Exception as error:  # noqa: BLE001 - one test never stops the pilot
             status, evidence = FAIL, {"error": f"{type(error).__name__}: {error}", "trace": traceback.format_exc()[-1500:]}
+        if guard and mark:
+            status, evidence = judge_with_host_state(guard, mark, test_id, status, evidence, FAIL)
         self.results.append({"id": test_id, "title": title, "status": status, "seconds": round(time.time() - started, 1),
                              "evidence": evidence})
         print(f"{status:<28} {test_id:<5} {title}", flush=True)
-        if status == FAIL:
+        if status in NOT_PASSED:
             print(json.dumps(evidence, ensure_ascii=False, indent=1, default=str)[:2500], flush=True)
 
     # ---- matrix -----------------------------------------------------------
@@ -1121,6 +1156,12 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     lab = Lab(args.lab_dir.resolve())
+    with lab_diagnostics.session(lab.dir, run_dir) as guard:
+        return _run(args, lab, run_dir, guard)
+
+
+def _run(args: argparse.Namespace, lab: Lab, run_dir: Path, guard: lab_diagnostics.Session) -> int:
+    lab.diagnostics, lab.log_dir = guard, guard.log_dir
     lab.start_database()
     lab.wipe_products()
     lab.auth = ("lab-admin", lab.wp("user", "application-password", "create", "lab-admin", f"pilot-{time.time()}", "--porcelain"))
@@ -1173,15 +1214,16 @@ def main(argv: list[str] | None = None) -> int:
     report = {"ran_at": datetime.now(timezone.utc).isoformat(), "versions": versions, "database": lab.database,
               "only": args.only or None,
               "not_in_lab": ["Flatsome + Flatsome Child", "pll-bulk-link-translations v1/v2", "Duplicate Post RB", "production data"],
-              "results": pilot.results}
+              "host": guard.summary(), "results": pilot.results}
     path = run_dir / "pilot_report.json"
     path.write_text(json.dumps(report, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
     counts: dict[str, int] = {}
     for item in pilot.results:
         counts[item["status"]] = counts.get(item["status"], 0) + 1
     print(json.dumps(counts))
+    print(json.dumps({"host_suspensions": len(report["host"]["host_suspensions"]), "cleanup_clean": report["host"]["cleanup"]["clean"]}))
     print(f"Report: {path}")
-    return 1 if counts.get(FAIL) else 0
+    return 1 if any(counts.get(status) for status in NOT_PASSED) or not report["host"]["cleanup"]["clean"] else 0
 
 
 if __name__ == "__main__":

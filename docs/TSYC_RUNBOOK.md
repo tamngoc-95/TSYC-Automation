@@ -231,7 +231,9 @@ On 2026-11-07: 0 errors, 2 `WOO_STATUS_STALE_TERMINAL` (IMG-002-CAN-0019 existin
 - Pre-order first (2026-11-16), reference `PREORDER_MULTILINGUAL_WORKFLOW.md`:
   - Two workflows. `NEW_PREORDER_PRODUCT`: a new Fahasa pre-order book whose VI product is still TSYC's unpriced draft. `EXISTING_PUBLISHED_PRODUCT`: everything live, where automation creates, links and edits nothing. `plan_translation_drafts.py` reports both (`workflows`).
   - Two gates. Gate A (draft creation safety): `tools/wp_lab/run_preorder_gate_a.py`, passed in the lab only. Gate B (price, stock, orders on the real site): blocked. **Gate A never counts as Gate B, and a lab pass never enables a production write.**
+  - Owner decision 2026-11-16: Gate B is `DEFERRED`, not passed, for a pilot that only creates unpriced, unpublished drafts. Gate A on the real site is `BLOCKED_REAL_SITE_TEST` until the developer runs `site_blackbox.py run-gate-a` on an isolated copy.
   - Run the lab pilots one at a time: they share one loopback port.
+  - Keep the laptop awake and its lid open during a lab run. A pilot asks Windows to stay awake and marks a test that overlapped a standby `INVALID_HOST_SUSPENDED`: re-run that test. Logs and failure captures are in `<run>/lab_logs/`.
   - For the developer: `tools/site_blackbox/` (its own README), run on an isolated copy only.
 
 ## 8. Recovery
