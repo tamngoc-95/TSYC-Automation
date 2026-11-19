@@ -23,6 +23,11 @@ SQLite; base pilot 25 `PASS_REAL_LOCAL`, 2 `BLOCKED_MISSING_DEPENDENCY`; hardeni
 `PASS_SYNTHETIC_HOOK`, 6 `BLOCKED_MISSING_SOURCE`; 0 `FAIL`, 0 host suspensions, no stall (H09 84 s). Details and
 report folders: `PREORDER_MULTILINGUAL_WORKFLOW.md` section 3. Nothing was installed on any real site.
 
+**Developer handoff (2026-11-19):** `tools/site_blackbox/build_handoff.py` ships this bridge file, unchanged, inside
+the black-box zip. The harness refuses a copy whose installed bridge differs from the shipped file, and refuses any
+copy that does not pass all four isolation checks (`PREORDER_MULTILINGUAL_WORKFLOW.md` section 4). The bridge itself
+is not changed by the handoff.
+
 ## 1. Confirmed architecture
 
 From the website developer (context; checked independently where section 2 says so):

@@ -290,10 +290,35 @@ def test_the_driver_refuses_production_and_never_prices_or_publishes() -> None:
     assert "NOT_A_DRIVER_PRODUCT" in code and "TSYC_BBX_SKU_PREFIX" in code
 
 
+def test_the_isolation_check_is_read_only_and_fails_closed() -> None:
+    code = php("tsyc-isolation.php")
+    for pattern in (r"\b(update|add|delete)_(option|post_meta|post|term|user_meta)\b", r"\bwp_(insert|update|delete|trash|set)_\w+",
+                    r"->save\s*\(", r"->(insert|update|delete|replace|query)\s*\(", r"\b(INSERT|UPDATE|DELETE|REPLACE|ALTER|DROP)\b",
+                    r"\bwp_remote_\w+", r"\bcurl_\w+", r"\bfile_put_contents\b", r"\bfopen\b", r"\bwp_mail\b"):
+        assert not re.search(pattern, code), pattern
+    for check in ("HOST_NOT_PRODUCTION", "ENVIRONMENT_TYPE", "OUTBOUND_HTTP_BLOCKED", "OPERATOR_ATTESTATION"):
+        assert f"'{check}'" in code
+    # Isolated only when every check is ok; the attestation must equal this copy's own host.
+    assert "$isolated = $isolated && $check['ok']" in code and "$attested === $hosts['home_url']" in code
+    assert "WP_HTTP_BLOCK_EXTERNAL === true" in code and "'tiemsachyeucon.com'" in code
+    assert "stored_" in code and "option_name IN ('home', 'siteurl')" in code         # the stored address, not only filters
+
+
+def test_the_driver_establishes_isolation_before_any_write() -> None:
+    code = php("tsyc-bridge-trio-driver.php")
+    guard_body = code[code.index("function tsyc_bbx_guard()"):code.index("function tsyc_bbx_bridge_post")]
+    assert "tsyc-isolation.php" in guard_body and "tsyc_bbx_isolation()" in guard_body
+    assert "$isolation['isolated'] !== true" in guard_body and "NOT_ISOLATED" in guard_body
+    assert guard_body.index("NOT_ISOLATED") < guard_body.index("PRODUCTION_HOST_REFUSED")
+    # A missing library is a refusal, not a skipped check.
+    assert "!is_readable($library)" in guard_body
+
+
 def test_the_comparison_tool_needs_nothing_but_the_standard_library() -> None:
     source = (PACKAGE / "site_blackbox.py").read_text(encoding="utf-8")
     imports = set(re.findall(r"^(?:from|import)\s+([\w.]+)", source, flags=re.M))
-    assert imports <= {"__future__", "argparse", "json", "os", "shlex", "subprocess", "sys", "time", "pathlib", "typing"}, imports
+    assert imports <= {"__future__", "argparse", "hashlib", "json", "os", "shlex", "subprocess", "sys", "time", "zipfile",
+                       "pathlib", "typing"}, imports
     assert "requests" not in source and "urllib" not in source and "socket" not in source and "http" not in source.lower()
 
 
@@ -382,21 +407,41 @@ def test_without_a_complete_bridge_run_the_real_site_test_is_blocked_never_passe
 # ------------------------------------------------- the one-command harness
 
 
-class FakeSite:
-    """Stands in for WP-CLI on a site copy: answers the snapshot and driver calls."""
+ISOLATION_IDS = (("I1", "HOST_NOT_PRODUCTION"), ("I2", "ENVIRONMENT_TYPE"), ("I3", "OUTBOUND_HTTP_BLOCKED"),
+                 ("I4", "OPERATOR_ATTESTATION"))
 
-    def __init__(self, host: str = HOST, translate_ok: bool = True, change_bystander: bool = False) -> None:
+
+def isolation_answer(failing: tuple[str, ...] = (), bridge_sha256: str | None = None) -> dict[str, Any]:
+    checks = [{"id": cid, "name": name, "ok": cid not in failing, "detail": f"{name} detail"} for cid, name in ISOLATION_IDS]
+    return {"tsyc_isolation": 1, "isolated": not failing, "checks": checks, "bridge_version": "1.2.0",
+            "bridge_sha256": bbx.expected_bridge_sha256(PACKAGE) if bridge_sha256 is None else bridge_sha256}
+
+
+class FakeSite:
+    """Stands in for WP-CLI on a site copy: answers the isolation, snapshot and driver calls."""
+
+    def __init__(self, host: str = HOST, translate_ok: bool = True, change_bystander: bool = False,
+                 failing: tuple[str, ...] = (), bridge_sha256: str | None = None, snapshot_isolated: bool = True,
+                 hang_on: str | None = None) -> None:
         self.host, self.translate_ok, self.change_bystander = host, translate_ok, change_bystander
+        self.isolation = isolation_answer(failing, bridge_sha256)
+        self.snapshot_isolated, self.hang_on = snapshot_isolated, hang_on
         self.products = copy.deepcopy(BYSTANDERS)
         self.calls: list[list[str]] = []
 
-    def __call__(self, command: list[str], **_kwargs: Any) -> Any:
+    def __call__(self, command: list[str], **kwargs: Any) -> Any:
         self.calls.append(list(command))
         at = command.index("eval-file")      # after whatever starts WP-CLI on this machine
         script, arguments = Path(command[at + 1]).name, command[at + 2:]
+        if self.hang_on and self.hang_on in (script, arguments[0] if arguments else ""):
+            raise bbx.subprocess.TimeoutExpired(command, kwargs.get("timeout"), stderr=b"still working")
         out, code = "", 0
-        if script == "tsyc-site-snapshot.php":
-            out = json.dumps(snapshot(self.products, self.host, arguments[0]))
+        if script == "tsyc-isolation.php":
+            out, code = json.dumps(self.isolation), (0 if self.isolation["isolated"] else 5)
+        elif script == "tsyc-site-snapshot.php":
+            data = snapshot(self.products, self.host, arguments[0])
+            data["site"]["isolation"] = self.isolation if self.snapshot_isolated else None
+            out = json.dumps(data)
         elif arguments[0] == "create-vi":
             self.products.append(vi_alone())
             out = json.dumps({"tsyc_driver": 1, "ok": True, "trio": {"vi": TRIO["vi"]}, "answers": {}})
@@ -434,9 +479,107 @@ def test_harness_runs_the_whole_gate_a_site_test_in_order(tmp_path: Path) -> Non
     assert report["real_site_compatibility"] == bbx.PASS and report["_waits"] == [120.0]
     assert site.writes() == ["create-vi", "translate", "cleanup"]
     assert sorted(p.stem for p in (tmp_path / "run").glob("*.json")) == [
-        "00_baseline", "00b_vi_created", "01_trio_created", "10_cleanup", "blackbox_report"]
+        "00_baseline", "00_isolation", "00b_vi_created", "01_trio_created", "10_cleanup", "blackbox_report"]
     assert all(call[:3] == ["wp", "--path=/copy", "eval-file"] for call in site.calls)
     assert all("--user=admin" in call for call in site.calls if "driver" in call[3])
+    # The isolation check is the very first call; the summary and the call log are written.
+    assert Path(site.calls[0][3]).name == "tsyc-isolation.php"
+    summary = (tmp_path / "run" / "summary.txt").read_text(encoding="utf-8")
+    assert summary.startswith("TSYC black-box Gate A on a site copy: PASS") and "all UNCHANGED" in summary
+    log = [json.loads(line) for line in (tmp_path / "run" / "run_log.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(log) == len(site.calls) and all("--user=admin" not in entry["arguments"] for entry in log)
+    assert not (tmp_path / "run" / "failure.json").exists()
+
+
+@pytest.mark.parametrize("failing", [("I1",), ("I2",), ("I3",), ("I4",), ("I1", "I2", "I3", "I4")])
+def test_harness_writes_nothing_unless_every_isolation_check_passes(tmp_path: Path, failing: tuple[str, ...]) -> None:
+    site = FakeSite(failing=failing)
+    with pytest.raises(bbx.HarnessError, match="Not an established isolated copy"):
+        harness(tmp_path, site)
+    assert site.writes() == [] and len(site.calls) == 1          # only the read-only isolation check ran
+    failure = json.loads((tmp_path / "run" / "failure.json").read_text(encoding="utf-8"))
+    assert failure["nothing_written"] is True and failure["cleanup"] is None and failure["retried"] is False
+
+
+@pytest.mark.parametrize("answer", [None, {}, {"isolated": True}, {"isolated": True, "checks": []},
+                                    {"isolated": True, "checks": [{"id": "I1", "ok": True}]},
+                                    {"isolated": False, "checks": [{"id": c, "ok": True} for c in ("I1", "I2", "I3", "I4")]}])
+def test_an_incomplete_or_missing_isolation_answer_is_never_isolated(answer: Any) -> None:
+    assert bbx.isolation_problems(answer)
+
+
+def test_harness_refuses_a_bridge_that_is_not_the_shipped_file(tmp_path: Path) -> None:
+    for folder, sha in (("other", "0" * 64), ("none", "")):
+        site = FakeSite(bridge_sha256=sha)
+        with pytest.raises(bbx.HarnessError, match="not the file shipped"):
+            harness(tmp_path / folder, site)
+        assert site.writes() == []
+
+
+def test_harness_refuses_when_the_baseline_does_not_confirm_isolation(tmp_path: Path) -> None:
+    site = FakeSite(snapshot_isolated=False)
+    with pytest.raises(bbx.HarnessError, match="baseline snapshot does not confirm isolation"):
+        harness(tmp_path, site)
+    assert site.writes() == []
+
+
+def test_harness_refuses_without_a_reference_bridge_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    empty = tmp_path / "pkg" / "a" / "b"
+    empty.mkdir(parents=True)
+    with pytest.raises(bbx.HarnessError, match="cannot be checked"):
+        bbx.expected_bridge_sha256(empty)
+    site = FakeSite()
+    real = bbx.expected_bridge_sha256
+    monkeypatch.setattr(bbx, "expected_bridge_sha256", lambda _here: real(empty))
+    with pytest.raises(bbx.HarnessError, match="cannot be checked"):
+        harness(tmp_path, site)
+    assert site.calls == []
+
+
+def test_bridge_identity_ignores_line_endings_only(tmp_path: Path) -> None:
+    (tmp_path / "lf.php").write_bytes(b"<?php\necho 1;\n")
+    (tmp_path / "crlf.php").write_bytes(b"<?php\r\necho 1;\r\n")
+    (tmp_path / "other.php").write_bytes(b"<?php\necho 2;\n")
+    assert bbx.normalized_sha256(tmp_path / "lf.php") == bbx.normalized_sha256(tmp_path / "crlf.php")
+    assert bbx.normalized_sha256(tmp_path / "lf.php") != bbx.normalized_sha256(tmp_path / "other.php")
+
+
+def test_a_timeout_stops_the_run_records_where_and_retries_nothing(tmp_path: Path) -> None:
+    site = FakeSite(hang_on="translate")
+    with pytest.raises(bbx.HarnessError, match="did not answer within 7 s"):
+        harness(tmp_path, site, timeout=7)
+    assert site.writes() == ["create-vi", "translate"]           # translate was not sent again
+    failure = json.loads((tmp_path / "run" / "failure.json").read_text(encoding="utf-8"))
+    assert failure["stopped_at_step"] == "driver translate" and failure["vi_test_product_id"] == TRIO["vi"]
+    assert failure["cleanup"] == f"wp eval-file tsyc-bridge-trio-driver.php cleanup {TRIO['vi']} --user=admin"
+    last = json.loads((tmp_path / "run" / "run_log.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert last["outcome"] == "TIMEOUT after 7 s" and last["stderr_tail"] == "still working"
+
+
+def test_the_default_call_timeout_is_bounded() -> None:
+    assert 0 < bbx.DEFAULT_CALL_TIMEOUT <= 600
+
+
+def test_pack_hashes_other_products_titles_and_still_evaluates_the_same(tmp_path: Path) -> None:
+    harness(tmp_path, FakeSite())
+    archive = bbx.pack_results(tmp_path / "run")
+    import zipfile
+    with zipfile.ZipFile(archive) as packed:
+        names = set(packed.namelist())
+        assert {"run/blackbox_report.json", "run/summary.txt", "run/run_log.jsonl", "run/00_isolation.json",
+                "run/00_baseline.json", "run/01_trio_created.json"} <= names
+        unpacked = tmp_path / "unpacked"
+        packed.extractall(unpacked)
+    baseline = json.loads((unpacked / "run" / "00_baseline.json").read_text(encoding="utf-8"))
+    assert baseline["sanitized"] is True
+    assert all(p["title"].startswith("sha256:") and p["slug"].startswith("sha256:") for p in baseline["products"].values())
+    after = json.loads((unpacked / "run" / "01_trio_created.json").read_text(encoding="utf-8"))
+    assert after["products"][str(TRIO["en"])]["title"] == f"Book {TRIO['en']}"            # the test trio stays readable
+    (unpacked / "run" / "blackbox_report.json").unlink()
+    again = bbx.evaluate(unpacked / "run")
+    original = json.loads((tmp_path / "run" / "blackbox_report.json").read_text(encoding="utf-8"))
+    assert again["real_site_compatibility"] == original["real_site_compatibility"] == bbx.PASS
+    assert again["gate_a_site_checks"] == original["gate_a_site_checks"]
 
 
 def test_harness_writes_nothing_on_the_production_host(tmp_path: Path) -> None:

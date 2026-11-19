@@ -4,33 +4,39 @@ Standard library only: this file runs on its own, without the TSYC repository,
 a database, a network connection or any credential. It reads snapshot JSON
 files and writes a report. It never contacts a website.
 
-  run-gate-a  one command: snapshot, create a synthetic trio through the TSYC
-              bridge, snapshot again, clean up, and judge (needs WP-CLI)
+  run-gate-a  one command: check isolation, snapshot, create a synthetic trio
+              through the TSYC bridge, snapshot again, clean up, and judge
+              (needs WP-CLI)
   diff        what changed between two snapshots
   evaluate    judge a scenario folder (README.md) against Gate A (site copy)
               and record what was observed for Gate B
+  pack        zip one run for sending back, product titles and slugs hashed
 
 A step whose snapshot is missing is BLOCKED, never PASS. A Gate B result is an
 OBSERVED fact for a person to read, never a machine pass. Snapshots taken on
-the production host are refused: the scenario writes test products.
+the production host are refused: the scenario writes test products. A site
+that does not pass every isolation check is refused before anything is written.
 
 The only thing run-gate-a starts is the WP-CLI command you give it, with the
-two PHP files next to this one. It opens no network connection itself.
+PHP files next to this one. It opens no network connection itself.
 
 Usage:
-  python site_blackbox.py run-gate-a RUN_FOLDER --user ADMIN_LOGIN [--wp "wp --path=/var/www/copy"]
+  python site_blackbox.py run-gate-a RUN_FOLDER --user ADMIN_LOGIN [--wp "wp --path=/var/www/copy"] [--timeout 300]
   python site_blackbox.py diff BEFORE.json AFTER.json
   python site_blackbox.py evaluate RUN_FOLDER [--json-out REPORT.json]
+  python site_blackbox.py pack RUN_FOLDER
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -439,66 +445,223 @@ def _text(raw: Any) -> str:
     return _decode(raw) if isinstance(raw, bytes) else str(raw or "")
 
 
+BRIDGE_FILE = "tsyc-polylang-bridge.php"
+DEFAULT_CALL_TIMEOUT = 300          # seconds per WP-CLI call; a run makes at most 7 calls plus the wait
+ISOLATION_EXIT = 5                  # tsyc-isolation.php: not isolated
+
+
+def normalized_sha256(path: Path) -> str:
+    """SHA-256 with CRLF read as LF, the same rule tsyc-isolation.php applies to the installed file."""
+    return hashlib.sha256(Path(path).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def expected_bridge_sha256(here: Path) -> str:
+    """The bridge file shipped with this package (or, in the TSYC repository, the
+    repository's own copy). No reference file means the installed bridge cannot be
+    identified, and the run refuses: fail closed."""
+    for candidate in (here / BRIDGE_FILE, here.parent.parent / "wordpress" / "tsyc-polylang-bridge" / BRIDGE_FILE):
+        if candidate.is_file():
+            return normalized_sha256(candidate)
+    raise HarnessError(f"{BRIDGE_FILE} is not next to this script, so the installed bridge cannot be checked. Nothing was written.")
+
+
+def isolation_problems(isolation: Any) -> list[str]:
+    """Every reason the site is not an established isolated copy. Empty only for a complete, passing answer."""
+    if not isinstance(isolation, dict) or not isinstance(isolation.get("checks"), list) or not isolation["checks"]:
+        return ["The isolation check gave no answer (tsyc-isolation.php missing or not run)."]
+    problems = [f"{c.get('id')} {c.get('name')}: {c.get('detail')}" for c in isolation["checks"] if c.get("ok") is not True]
+    if len({c.get("id") for c in isolation["checks"]}) < 4:
+        problems.append("The isolation check is incomplete (fewer than 4 checks).")
+    if isolation.get("isolated") is not True and not problems:
+        problems.append("The isolation check did not say isolated.")
+    return problems
+
+
+def summary_lines(report: Mapping[str, Any]) -> list[str]:
+    """A short, plain result for the person who ran it."""
+    lines = [f"TSYC black-box Gate A on a site copy: {report['real_site_compatibility']}",
+             f"host: {', '.join(report.get('hosts') or []) or '-'}   status: {report['status']}   trio: {report.get('trio')}   "
+             f"created by: {report.get('created_by', '-')}"]
+    for scope, groups in report.get("compatibility", {}).items():
+        if isinstance(groups, dict):
+            changed = {g: v for g, v in groups.items() if not str(v).startswith("UNCHANGED")}
+            lines.append(f"{scope}: " + ("all UNCHANGED" if not changed else "; ".join(f"{g} {v}" for g, v in changed.items())))
+    for item in report.get("gate_a_site_checks", []):
+        if item["status"] != PASS:
+            lines.append(f"{item['status']} {item['id']}: {item['evidence'][:300]}")
+    harness = report.get("harness") or {}
+    if harness:
+        lines.append(f"test products cleaned up: {harness.get('cleaned_up')}   VI test product: #{harness.get('vi_id')}")
+    return lines
+
+
 def run_gate_a(
     run_dir: Path, *, wp: Sequence[str], user: str, wait_seconds: float = 120.0, cleanup: bool = True,
     run: Callable[..., Any] | None = None, sleep: Callable[[float], None] = time.sleep,
-    say: Callable[[str], None] = print, timeout: int = 900,
+    say: Callable[[str], None] = print, timeout: int = DEFAULT_CALL_TIMEOUT,
 ) -> dict[str, Any]:
-    """Snapshot, create one synthetic trio through the TSYC bridge, snapshot,
-    clean up, judge. Every write is made by tsyc-bridge-trio-driver.php, which
-    refuses the production host and any environment but local or staging; this
-    function also refuses as soon as the first snapshot names the production host."""
+    """Check isolation, snapshot, create one synthetic trio through the TSYC
+    bridge, snapshot, clean up, judge.
+
+    Fail closed: before anything is written the site must pass every isolation
+    check (tsyc-isolation.php) and run exactly the bridge file shipped with this
+    package. The driver repeats the isolation check itself before each write.
+    Every WP-CLI call is bounded by `timeout`. On any stop, failure.json says at
+    which step, and how to clean up; nothing is retried."""
     here = Path(__file__).resolve().parent
     run_dir = Path(run_dir)
     run = run or subprocess.run
     run_dir.mkdir(parents=True, exist_ok=True)
     if any(run_dir.glob("*.json")):
         raise HarnessError(f"{run_dir} already holds snapshots. Use a new, empty folder for each run.")
+    state: dict[str, Any] = {"step": "start", "vi_id": None}
+    log_path = run_dir / "run_log.jsonl"
 
-    def call(*arguments: str) -> str:
-        done = run([*wp, *arguments], capture_output=True, timeout=timeout)
-        out = _text(done.stdout)
-        if done.returncode not in (0, 3, 4):
-            raise HarnessError(f"WP-CLI failed ({done.returncode}) on {arguments[:3]}: {(out + _text(done.stderr)).strip()[-600:]}")
+    def call(*arguments: str, allowed: tuple[int, ...] = (0, 3, 4)) -> str:
+        started = time.monotonic()
+        entry: dict[str, Any] = {"step": state["step"], "script": Path(arguments[1]).name if len(arguments) > 1 else "",
+                                 "arguments": [a for a in arguments[2:] if not a.startswith("--user=")]}
+        try:
+            done = run([*wp, *arguments], capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            entry.update(seconds=round(time.monotonic() - started, 1), outcome=f"TIMEOUT after {timeout} s",
+                         stderr_tail=_text(error.stderr)[-1500:])
+            _append_log(log_path, entry)
+            raise HarnessError(f"WP-CLI did not answer within {timeout} s at step {state['step']}. "
+                               "Its effect is unknown: nothing is retried.") from error
+        except OSError as error:
+            raise HarnessError(f"WP-CLI could not be started ({error}). Check --wp.") from error
+        out, err = _text(done.stdout), _text(done.stderr)
+        entry.update(seconds=round(time.monotonic() - started, 1), returncode=done.returncode,
+                     stdout_bytes=len(out), stderr_tail=err[-1500:])
+        _append_log(log_path, entry)
+        if done.returncode not in allowed:
+            raise HarnessError(f"WP-CLI failed ({done.returncode}) at step {state['step']}: {(out + err).strip()[-600:]}")
         return out
 
     def snapshot(stem: str) -> dict[str, Any]:
+        state["step"] = f"snapshot {stem}"
         say(f"snapshot {stem} ...")
         (run_dir / f"{stem}.json").write_text(call("eval-file", str(here / "tsyc-site-snapshot.php"), stem), encoding="utf-8")
         return load_snapshot(run_dir / f"{stem}.json")
 
     def driver(*arguments: str) -> dict[str, Any]:
+        state["step"] = f"driver {arguments[0]}"
         answer = _json_line(call("eval-file", str(here / "tsyc-bridge-trio-driver.php"), *arguments, f"--user={user}"),
                             '{"tsyc_driver"')
         (run_dir / f"driver_{arguments[0]}.txt").write_text(json.dumps(answer, ensure_ascii=False, indent=1), encoding="utf-8")
         return answer
 
-    first = snapshot("00_baseline")
-    host = str(first["site"].get("host") or "")
-    if host in PRODUCTION_HOSTS:
-        raise HarnessError("This is the production host. Nothing was written. Run this only on an isolated copy.")
-    say(f"site {host}, {len(first['products'])} products, environment {first['site'].get('environment_type')!r}")
+    try:
+        # 1. Isolation, read-only. Nothing is written unless every check passes.
+        expected_bridge = expected_bridge_sha256(here)
+        state["step"] = "isolation check"
+        say("checking that this is an isolated copy ...")
+        isolation = _json_line(call("eval-file", str(here / "tsyc-isolation.php"), allowed=(0, ISOLATION_EXIT)),
+                               '{"tsyc_isolation"')
+        (run_dir / "00_isolation.json").write_text(json.dumps(isolation, ensure_ascii=False, indent=1), encoding="utf-8")
+        problems = isolation_problems(isolation)
+        if problems:
+            raise HarnessError("Not an established isolated copy. Nothing was written. " + " | ".join(problems))
+        if isolation.get("bridge_sha256") != expected_bridge:
+            raise HarnessError("The TSYC bridge installed on this copy is not the file shipped with this package "
+                               f"(installed {isolation.get('bridge_sha256') or 'none'}, expected {expected_bridge}). Nothing was written.")
 
-    made = driver("create-vi")
-    if not made.get("ok"):
-        raise HarnessError(f"The driver refused to start: {made.get('code')}: {made.get('message')}")
-    vi_id = int(made["trio"]["vi"])
-    snapshot("00b_vi_created")
-    translated = driver("translate", str(vi_id))
-    if not translated.get("ok"):
-        # A refusal or a side-effect stop is the finding. Snapshot it; retry nothing.
-        say(f"The bridge stopped: {translated.get('answers')}")
-    say(f"waiting {wait_seconds:.0f} s so delayed jobs on the site can run ...")
-    sleep(wait_seconds)
-    snapshot("01_trio_created")
-    if cleanup:
-        cleaned = driver("cleanup", str(vi_id))
-        say(f"test products moved to the trash: {cleaned.get('trashed')}")
-        snapshot("10_cleanup")
+        # 2. Baseline, which must say the same.
+        first = snapshot("00_baseline")
+        host = str(first["site"].get("host") or "")
+        if host.lower() in PRODUCTION_HOSTS:
+            raise HarnessError("This is the production host. Nothing was written. Run this only on an isolated copy.")
+        if isolation_problems(first["site"].get("isolation")):
+            raise HarnessError("The baseline snapshot does not confirm isolation. Nothing was written. "
+                               + " | ".join(isolation_problems(first["site"].get("isolation"))))
+        say(f"site {host}, {len(first['products'])} products, environment {first['site'].get('environment_type')!r}")
+
+        # 3. The test trio, then cleanup.
+        made = driver("create-vi")
+        if not made.get("ok"):
+            raise HarnessError(f"The driver refused to start: {made.get('code')}: {made.get('message')}")
+        state["vi_id"] = vi_id = int(made["trio"]["vi"])
+        snapshot("00b_vi_created")
+        translated = driver("translate", str(vi_id))
+        if not translated.get("ok"):
+            # A refusal or a side-effect stop is the finding. Snapshot it; retry nothing.
+            say(f"The bridge stopped: {translated.get('answers')}")
+        state["step"] = "wait"
+        say(f"waiting {wait_seconds:.0f} s so delayed jobs on the site can run ...")
+        sleep(wait_seconds)
+        snapshot("01_trio_created")
+        if cleanup:
+            cleaned = driver("cleanup", str(vi_id))
+            say(f"test products moved to the trash: {cleaned.get('trashed')}")
+            snapshot("10_cleanup")
+    except (HarnessError, SnapshotError) as error:
+        failure = {"stopped_at_step": state["step"], "error": str(error), "vi_test_product_id": state["vi_id"],
+                   "retried": False,
+                   "cleanup": (None if state["vi_id"] is None else
+                               f"wp eval-file tsyc-bridge-trio-driver.php cleanup {state['vi_id']} --user={user}"),
+                   "nothing_written": state["vi_id"] is None}
+        (run_dir / "failure.json").write_text(json.dumps(failure, ensure_ascii=False, indent=1), encoding="utf-8")
+        if isinstance(error, HarnessError):
+            raise
+        raise HarnessError(str(error)) from error
+
     report = evaluate(run_dir)
-    report["harness"] = {"vi_id": vi_id, "translate": translated, "waited_seconds": wait_seconds, "cleaned_up": cleanup}
+    report["harness"] = {"vi_id": vi_id, "translate": translated, "waited_seconds": wait_seconds, "cleaned_up": cleanup,
+                         "isolation": isolation, "bridge_sha256": expected_bridge, "call_timeout_seconds": timeout}
     (run_dir / "blackbox_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    (run_dir / "summary.txt").write_text("\n".join(summary_lines(report)) + "\n", encoding="utf-8")
     return report
+
+
+def _append_log(path: Path, entry: Mapping[str, Any]) -> None:
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+# ------------------------------------------------------------ results to send
+
+# What goes back to TSYC: the judgement and its evidence, nothing else.
+PACK_FILES = ("blackbox_report.json", "summary.txt", "failure.json", "run_log.jsonl", "00_isolation.json",
+              "driver_create-vi.txt", "driver_translate.txt", "driver_cleanup.txt")
+SANITIZED_TEXT_FIELDS = ("title", "slug")
+
+
+def sanitize_snapshot(data: Mapping[str, Any], keep_ids: Sequence[int]) -> dict[str, Any]:
+    """Titles and slugs of every product except the test trio become hashes.
+    The same text always gives the same hash, so the sanitized snapshots still
+    compare exactly like the originals."""
+    out = json.loads(json.dumps(data))
+    keep = {str(int(pid)) for pid in keep_ids}
+    for pid, product in out["products"].items():
+        if pid in keep:
+            continue
+        for field in SANITIZED_TEXT_FIELDS:
+            value = product.get(field)
+            if isinstance(value, str):
+                product[field] = "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+    out["sanitized"] = True
+    return out
+
+
+def pack_results(run_dir: Path, out: Path | None = None) -> Path:
+    """A zip of one run with product titles and slugs hashed, ready to send."""
+    run_dir = Path(run_dir)
+    report_path = run_dir / "blackbox_report.json"
+    trio: Mapping[str, Any] = {}
+    if report_path.exists():
+        trio = json.loads(report_path.read_text(encoding="utf-8")).get("trio") or {}
+    out = Path(out) if out else run_dir.with_name(run_dir.name + "_results.zip")
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name in PACK_FILES:
+            if (run_dir / name).exists():
+                archive.write(run_dir / name, f"{run_dir.name}/{name}")
+        for stem, _ in STEPS:
+            path = run_dir / f"{stem}.json"
+            if path.exists():
+                clean = sanitize_snapshot(load_snapshot(path), list(trio.values()))
+                archive.writestr(f"{run_dir.name}/{stem}.json", json.dumps(clean, ensure_ascii=False))
+    return out
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -510,6 +673,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     harness.add_argument("--wp", default="wp", help='How to start WP-CLI here, e.g. "wp --path=/var/www/copy".')
     harness.add_argument("--wait", type=float, default=120.0, help="Seconds to wait before the after-snapshot (default 120).")
     harness.add_argument("--keep", action="store_true", help="Leave the test products in place (for the price and stock steps).")
+    harness.add_argument("--timeout", type=int, default=DEFAULT_CALL_TIMEOUT,
+                         help=f"Seconds allowed for each WP-CLI call (default {DEFAULT_CALL_TIMEOUT}).")
+    packer = commands.add_parser("pack", help="Zip one run for sending back, product titles and slugs hashed.")
+    packer.add_argument("run_dir", type=Path)
+    packer.add_argument("--out", type=Path)
     diff = commands.add_parser("diff", help="What changed between two snapshots.")
     diff.add_argument("before", type=Path)
     diff.add_argument("after", type=Path)
@@ -525,13 +693,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "run-gate-a":
             try:
                 report = run_gate_a(args.run_dir, wp=shlex.split(args.wp, posix=os.name != "nt"), user=args.user,
-                                    wait_seconds=args.wait, cleanup=not args.keep)
+                                    wait_seconds=args.wait, cleanup=not args.keep, timeout=args.timeout)
             except HarnessError as error:
                 print(f"{BLOCKED_REAL_SITE_TEST}: {error}", file=sys.stderr)
+                if (args.run_dir / "failure.json").exists():
+                    print(f"Details and cleanup: {args.run_dir / 'failure.json'}", file=sys.stderr)
                 return 4
             _print_report(report)
-            print(f"\nReport: {args.run_dir / 'blackbox_report.json'}")
+            print("\n" + "\n".join(summary_lines(report)))
+            print(f"\nReport: {args.run_dir / 'blackbox_report.json'}   Summary: {args.run_dir / 'summary.txt'}")
+            print(f"To send it back: python site_blackbox.py pack {args.run_dir}")
             return {PASS: 0, FAIL: 1}.get(report["real_site_compatibility"], 4)
+        if args.command == "pack":
+            print(f"Results to send: {pack_results(args.run_dir, args.out)}")
+            return 0
         if args.command == "diff":
             print(json.dumps(diff_snapshots(load_snapshot(args.before), load_snapshot(args.after)), ensure_ascii=False, indent=1))
             return 0

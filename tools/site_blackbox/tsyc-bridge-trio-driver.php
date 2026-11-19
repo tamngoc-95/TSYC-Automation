@@ -3,8 +3,11 @@
  * TSYC black-box driver: one synthetic pre-order trio through the TSYC Polylang bridge.
  *
  * THIS FILE WRITES TEST PRODUCTS. It refuses to run unless ALL of these hold:
- *   - the site host is not tiemsachyeucon.com (with or without www);
- *   - WP_ENVIRONMENT_TYPE is "local" or "staging";
+ *   - every isolation check in tsyc-isolation.php passes (fail closed): no
+ *     production host anywhere in the site's address, WP_ENVIRONMENT_TYPE
+ *     "local" or "staging", outbound HTTP blocked, and the developer's
+ *     TSYC_BLACKBOX_ISOLATED_COPY attestation naming this exact host;
+ *   - the site host is not tiemsachyeucon.com (checked again here);
  *   - the TSYC bridge is installed with its write routes enabled, which the
  *     bridge itself only allows off production;
  *   - it runs through WP-CLI as a user who may edit products.
@@ -39,6 +42,24 @@ function tsyc_bbx_stop(string $code, string $message): void
 
 function tsyc_bbx_guard(): void
 {
+    $library = __DIR__ . '/tsyc-isolation.php';
+    if (!is_readable($library)) {
+        tsyc_bbx_stop('NOT_ISOLATED', 'tsyc-isolation.php is missing next to this file, so isolation cannot be established.');
+    }
+    if (!defined('TSYC_BBX_ISOLATION_LIBRARY')) {
+        define('TSYC_BBX_ISOLATION_LIBRARY', true);
+    }
+    require_once $library;
+    $isolation = tsyc_bbx_isolation();
+    if ($isolation['isolated'] !== true) {
+        $failed = array();
+        foreach ($isolation['checks'] as $check) {
+            if (!$check['ok']) {
+                $failed[] = $check['id'] . ' ' . $check['name'] . ': ' . $check['detail'];
+            }
+        }
+        tsyc_bbx_stop('NOT_ISOLATED', 'Not an established isolated copy. Nothing was written. ' . implode(' | ', $failed));
+    }
     $host = preg_replace('/^www\./', '', strtolower((string) wp_parse_url(home_url(), PHP_URL_HOST)));
     if ($host === '' || in_array($host, TSYC_BBX_PRODUCTION_HOSTS, true)) {
         tsyc_bbx_stop('PRODUCTION_HOST_REFUSED', 'This driver never runs on the production host.');

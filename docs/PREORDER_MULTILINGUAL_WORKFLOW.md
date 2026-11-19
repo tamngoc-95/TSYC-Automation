@@ -242,19 +242,40 @@ developer.
 
 | File | Role |
 |---|---|
-| `tsyc-site-snapshot.php` | Read-only snapshot of every product: status, prices, stock, backorders, SKU, images, language, translation links, related product IDs, and hashes of the text; plus the theme, plugin and must-use plugin names and versions |
-| `site_blackbox.py` | The one-command Gate A run, and the step-by-step comparison. Standard library only; it starts nothing but the WP-CLI command it is given |
-| `tsyc-bridge-trio-driver.php` | Creates one synthetic trio through the bridge on the copy, in one step or two. Refuses the production host and any environment other than `local` or `staging` |
+| `tsyc-isolation.php` | Read-only, fail closed. The copy is isolated only if all four pass: I1 no production host in the home/site URL (filtered and as stored), I2 `WP_ENVIRONMENT_TYPE` local/staging, I3 `WP_HTTP_BLOCK_EXTERNAL` true with no wildcard or production host in `WP_ACCESSIBLE_HOSTS`, I4 `TSYC_BLACKBOX_ISOLATED_COPY` equal to the copy's own host (the developer's statement that mail, payments and sync are off). Also reports the installed bridge file's SHA-256 |
+| `tsyc-site-snapshot.php` | Read-only snapshot of every product: status, prices, stock, backorders, SKU, images, language, translation links, related product IDs, and hashes of the text; plus the theme, plugin and must-use plugin names and versions, and the isolation result |
+| `site_blackbox.py` | The one-command Gate A run, the step-by-step comparison, and `pack` (results zip, real product titles and slugs hashed). Standard library only; it starts nothing but the WP-CLI command it is given |
+| `tsyc-bridge-trio-driver.php` | Creates one synthetic trio through the bridge on the copy, in one step or two. Runs the isolation check itself first and refuses (`NOT_ISOLATED`) unless all four pass |
+| `build_handoff.py` (not shipped) | Builds the zip for the developer from one commit, with the bridge, `MANIFEST.json` and `SHA256SUMS.txt`; refuses uncommitted files and anything that looks like a secret |
+
+**Fail closed (2026-11-19).** Before the first write, `run-gate-a` requires every isolation check to pass and
+the installed bridge to be byte-for-byte the shipped file (line endings aside). The baseline snapshot must say
+isolated too, and the driver checks again. Each WP-CLI call is bounded (`--timeout`, default 300 s, at most 7
+calls). Any stop writes `failure.json` (the step, whether anything was written, the exact cleanup command) and
+retries nothing. `run_log.jsonl` records each call's exit code, duration and error output. Lab proof (X02, both
+databases, `preorder_gate_a/20261119T140234Z` and `20261119T144506Z`): without the attestation the isolation check
+exits 5, the driver answers `NOT_ISOLATED`, and the product count is unchanged; with it, all four checks pass and
+Gate A is 15 of 15 again.
+
+**Building the package for the developer:**
+
+```
+.venv/Scripts/python.exe tools/site_blackbox/build_handoff.py
+```
+
+writes `data/output/blackbox_handoff/tsyc-blackbox-gate-a-<commit>.zip` (gitignored). Send that zip, nothing else.
+The developer instructions are its `README.md`.
 
 **Gate A on the copy is one command** for the developer:
 
 ```
-python site_blackbox.py run-gate-a run1 --user ADMIN_LOGIN --wp "wp --path=/path/to/copy"
+python3 site_blackbox.py run-gate-a run1 --user ADMIN_LOGIN --wp "wp --path=/path/to/copy"
+python3 site_blackbox.py pack run1
 ```
 
-It snapshots the catalog, creates the VI draft, snapshots, creates EN and DE through the bridge, waits two
-minutes, snapshots, moves the test products to the trash, and judges. It refuses as soon as the first
-snapshot names the production host, never reuses a folder, and never retries a bridge refusal: a
+It checks isolation, snapshots the catalog, creates the VI draft, snapshots, creates EN and DE through the
+bridge, waits two minutes, snapshots, moves the test products to the trash, and judges. It refuses before
+any write unless isolation is established, never reuses a folder, and never retries a bridge refusal: a
 `tsyc_sibling_side_effect` stop is the finding.
 
 The report answers "did creating and saving the EN/DE drafts change anything?" group by group, for the
@@ -343,4 +364,5 @@ Minimum for the first bounded production pilot, once 1 to 5 are met:
 | `tools/wp_lab/run_preorder_gate_a.py` | Gate A in the lab |
 | `tools/wp_lab/lab_diagnostics.py` | Stay-awake request, suspension detection, per-run logs, failure captures, cleanup check |
 | `tools/site_blackbox/` | The developer's package |
-| `tests/test_preorder_workflow_gates.py`, `tests/test_site_blackbox.py`, `tests/test_lab_diagnostics.py` | Offline tests |
+| `tools/site_blackbox/build_handoff.py` | Builds the developer's zip from one commit |
+| `tests/test_preorder_workflow_gates.py`, `tests/test_site_blackbox.py`, `tests/test_lab_diagnostics.py`, `tests/test_blackbox_handoff.py` | Offline tests |

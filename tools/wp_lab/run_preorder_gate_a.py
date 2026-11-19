@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 import time
 import traceback
@@ -469,7 +471,31 @@ echo json_encode(count($ids));""")
         refused = json.loads(foreign.strip().splitlines()[-1])
         expect(refused.get("code") == "NOT_A_DRIVER_PRODUCT", f"{refused}")
         expect(self.lab.product(self.b1["ids"]["vi"])["status"] == "draft", "The driver touched a product it did not make.")
-        return {"no_user": answer["code"], "cleanup_of_foreign_product": refused["code"]}
+        # Fail closed: the same lab without the operator's attestation is not an isolated copy.
+        def product_total() -> int:
+            return int(self.lab.wc("GET", "products", params={"per_page": 1, "status": "any"}).headers["X-WP-Total"])
+
+        before = product_total()
+        unattested = subprocess.run([str(self.lab.php), "-c", str(self.lab.ini), str(self.lab.cli), f"--path={self.lab.site}",
+                                     "eval-file", str(DRIVER_PHP), "create", "--user=lab-admin"],
+                                    capture_output=True, encoding="utf-8", errors="replace", timeout=HTTP_TIMEOUT,
+                                    env={**os.environ, "TSYC_LAB_NOT_ATTESTED": "1"})
+        not_isolated = json.loads(unattested.stdout.strip().splitlines()[-1])
+        expect(not_isolated.get("code") == "NOT_ISOLATED" and "I4 OPERATOR_ATTESTATION" in not_isolated.get("message", ""),
+               f"{not_isolated}")
+        isolation_off = subprocess.run([str(self.lab.php), "-c", str(self.lab.ini), str(self.lab.cli), f"--path={self.lab.site}",
+                                        "eval-file", str(BLACKBOX_DIR / "tsyc-isolation.php")],
+                                       capture_output=True, encoding="utf-8", errors="replace", timeout=HTTP_TIMEOUT,
+                                       env={**os.environ, "TSYC_LAB_NOT_ATTESTED": "1"})
+        expect(isolation_off.returncode == bbx.ISOLATION_EXIT, f"isolation check exit {isolation_off.returncode}")
+        isolation_on = json.loads(self.lab.wp("eval-file", str(BLACKBOX_DIR / "tsyc-isolation.php")).splitlines()[-1])
+        expect(isolation_on["isolated"] is True and not bbx.isolation_problems(isolation_on), f"{isolation_on}")
+        expect(isolation_on["bridge_sha256"] == bbx.expected_bridge_sha256(BLACKBOX_DIR), "installed bridge differs from the repository")
+        after = product_total()
+        expect(after == before, f"An unattested driver run created products ({before} -> {after}).")
+        return {"no_user": answer["code"], "cleanup_of_foreign_product": refused["code"],
+                "unattested_copy": not_isolated["code"], "isolation_check_unattested_exit": isolation_off.returncode,
+                "isolation_check_lab": {c["id"]: c["ok"] for c in isolation_on["checks"]}}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -487,6 +513,10 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run(lab: Lab, run_dir: Path, guard: lab_diagnostics.Session) -> int:
     lab.diagnostics, lab.log_dir = guard, guard.log_dir
+    import provision_lab  # the lab's own config writer
+
+    if provision_lab.ensure_blackbox_attestation(lab.site):
+        print("lab wp-config: black-box isolation attestation added (127.0.0.1)")
     lab.start_database()
     lab.wipe_products()
     lab.auth = ("lab-admin", lab.wp("user", "application-password", "create", "lab-admin", f"gate-a-{time.time()}", "--porcelain"))

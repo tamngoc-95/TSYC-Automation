@@ -124,6 +124,15 @@ if (!function_exists('tsyc_snapshot_build')) {
             $plugins[] = array('file' => (string) $file, 'version' => isset($installed[$file]['Version']) ? (string) $installed[$file]['Version'] : '');
         }
         $theme = wp_get_theme();
+        // Isolation evidence (read-only), so every snapshot says what it was taken on.
+        $isolation = null;
+        if (is_readable(__DIR__ . '/tsyc-isolation.php')) {
+            if (!defined('TSYC_BBX_ISOLATION_LIBRARY')) {
+                define('TSYC_BBX_ISOLATION_LIBRARY', true);
+            }
+            require_once __DIR__ . '/tsyc-isolation.php';
+            $isolation = tsyc_bbx_isolation();
+        }
         return array(
             'tsyc_snapshot' => 1,
             'label' => $label,
@@ -145,6 +154,7 @@ if (!function_exists('tsyc_snapshot_build')) {
                 'manage_stock_option' => (string) get_option('woocommerce_manage_stock'),
                 'no_stock_amount' => (string) get_option('woocommerce_notify_no_stock_amount'),
                 'hold_stock_minutes' => (string) get_option('woocommerce_hold_stock_minutes'),
+                'isolation' => $isolation,
             ),
             'product_count' => count($products),
             'products' => $products,
