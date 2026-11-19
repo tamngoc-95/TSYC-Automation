@@ -109,7 +109,9 @@ def load_snapshot(path: Path) -> dict[str, Any]:
         data = json.loads(line)
     except json.JSONDecodeError as error:
         raise SnapshotError(f"{path}: {error}") from error
-    if data.get("tsyc_snapshot") != SNAPSHOT_VERSION or not isinstance(data.get("products"), dict):
+    if isinstance(data, dict) and data.get("products") == [] and data.get("product_count") == 0:
+        data["products"] = {}          # an empty catalog from a snapshot script that encoded it as a list
+    if not isinstance(data, dict) or data.get("tsyc_snapshot") != SNAPSHOT_VERSION or not isinstance(data.get("products"), dict):
         raise SnapshotError(f"{path}: not a version {SNAPSHOT_VERSION} snapshot.")
     if data.get("product_count") != len(data["products"]):
         raise SnapshotError(f"{path}: truncated ({len(data['products'])} of {data.get('product_count')} products).")

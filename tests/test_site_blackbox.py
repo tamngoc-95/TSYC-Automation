@@ -290,6 +290,25 @@ def test_the_driver_refuses_production_and_never_prices_or_publishes() -> None:
     assert "NOT_A_DRIVER_PRODUCT" in code and "TSYC_BBX_SKU_PREFIX" in code
 
 
+def test_an_empty_catalog_is_a_valid_snapshot(tmp_path: Path) -> None:
+    # Found running the shipped package on an emptied lab: PHP encodes an empty array as [].
+    for name, products in (("list.json", []), ("object.json", {})):
+        (tmp_path / name).write_text(json.dumps({"tsyc_snapshot": 1, "label": "x", "site": {"host": HOST},
+                                                 "product_count": 0, "products": products}), encoding="utf-8")
+        assert bbx.load_snapshot(tmp_path / name)["products"] == {}
+    (tmp_path / "bad.json").write_text(json.dumps({"tsyc_snapshot": 1, "product_count": 2, "products": []}), encoding="utf-8")
+    with pytest.raises(bbx.SnapshotError):
+        bbx.load_snapshot(tmp_path / "bad.json")                 # a list that claims products is still refused
+    assert "$products ? $products : new stdClass()" in php("tsyc-site-snapshot.php")
+
+
+def test_the_harness_judges_a_site_that_starts_with_no_products(tmp_path: Path) -> None:
+    site = FakeSite()
+    site.products = []
+    report = harness(tmp_path, site)
+    assert report["status"] == "EVALUATED" and report["real_site_compatibility"] == bbx.PASS
+
+
 def test_the_isolation_check_is_read_only_and_fails_closed() -> None:
     code = php("tsyc-isolation.php")
     for pattern in (r"\b(update|add|delete)_(option|post_meta|post|term|user_meta)\b", r"\bwp_(insert|update|delete|trash|set)_\w+",
@@ -447,7 +466,7 @@ class FakeSite:
             out = json.dumps({"tsyc_driver": 1, "ok": True, "trio": {"vi": TRIO["vi"]}, "answers": {}})
         elif arguments[0] == "translate":
             if self.translate_ok:
-                self.products = self.products[:2] + trio_products()
+                self.products = [p for p in self.products if p["id"] not in TRIO.values()] + trio_products()
                 if self.change_bystander:
                     self.products[0]["stock_quantity"] = "1"
                 out = json.dumps({"tsyc_driver": 1, "ok": True, "trio": TRIO, "answers": {}})
@@ -455,8 +474,9 @@ class FakeSite:
                 out, code = json.dumps({"tsyc_driver": 1, "ok": False, "trio": {"vi": TRIO["vi"]},
                                         "answers": {"en": {"http_status": 409, "code": "tsyc_sibling_side_effect"}}}), 4
         elif arguments[0] == "cleanup":
-            for item in self.products[2:]:
-                item["status"] = "trash"
+            for item in self.products:
+                if item["id"] in TRIO.values():
+                    item["status"] = "trash"
             out = json.dumps({"tsyc_driver": 1, "ok": True, "trashed": TRIO})
         return type("Done", (), {"stdout": ("Notice: x\n" + out + "\n").encode("utf-8"), "stderr": b"", "returncode": code})()
 

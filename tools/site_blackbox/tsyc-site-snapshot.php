@@ -157,7 +157,8 @@ if (!function_exists('tsyc_snapshot_build')) {
                 'isolation' => $isolation,
             ),
             'product_count' => count($products),
-            'products' => $products,
+            // An empty PHP array encodes as [] ; the products are always a JSON object.
+            'products' => $products ? $products : new stdClass(),
         );
     }
 }
