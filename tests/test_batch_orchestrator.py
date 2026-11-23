@@ -1232,6 +1232,107 @@ def test_one_human_gated_candidate_does_not_stop_independent_candidates():
 
 
 # --------------------------------------------------------------------------
+# 18b. Transient read failure isolation (2026-11-21 interruption: a Supabase
+# TLS handshake timeout in the first candidate's initial read aborted the
+# whole 8-candidate batch with a traceback and no summary).
+# --------------------------------------------------------------------------
+
+
+def _two_candidate_repository() -> tuple[FakeSupabaseRepository, str]:
+    other_code = "FB-2026-001-CAN-0002"
+    other_candidate_id = "88888888-8888-8888-8888-888888888888"
+    repository = make_repository(
+        product_candidates=[
+            make_candidate(identity_status="IDENTITY_VERIFIED"),
+            make_candidate(
+                candidate_id=other_candidate_id,
+                candidate_code=other_code,
+                identity_status="IDENTITY_VERIFIED",
+            ),
+        ],
+        product_references=[
+            make_reference(),
+            make_reference(reference_id="reference-2", candidate_id=other_candidate_id),
+        ],
+    )
+    return repository, other_code
+
+
+def _main_two(repository, other_code, runner):
+    return run_batch.main(
+        [
+            "--candidate-code", CANDIDATE_CODE,
+            "--candidate-code", other_code,
+            "--max-candidates", "2",
+            "--non-interactive",
+        ],
+        repository=repository,
+        subprocess_runner=runner,
+        confirm=always_confirm,
+        preflight_runner=always_ready_preflight,
+    )
+
+
+def test_initial_read_failure_is_isolated_and_batch_continues(capsys):
+    repository, other_code = _two_candidate_repository()
+    runner, calls = recording_runner()
+    real_load = run_batch.load_candidate_bundle
+
+    def flaky_load(repo, code):
+        if code == CANDIDATE_CODE:
+            raise ConnectionError("_ssl.c:993: The handshake operation timed out")
+        return real_load(repo, code)
+
+    with patch.object(run_batch, "load_candidate_bundle", flaky_load):
+        exit_code = _main_two(repository, other_code, runner)
+
+    out = capsys.readouterr().out
+    assert exit_code == 1  # a failure is still reported, never hidden
+    # No writer ran for the failed candidate; the independent one advanced.
+    assert len(calls) == 1
+    assert calls[0][-3] == other_code
+    assert "READ FAILED" in out
+
+
+def test_initial_read_failure_report_is_blocked_with_no_actions():
+    repository = make_repository(product_candidates=[make_candidate()])
+    runner, calls = recording_runner()
+
+    def failing_load(_repo, _code):
+        raise TimeoutError("simulated")
+
+    with patch.object(run_batch, "load_candidate_bundle", failing_load):
+        report = run_batch.process_one_candidate(
+            CANDIDATE_CODE, make_args(), repository, runner, always_confirm, None
+        )
+
+    assert report.result == run_batch.READ_FAILED
+    assert report.blocked is True
+    assert report.actions_executed == []
+    assert calls == []
+    assert run_batch.classify_report_group(report) == "BLOCKED"
+
+
+def test_unexpected_error_after_processing_started_stops_the_batch(capsys):
+    repository, other_code = _two_candidate_repository()
+    runner, calls = recording_runner()
+    real_process = run_batch.process_one_candidate
+
+    def exploding_process(code, *args, **kwargs):
+        if code == CANDIDATE_CODE:
+            raise RuntimeError("re-read after writer failed")
+        return real_process(code, *args, **kwargs)
+
+    with patch.object(run_batch, "process_one_candidate", exploding_process):
+        exit_code = _main_two(repository, other_code, runner)
+
+    assert exit_code == 1
+    # Uncertain outcome: the second candidate must NOT be processed.
+    assert calls == []
+    assert "unexpected RuntimeError" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
 # 19. Final grouped summary (Phase 6): candidates classify into exactly one
 # of the named result groups, and a human-gated candidate's short reason
 # is printed.

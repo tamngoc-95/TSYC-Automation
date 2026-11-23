@@ -423,6 +423,13 @@ WOO_DRAFT_DISPATCH = DispatchEntry(
 )
 
 
+# Per-candidate result for a side-effect-free initial read failure
+# (isolated; the batch continues) and for an unexpected exception after
+# processing started (uncertain; the batch stops).
+READ_FAILED = "READ_FAILED"
+UNEXPECTED_ERROR = "UNEXPECTED_ERROR"
+
+
 @dataclass
 class CandidateReport:
     """Everything the final summary table and counts need for one candidate."""
@@ -908,7 +915,26 @@ def process_one_candidate(
     verbose = getattr(args, "verbose", False)
     report = CandidateReport(candidate_code=candidate_code)
 
-    bundle = load_candidate_bundle(repository, candidate_code)
+    # The initial read happens before any stage is dispatched, so a
+    # transient failure here (e.g. a Supabase TLS handshake timeout, the
+    # 2026-11-21 interruption) has no side effect: isolate it to this
+    # candidate instead of aborting the whole batch. Failures after a stage
+    # ran are NOT caught here -- see _execute_allowlist().
+    try:
+        bundle = load_candidate_bundle(repository, candidate_code)
+    except Exception as error:  # noqa: BLE001 -- isolated, side-effect free
+        report.initial_state = "READ_FAILED"
+        report.final_state = "READ_FAILED"
+        report.result = READ_FAILED
+        report.blocked = True
+        report.blocked_reason = (
+            f"Initial state read failed ({type(error).__name__}); no stage "
+            "was dispatched. Re-run this candidate."
+        )
+        print()
+        print(f"Candidate: {candidate_code}")
+        print(f"Result: READ FAILED -- {report.blocked_reason}")
+        return report
 
     if bundle is None:
         report.initial_state = "NOT_FOUND"
@@ -1293,6 +1319,8 @@ _FAILURE_RESULTS = (
     "AUDIT_FAILED",
     "NOT_FOUND",
     "BATCH_MISMATCH",
+    READ_FAILED,
+    UNEXPECTED_ERROR,
 )
 
 
@@ -1637,17 +1665,38 @@ def _execute_allowlist(
             )
             continue
 
-        report = process_one_candidate(
-            candidate_code,
-            args,
-            repository,
-            subprocess_runner,
-            confirm,
-            expected_batch_id,
-        )
+        try:
+            report = process_one_candidate(
+                candidate_code,
+                args,
+                repository,
+                subprocess_runner,
+                confirm,
+                expected_batch_id,
+            )
+        except Exception as error:  # noqa: BLE001 -- stop, never continue blind
+            # A writer stage may already have run for this candidate, so
+            # its outcome is uncertain: stop the batch (CLAUDE.md 19.3, no
+            # blind continuation) but still print the summary below.
+            print(
+                f"Candidate {candidate_code}: unexpected "
+                f"{type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
+            report = CandidateReport(
+                candidate_code=candidate_code,
+                final_state=UNEXPECTED_ERROR,
+                result=UNEXPECTED_ERROR,
+                blocked=True,
+                blocked_reason=(
+                    f"Unexpected {type(error).__name__} while processing; a "
+                    "stage may have run. Batch stopped -- reconcile before "
+                    "re-running."
+                ),
+            )
         reports.append(report)
 
-        if report.result == "AUDIT_FAILED":
+        if report.result in ("AUDIT_FAILED", UNEXPECTED_ERROR):
             batch_stopped = True
 
     if args.verbose:
@@ -1667,6 +1716,8 @@ def _execute_allowlist(
             "NOT_FOUND",
             "BATCH_MISMATCH",
             "BLOCKED",
+            READ_FAILED,
+            UNEXPECTED_ERROR,
         )
         for report in reports
     )
