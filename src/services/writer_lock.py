@@ -71,13 +71,21 @@ class LockState:
     path: Path
 
 
+def _resolve_path(path: Path | None) -> Path:
+    # Resolved at call time (not as a bound default) so the offline test
+    # suite can redirect DEFAULT_LOCK_PATH away from the production lock
+    # (tests/conftest.py) -- tests must never take the real writer lock.
+    return DEFAULT_LOCK_PATH if path is None else path
+
+
 def inspect_lock(
-    path: Path = DEFAULT_LOCK_PATH,
+    path: Path | None = None,
     *,
     alive: Callable[[int], bool] = process_alive,
     own_pid: int | None = None,
 ) -> LockState:
     """Read-only view of the lock."""
+    path = _resolve_path(path)
     own_pid = os.getpid() if own_pid is None else own_pid
     if not path.exists():
         return LockState(FREE, None, path)
@@ -99,12 +107,12 @@ class ProductionWriterLock:
     def __init__(
         self,
         owner: str,
-        path: Path = DEFAULT_LOCK_PATH,
+        path: Path | None = None,
         *,
         alive: Callable[[int], bool] = process_alive,
     ) -> None:
         self.owner = owner
-        self.path = path
+        self.path = _resolve_path(path)
         self.alive = alive
         self.took_over: dict[str, Any] | None = None
         self._held = False

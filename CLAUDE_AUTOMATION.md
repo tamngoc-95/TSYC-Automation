@@ -280,7 +280,8 @@ failing image → isolated (RIGHTS_REVIEW_REQUIRED when no cover passes); never 
 never applies to other products' images (swatches), other sites, or other uses
 Fahasa-discovered candidates (FAHASA-<batch>-CAN-NNNN):
 created only from NEW_CONFIRMED discoveries re-checked against a fresh unified identity index (scripts/import_fahasa_candidates.py)
-live pipeline: IDENTITY_VERIFIED required; WooCommerce drafts need bounded owner authorization (--allow-woo-draft)
+live pipeline: IDENTITY_VERIFIED required and the full live readiness gate applies
+standing draft authorization (CLAUDE.md 6.3, owner-adopted 2026-11-23): an eligible FAHASA- pre-order candidate (origin FAHASA_DISCOVERY, PREORDER_PENDING_SUPPLY_CONFIRMATION, IDENTITY_VERIFIED, full readiness AUTO_PASS) derives READY_FOR_DRAFT_FAHASA and run_batch dispatches create_woocommerce_draft.py without --allow-woo-draft; a FAHASA- candidate failing any of these keeps the READY_FOR_DRAFT human gate
 supply status PREORDER_PENDING_SUPPLY_CONFIRMATION in source_evidence; no price ever recorded
 Fahasa pre-order inventory (owner request 2026-10-16, src/domain/rules/preorder_inventory_rules.py):
 only for a FAHASA- candidate still PREORDER_PENDING_SUPPLY_CONFIRMATION

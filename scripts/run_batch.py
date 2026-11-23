@@ -402,7 +402,32 @@ AUTOMATABLE_DISPATCH: dict[str, DispatchEntry] = {
             "never publishes, never sets a price)."
         ),
     ),
+    # CLAUDE.md 6.3 standing owner authorization (adopted 2026-11-23):
+    # eligible new Fahasa pre-order books (full live readiness gate passed,
+    # see pipeline_state._fahasa_standing_draft_eligible) need no
+    # --allow-woo-draft. Same script, same args; the creator re-checks
+    # every gate, SKU any+trash and catalog identity NEW_CONFIRMED before
+    # the POST, sends status="draft", no price, stock 0, backorders yes.
+    "READY_FOR_DRAFT_FAHASA": DispatchEntry(
+        script="create_woocommerce_draft.py",
+        build_args=lambda state: [
+            "--product-code",
+            state.product_code,
+            "--non-interactive",
+            "--confirm-create",
+        ],
+        description=(
+            "Create the WooCommerce VI draft for an eligible Fahasa pre-order "
+            "book under the standing owner authorization (CLAUDE.md 6.3; "
+            "draft only -- never publishes, never sets a price)."
+        ),
+    ),
 }
+
+# The ONLY derived states that reach create_woocommerce_draft.py without a
+# per-run --allow-woo-draft: both are explicit standing owner
+# authorizations (CLAUDE.md 6.2 and 6.3). Pinned by preflight and tests.
+STANDING_WOO_DRAFT_STATES = frozenset({"READY_FOR_DRAFT_HISTORICAL", "READY_FOR_DRAFT_FAHASA"})
 
 # READY_FOR_DRAFT is a human gate by default. It is only ever dispatched
 # when the caller passes --allow-woo-draft on this exact bounded
@@ -1435,6 +1460,8 @@ _EXPECTED_NEXT_STATE_AFTER_ACTION: dict[str, str] = {
         "approval checks do not all pass)"
     ),
     "IMAGE_VALIDATED": "READY_FOR_DRAFT",
+    "READY_FOR_DRAFT_HISTORICAL": "DRAFT_CREATED",
+    "READY_FOR_DRAFT_FAHASA": "DRAFT_CREATED",
     "DRAFT_CREATED": "RECONCILED",
 }
 

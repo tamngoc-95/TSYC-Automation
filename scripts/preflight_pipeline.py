@@ -857,6 +857,19 @@ def check_orchestrator_safety() -> PreflightCheck:
             "--allow-woo-draft does not delegate to create_woocommerce_draft.py"
         )
 
+    # Only the standing owner authorizations (CLAUDE.md 6.2 / 6.3) reach
+    # the Woo creator without --allow-woo-draft.
+    unflagged_creator_states = {
+        state
+        for state, entry in run_batch.AUTOMATABLE_DISPATCH.items()
+        if entry.script == "create_woocommerce_draft.py"
+    }
+    if unflagged_creator_states != set(run_batch.STANDING_WOO_DRAFT_STATES):
+        problems.append(
+            "create_woocommerce_draft.py is dispatched without --allow-woo-draft "
+            f"from unexpected states {sorted(unflagged_creator_states)}"
+        )
+
     # No publish/price argument anywhere in the dispatch table.
     sample_state = CandidateState(
         candidate_code="CAN-PREFLIGHT-CHECK",

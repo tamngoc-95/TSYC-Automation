@@ -51,7 +51,7 @@ LANES = (
     HISTORICAL_RECOVERY_BACKLOG,
 )
 
-_READY_FOR_DRAFT_DERIVED_STATES = {"READY_FOR_DRAFT", "READY_FOR_DRAFT_HISTORICAL"}
+_READY_FOR_DRAFT_DERIVED_STATES = {"READY_FOR_DRAFT", "READY_FOR_DRAFT_HISTORICAL", "READY_FOR_DRAFT_FAHASA"}
 
 # derived_state values that need no further Fast Track action even though
 # scripts.pipeline_state.CandidateState.terminal is only set True for a
@@ -77,6 +77,7 @@ _POST_VI_APPROVAL_DERIVED_STATES = frozenset(
         "IMAGE_VALIDATED",
         "READY_FOR_DRAFT",
         "READY_FOR_DRAFT_HISTORICAL",
+        "READY_FOR_DRAFT_FAHASA",
     }
 )
 

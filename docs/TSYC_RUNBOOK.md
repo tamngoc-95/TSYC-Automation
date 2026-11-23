@@ -70,6 +70,18 @@ set:
 Never one approval per candidate. Authorization never extends to a
 candidate outside the exact codes passed on that invocation.
 
+Standing authorizations (no `--allow-woo-draft` needed, still bounded by
+the exact allowlist and `--max-candidates`):
+- `FB-HIST-` historical candidates → `READY_FOR_DRAFT_HISTORICAL` (CLAUDE.md 6.2).
+- Eligible new Fahasa pre-order books (`FAHASA-`, origin
+  `FAHASA_DISCOVERY`, supply `PREORDER_PENDING_SUPPLY_CONFIRMATION`,
+  `IDENTITY_VERIFIED`, full live readiness) → `READY_FOR_DRAFT_FAHASA`
+  (CLAUDE.md 6.3, owner-adopted 2026-11-23). The creator still re-checks
+  every gate, SKU (any + trash) and catalog identity `NEW_CONFIRMED`
+  before the POST, and sends draft / no price / stock 0 / backorders yes.
+
+Any other `READY_FOR_DRAFT` candidate keeps the per-batch approval above.
+
 ## 7. Woo reconciliation
 `DRAFT_CREATED` candidates automatically reconcile against the remote
 product (SKU, status, media) on the next batch pass -- read-only against

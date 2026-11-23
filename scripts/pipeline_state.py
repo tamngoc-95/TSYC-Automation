@@ -35,6 +35,9 @@ from urllib.parse import urlsplit
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# CLAUDE.md 6.3 standing Fahasa draft authorization derived state.
+READY_FOR_DRAFT_FAHASA = "READY_FOR_DRAFT_FAHASA"
+
 from create_internal_product import is_historical_candidate_code  # noqa: E402
 from prepare_product_content import (  # noqa: E402
     build_safe_draft,
@@ -52,6 +55,7 @@ from src.domain.rules import (
     image_price_rules,
     image_rules,
     metadata_only_content,
+    preorder_inventory_rules,
     readiness_rules,
     reference_discovery_rules,
 )
@@ -129,6 +133,7 @@ DERIVED_STATES = {
     "IMAGE_VALIDATED",
     "READY_FOR_DRAFT",
     "READY_FOR_DRAFT_HISTORICAL",
+    "READY_FOR_DRAFT_FAHASA",
     "DRAFT_CREATION_IN_PROGRESS",
     "DRAFT_CREATED",
     "RECONCILED",
@@ -1718,6 +1723,24 @@ def _derive_pre_product_state(
     )
 
 
+def _fahasa_standing_draft_eligible(bundle: dict[str, Any]) -> bool:
+    """CLAUDE.md 6.3 eligibility (pure): a Fahasa-discovered pre-order
+    candidate (FAHASA- code, origin FAHASA_DISCOVERY, supply
+    PREORDER_PENDING_SUPPLY_CONFIRMATION -- the products that get the
+    stock-0/backorders inventory), IDENTITY_VERIFIED, and passing the FULL
+    live readiness gate (evaluate_readiness, never the historical one).
+    Anything else keeps the 6/6.1 human gate."""
+    candidate = bundle["candidate"]
+
+    if not preorder_inventory_rules.is_fahasa_preorder_candidate(candidate):
+        return False
+
+    if candidate.get("identity_status") != IdentityStatus.IDENTITY_VERIFIED:
+        return False
+
+    return stage_preflight_draft(bundle).outcome == Outcome.AUTO_PASS
+
+
 def derive_candidate_state(
     bundle: dict[str, Any],
 ) -> CandidateState:
@@ -1847,6 +1870,25 @@ def derive_candidate_state(
                 candidate_id=candidate_id,
                 product_code=product_code,
                 derived_state="READY_FOR_DRAFT_HISTORICAL",
+                warnings=warnings,
+            )
+
+        if _fahasa_standing_draft_eligible(bundle):
+            # CLAUDE.md 6.3 standing owner authorization (adopted
+            # 2026-11-23): an eligible new Fahasa pre-order book's DRAFT
+            # create (status="draft", no price, stock 0, backorders yes) is
+            # pre-authorized -- no per-batch --allow-woo-draft. Unlike 6.2
+            # nothing is relaxed: the FULL live readiness gate passed above,
+            # create_woocommerce_draft.py re-reads every gate, re-checks SKU
+            # (any + trash) and requires catalog-identity NEW_CONFIRMED
+            # immediately before the POST. Recovery, owner removal, catalog
+            # duplicate markers and existing syncs were all handled earlier
+            # in this function and never reach this branch.
+            return CandidateState(
+                candidate_code=candidate_code,
+                candidate_id=candidate_id,
+                product_code=product_code,
+                derived_state=READY_FOR_DRAFT_FAHASA,
                 warnings=warnings,
             )
 
