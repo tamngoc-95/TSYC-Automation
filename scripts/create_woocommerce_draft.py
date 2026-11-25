@@ -23,7 +23,13 @@ from src.domain import woo_catalog_identity
 from src.domain.content_status import ContentStatus, InternalProductContentStatus
 from src.domain.image_status import ImageStatus, InternalProductImageStatus
 from src.domain.rights_status import PUBLISHABLE_RIGHTS_STATUSES
-from src.domain.rules import content_rules, preorder_inventory_rules, storefront_text, woo_presentation
+from src.domain.rules import (
+    content_rules,
+    preorder_inventory_rules,
+    storefront_text,
+    woo_post_create_verification,
+    woo_presentation,
+)
 from src.domain.woocommerce_status import WooCommerceStatus, WooCommerceSyncStatus
 from src.repositories.supabase_repository import SupabaseRepository
 
@@ -31,7 +37,7 @@ configure_utf8_console()
 
 
 CREATOR_NAME = "woocommerce_draft_creator"
-CREATOR_VERSION = "1.5.0"
+CREATOR_VERSION = "1.6.0"
 
 VALID_CONFIRMATIONS = {
     "UPLOAD_AND_CREATE",
@@ -2249,6 +2255,124 @@ def mark_post_create_recovery_required(
     )
 
 
+def _woo_get(
+    store_url: str,
+    api_version: str,
+    consumer_key: str,
+    consumer_secret: str,
+    timeout_seconds: int,
+    endpoint: str,
+    params: dict[str, Any],
+) -> Any:
+    """One read-only WooCommerce GET; returns the JSON body on HTTP 200,
+    else None. Never raises (a failed read is an unverified result)."""
+    try:
+        response = requests.get(
+            build_api_url(store_url=store_url, namespace=api_version, endpoint=endpoint),
+            auth=HTTPBasicAuth(consumer_key, consumer_secret),
+            params=params,
+            headers={"Accept": "application/json", "User-Agent": f"{CREATOR_NAME}/{CREATOR_VERSION}"},
+            timeout=timeout_seconds,
+        )
+    except Exception:  # noqa: BLE001 - any failure means "not verified"
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    return safe_json_response(response)
+
+
+def verify_created_draft_remotely(
+    store_url: str,
+    api_version: str,
+    consumer_key: str,
+    consumer_secret: str,
+    timeout_seconds: int,
+    product: dict[str, Any],
+    product_id: int,
+    sent_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """CLAUDE.md 6.3 post-create verification: fresh GET of the created
+    product (context=edit, raw stored fields) plus an exact-SKU search over
+    any + trash, compared with the payload this run sent. Read-only."""
+    lookup = dict(
+        store_url=store_url,
+        api_version=api_version,
+        consumer_key=consumer_key,
+        consumer_secret=consumer_secret,
+        timeout_seconds=timeout_seconds,
+    )
+    remote = _woo_get(**lookup, endpoint=f"products/{int(product_id)}", params={"context": "edit"})
+
+    sku = str(sent_payload.get("sku") or "")
+    sku_hits: list[dict[str, Any]] | None = []
+
+    for status in ("any", "trash"):
+        body = _woo_get(**lookup, endpoint="products", params={"sku": sku, "status": status, "per_page": 20})
+
+        if not isinstance(body, list):
+            sku_hits = None
+            break
+
+        sku_hits.extend(item for item in body if isinstance(item, dict))
+
+    result = woo_post_create_verification.verify_created_draft(
+        expected_product_id=int(product_id),
+        sent_payload=sent_payload,
+        internal_product_id=str(product["internal_product_id"]),
+        remote=remote if isinstance(remote, dict) else None,
+        sku_hits=sku_hits,
+    )
+    result["woocommerce_product_id"] = int(product_id)
+    result["verified_at"] = utc_now()
+    return result
+
+
+def persist_post_create_verification(
+    repository: SupabaseRepository,
+    sync_id: str,
+    verification: dict[str, Any],
+) -> None:
+    """Record the verification on the exact sync row. A FAILED result also
+    sets recovery_required, so pipeline_state stops this candidate at
+    RECOVERY_REVIEW_REQUIRED (the remote draft exists; never recreated)."""
+    rows = (
+        repository.client
+        .table("woocommerce_product_syncs")
+        .select("response_payload")
+        .eq("sync_id", sync_id)
+        .limit(1)
+        .execute()
+    ).data or []
+
+    if not rows:
+        raise RuntimeError("Sync row disappeared before the post-create verification was saved.")
+
+    payload = rows[0].get("response_payload")
+    payload = dict(payload) if isinstance(payload, dict) else {}
+    payload["post_create_verification"] = verification
+    update: dict[str, Any] = {"response_payload": payload, "updated_at": utc_now()}
+
+    if verification.get("status") != woo_post_create_verification.VERIFIED:
+        payload["recovery_required"] = True
+        update["error_code"] = "POST_CREATE_VERIFICATION_FAILED"
+        update["error_message"] = (
+            "Post-create re-read did not confirm: " + ", ".join(verification.get("failed") or [])
+        )
+
+    response = (
+        repository.client
+        .table("woocommerce_product_syncs")
+        .update(update)
+        .eq("sync_id", sync_id)
+        .execute()
+    )
+
+    if not response.data:
+        raise RuntimeError("Could not save the post-create verification result.")
+
+
 def update_internal_product(
     repository: SupabaseRepository,
     product: dict[str, Any],
@@ -2901,6 +3025,41 @@ def main() -> None:
             "finalization failed. Do not retry draft creation. Run the "
             "WooCommerce status synchronization/recovery workflow instead."
         ) from error
+
+    # CLAUDE.md 6.3: re-read the created product and verify it against the
+    # payload sent; persist the result. A failure never retries or edits
+    # the remote draft -- it flags recovery and stops this candidate.
+    verification = verify_created_draft_remotely(
+        store_url=store_url,
+        api_version=api_version,
+        consumer_key=consumer_key,
+        consumer_secret=consumer_secret,
+        timeout_seconds=timeout_seconds,
+        product=product,
+        product_id=int(product_response["id"]),
+        sent_payload=woo_payload,
+    )
+
+    persist_post_create_verification(
+        repository=repository,
+        sync_id=sync["sync_id"],
+        verification=verification,
+    )
+
+    print()
+    print(
+        "Post-create verification: "
+        f"{verification['status']}"
+        + (f" (failed: {', '.join(verification['failed'])})" if verification["failed"] else "")
+    )
+
+    if verification["status"] != woo_post_create_verification.VERIFIED:
+        raise RuntimeError(
+            f"WooCommerce draft #{product_response.get('id')} was created, but the "
+            "post-create re-read did not confirm it "
+            f"({', '.join(verification['failed'])}). Do not retry draft creation; "
+            "the candidate is in recovery review."
+        )
 
     print()
     print("=" * 72)
