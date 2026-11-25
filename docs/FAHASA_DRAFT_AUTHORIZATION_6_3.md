@@ -6,6 +6,19 @@ implemented in code (`scripts/pipeline_state.py`, `scripts/run_batch.py`,
 automation, so **the owner pastes the text below into CLAUDE.md by hand**.
 Until then this file and the code are the record of the decision.
 
+**Applied 2026-11-25:** the owner added section 6.3 to CLAUDE.md in their own
+wording ("Standing authorization for automatic Fahasa WooCommerce drafts").
+That text is now authoritative. It was checked against this proposal and the
+code: same scope, same gates and the same draft payload (`regular_price` and
+`sale_price` empty = no price field sent). The companion edits 1, 2, 4 and 5
+below were not applied. Instead, the closing paragraph of the owner's 6.3
+makes it the exception wherever earlier sections (6, 6.2, 17, 19.4, 26, 28)
+require per-batch approval. Allowlist and `--max-candidates` (19.1),
+serial writes (19.2) and no-blind-retry (19.3) still apply ("All other safety
+requirements remain in force"). The code is stricter than the text in one
+respect, and that is intended: eligibility also requires `origin =
+FAHASA_DISCOVERY` and `supply_status = PREORDER_PENDING_SUPPLY_CONFIRMATION`.
+
 ## Behavior before and after
 
 | | Before (≤ 2026-11-23) | After (§6.3) |

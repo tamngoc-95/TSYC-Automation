@@ -272,6 +272,48 @@ It explicitly does NOT require: ISBN, author, publisher, weight, page count, dim
 Still hard blockers for a historical candidate, unchanged: a confirmed IDENTITY_CONFLICT, no usable title, unclear/unknown candidate_type, unapproved content, an unusable/missing/multiple main image, an active recovery condition, an existing Woo sync, a genuine sellable-unit or evidence conflict requiring business judgment (section 5.2 continues to apply in full to historical candidates).
 This exception never touches: WooCommerce publish (2.4/7 unchanged), selling-price automation (2.5/7 unchanged), deletion or destructive overwrite of verified/approved data (2.7/7 unchanged), or the no-blind-retry rule (2.6/18/19.3 unchanged).
 ---
+6.3 Standing authorization for automatic Fahasa WooCommerce drafts
+
+Adopted 2026-11-23 by explicit shop-owner business authorization.
+
+The shop owner grants standing authorization to automatically create WooCommerce DRAFT products for eligible new FAHASA- discovery candidates, without requesting separate approval for each candidate or batch.
+
+This standing authorization applies only when all existing mandatory gates pass:
+- Exact product identity, edition, volume and sellable unit are verified.
+- The product does not duplicate an existing WooCommerce product, including drafts, published products and trash.
+- The product has not been intentionally removed by the owner.
+- The selected main image and any gallery images have valid rights and match the exact product.
+- Required customer-facing content is APPROVED under the established TSYC content rules.
+- Preflight, duplicate prevention and production-writer safety checks pass.
+- No previous uncertain WooCommerce create operation remains unreconciled.
+- Existing site-level permissions and technical restrictions permit the operation.
+
+For each authorized new preorder draft:
+- status = draft
+- manage_stock = true
+- stock_quantity = 0
+- backorders = yes
+- regular_price = empty
+- sale_price = empty
+
+Use only the established, approved WooCommerce draft-creation pipeline. Recheck identity, SKU and remote state before every create. Re-read the created product, verify its Woo ID and draft fields, and persist the confirmed synchronization result.
+
+Eligible candidates proceed automatically without a new owner approval request. Duplicate, owner-removed, unsupported or insufficiently evidenced candidates must be skipped or held with a recorded reason; continue with independent eligible candidates. Uncertain remote writes must be reconciled before retry. A systemic safety failure stops the batch.
+
+This authorization never permits:
+- Publishing or changing published products.
+- Setting or modifying selling prices.
+- Changing inventory on existing products.
+- Overwriting owner-maintained content.
+- Recreating intentionally removed products.
+- Creating duplicate products.
+- Bypassing system permissions, mandatory quality checks or recovery safeguards.
+
+The owner retains final control over supplier confirmation, selling prices, physical inventory updates and publishing.
+
+Production EN/DE product creation and Polylang linking remain governed by their separate technical compatibility and write-authorization gates. This section does not independently activate those routes.
+
+Where earlier general sections require per-batch human approval for Woo draft creation, this section provides a standing business-authorization exception only for eligible FAHASA- candidates. All other safety requirements remain in force.
 7. Hard Deny Rules
 Never automate or permit through normal unattended operation:
 DROP
