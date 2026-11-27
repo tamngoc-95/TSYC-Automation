@@ -23,6 +23,16 @@ SQLite; base pilot 25 `PASS_REAL_LOCAL`, 2 `BLOCKED_MISSING_DEPENDENCY`; hardeni
 `PASS_SYNTHETIC_HOOK`, 6 `BLOCKED_MISSING_SOURCE`; 0 `FAIL`, 0 host suspensions, no stall (H09 84 s). Details and
 report folders: `PREORDER_MULTILINGUAL_WORKFLOW.md` section 3. Nothing was installed on any real site.
 
+**Production check, 2026-11-27 (read-only).** `audit_woo_translation_groups.py --sku-prefix TSYC-FAHASA-2026-00`
+read 1987 products: 819 vi, 582 en, 586 de. All 57 Fahasa SKUs are single VI rows, with 0 multi-row groups,
+0 errors and 0 warnings. The 11 drafts of the 2026-11-25..27 §6.3 run (#5416–#5441) have approved EN/DE
+content but no EN/DE Woo copy and no Polylang link.
+
+The single blocker is unchanged: Gate A on an isolated copy of the real site is `BLOCKED_REAL_SITE_TEST`.
+The minimum controlled test is already built. The developer runs the `tools/site_blackbox/` handoff zip
+(`build_handoff.py`) on their own isolated copy, for one synthetic book (section 10 C–E). Nothing new
+needs to be built first.
+
 **Developer handoff (2026-11-19):** `tools/site_blackbox/build_handoff.py` ships this bridge file, unchanged, inside
 the black-box zip. The harness refuses a copy whose installed bridge differs from the shipped file, and refuses any
 copy that does not pass all four isolation checks (`PREORDER_MULTILINGUAL_WORKFLOW.md` section 4). The bridge itself

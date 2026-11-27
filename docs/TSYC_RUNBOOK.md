@@ -304,10 +304,20 @@ against the candidate's MATCH Fahasa reference. The cover is the main image;
 a gallery/preview image joins the Woo gallery only with a stored visual review
 (see "Fahasa gallery and preview images" below).
 `--reclassify` re-applies the current rules to an earlier report without
-contacting Fahasa. A live run takes ~20 s per book; run it in the background.
+contacting Fahasa. A live fetch took 50–83 s per book in the 2026-11-25/26
+runs: 40 books in 55 min and 60 books in 50 min. Run it in the background
+with nohup.
 Discovery takes the newest book pages first, so to reach books past an
-earlier run raise `--max-listings` (<= 60) rather than re-reading the same
-head of the listing.
+earlier run raise `--max-listings` (<= 60). Discoverer 1.1.0 keeps a page
+cache (`data/processed/fahasa_discovery/page_cache.json`, gitignored).
+A product page parsed within `--cache-max-age-hours` (default 72; 0 = always
+fetch) is reused without contacting Fahasa. Every record is still classified
+against a freshly loaded catalog index, and an imported candidate's reference
+is crawled live again, so the cache never stands in for identity evidence.
+Fetch errors are never cached. Each record carries `metadata_fetched_at` and
+`metadata_from_cache`, and the report carries `page_cache` hit/fetch counts.
+Measured need: the 2026-11-26 run re-fetched 40 of its 60 pages from the
+2026-11-25 run.
 
 Then, for the exact NEW_CONFIRMED indexes chosen:
 ```
@@ -356,6 +366,47 @@ edited automatically.
 A reference crawl that ends FAILED (for example, a Playwright launch error)
 is not reset automatically. `--reset-stuck-in-progress` covers only
 IN_PROGRESS crawls, so the candidate is held for an owner decision.
+
+### 11.1 Bounded batch cycle (operating model)
+Each cycle stops after its own batch limit and is never a schedule. Start
+with 5–10 eligible books per production batch. The three lanes stay
+separate:
+
+1. **Discovery and preparation (no Woo write).**
+   - Preflight, then discovery (cached pages are reused).
+   - Pick the NEW_CONFIRMED indexes. Hold or skip the rest with a reason (see
+     the hold list above).
+   - Cover reviews, then import, then run_batch until content is pending.
+   - Gallery collection and visual review.
+   - Editorial package: dry run, then apply. Record contributor roles.
+   - Read-only steps may run while a writer runs. Database writers run one
+     at a time under the writer lock.
+2. **Production draft writing (single writer).**
+   - Run `run_batch.py` over the exact allowlist and `--max-candidates`.
+     Eligible §6.3 books create their drafts there; siblings go one per
+     round (see above).
+   - Every create is re-read by the post-create verifier. A FAILED or
+     uncertain result stops that book in recovery and is never retried.
+   - A systemic failure stops the batch.
+3. **Read-only monitoring and reporting.**
+   - `audit_pipeline_state.py`, `preflight_pipeline.py`, and
+     `audit_woo_translation_groups.py --sku-prefix TSYC-FAHASA-`. The last
+     confirms that no EN/DE copy or Polylang group exists while the bridge is
+     off production.
+   - Write one checkpoint per cycle:
+     `data/processed/orchestration/latest_execution_report.json`, holding the
+     drafts with Woo IDs, the holds with reasons, the write counts and the
+     audit/preflight results.
+
+Measured in the 2026-11-25..27 run:
+- Tool time: discovery about 105 min for 100 pages; reference crawl,
+  identity check, internal product and first content about 2 min per book;
+  gallery 23–30 s per book; Woo create 9–16 s (47 s with 6 images);
+  post-create verification 3–7 s.
+- One failed reference crawl hit the 10-minute Bash cap and cost about
+  17 min.
+- Most of the wall time was spent outside these tools: editorial authoring,
+  cover and visual reviews, and pauses between sibling rounds.
 
 ## Editorial content pipeline (VI/EN/DE)
 Read `docs/content_style/TSYC_CONTENT_GUIDE.md` and `docs/content_style/EDITORIAL_REFERENCE.md` first. Then write
