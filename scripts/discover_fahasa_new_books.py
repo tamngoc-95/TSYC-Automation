@@ -23,7 +23,10 @@ never writes Supabase, WooCommerce, images or prices.
      image provenance;
   5. writes data/output/fahasa_discovery/discovery_<UTC>.json and keeps an
      append-only first-seen ledger
-     (data/processed/fahasa_discovery/first_seen.json).
+     (data/processed/fahasa_discovery/first_seen.json) plus a page cache
+     (page_cache.json, same folder; --cache-max-age-hours, default 72) so a
+     re-run does not fetch pages it parsed recently. Classification always
+     runs against a freshly loaded index.
 
 No Fahasa price is recorded at all: Fahasa is never a purchase-price
 source (CLAUDE.md 8.2/8.3) and availability on Fahasa is never evidence
@@ -58,7 +61,7 @@ from src.domain.rules import catalog_identity_index as idx  # noqa: E402
 from src.domain.rules import identity_rules  # noqa: E402
 
 DISCOVERER_NAME = "fahasa_new_book_discoverer"
-DISCOVERER_VERSION = "1.0.0"
+DISCOVERER_VERSION = "1.1.0"
 
 DEFAULT_LISTING_URL = "https://www.fahasa.com/sach-trong-nuoc/thieu-nhi.html?order=created_at&limit=48"
 MAX_LISTINGS_HARD_CAP = 60
@@ -66,6 +69,13 @@ PAGE_DELAY_SECONDS = 2.0
 FACEBOOK_EXPORT_CSV = PROJECT_ROOT / "data" / "processed" / "facebook_history_classification.csv"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "output" / "fahasa_discovery"
 FIRST_SEEN_LEDGER = PROJECT_ROOT / "data" / "processed" / "fahasa_discovery" / "first_seen.json"
+# Parsed product-page metadata from earlier runs. Only the page fetch is
+# reused: every record is still classified against a freshly loaded Woo /
+# database / Facebook index, and an imported candidate's reference is
+# crawled live again by the pipeline, so a cached page never stands in for
+# current identity evidence. Stale entries are fetched again.
+PAGE_CACHE_PATH = PROJECT_ROOT / "data" / "processed" / "fahasa_discovery" / "page_cache.json"
+DEFAULT_CACHE_MAX_AGE_HOURS = 72.0
 
 _PRODUCT_URL_RE = re.compile(r"^https://www\.fahasa\.com/[a-z0-9-]+\.html$")
 # Site navigation links present on every Fahasa listing page.
@@ -97,7 +107,15 @@ def parse_arguments() -> argparse.Namespace:
         type=Path,
         help="Re-classify the records of an earlier discovery report against a fresh index; Fahasa is not contacted.",
     )
+    parser.add_argument(
+        "--cache-max-age-hours",
+        type=float,
+        default=DEFAULT_CACHE_MAX_AGE_HOURS,
+        help="Reuse a product page parsed by an earlier run within this many hours (0 = always fetch).",
+    )
     args = parser.parse_args()
+    if args.cache_max_age_hours < 0:
+        parser.error("--cache-max-age-hours must be 0 or more.")
     if not 1 <= args.max_listings <= MAX_LISTINGS_HARD_CAP:
         parser.error(f"--max-listings must be between 1 and {MAX_LISTINGS_HARD_CAP}.")
     if not args.listing_url.startswith("https://www.fahasa.com/"):
@@ -302,6 +320,83 @@ def save_first_seen(ledger: dict[str, str]) -> None:
     temporary.replace(FIRST_SEEN_LEDGER)
 
 
+def load_page_cache(path: Path = PAGE_CACHE_PATH) -> dict[str, dict[str, Any]]:
+    """The page cache, or empty when missing or unreadable (a cache is never
+    a reason to stop discovery)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_page_cache(cache: dict[str, dict[str, Any]], path: Path = PAGE_CACHE_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(cache, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
+def cached_page(
+    cache: dict[str, dict[str, Any]], url: str, now: datetime, max_age_hours: float
+) -> tuple[bool, dict[str, Any] | None]:
+    """(hit, metadata). A hit needs an entry younger than max_age_hours;
+    metadata None means the page was fetched and held no book."""
+    if max_age_hours <= 0:
+        return False, None
+    entry = cache.get(url)
+    if not isinstance(entry, dict) or "metadata" not in entry:
+        return False, None
+    try:
+        fetched_at = datetime.fromisoformat(str(entry["fetched_at"]))
+    except (KeyError, ValueError):
+        return False, None
+    if fetched_at.tzinfo is None:
+        return False, None
+    age_hours = (now - fetched_at).total_seconds() / 3600
+    if not 0 <= age_hours <= max_age_hours:
+        return False, None
+    metadata = entry["metadata"]
+    return True, metadata if isinstance(metadata, dict) else None
+
+
+def remember_page(cache: dict[str, dict[str, Any]], url: str, metadata: dict[str, Any] | None, fetched_at: str) -> None:
+    """Store one successful fetch. Metadata that cannot round-trip through
+    JSON unchanged is not cached, so a hit always equals a live parse."""
+    try:
+        restored = json.loads(json.dumps(metadata, ensure_ascii=False))
+    except (TypeError, ValueError):
+        cache.pop(url, None)
+        return
+    if restored != metadata:
+        cache.pop(url, None)
+        return
+    cache[url] = {"fetched_at": fetched_at, "metadata": restored}
+
+
+def acquire_page(
+    source: Any,
+    url: str,
+    cache: dict[str, dict[str, Any]],
+    max_age_hours: float,
+    *,
+    now: datetime | None = None,
+    sleep: Any = time.sleep,
+) -> tuple[dict[str, Any] | None, str, bool]:
+    """(metadata, fetched_at, from_cache) for one product page. A fresh cache
+    entry is reused without contacting Fahasa (and without the polite
+    delay); otherwise the page is fetched and cached. A fetch error
+    propagates and is never cached."""
+    hit, metadata = cached_page(cache, url, now or datetime.now(timezone.utc), max_age_hours)
+    if hit:
+        return metadata, str(cache[url]["fetched_at"]), True
+    sleep(PAGE_DELAY_SECONDS)
+    metadata = source.fetch_metadata(url)
+    fetched_at = utc_now_iso()
+    remember_page(cache, url, metadata, fetched_at)
+    return metadata, fetched_at, False
+
+
 def is_book_product_page(metadata: dict[str, Any] | None) -> bool:
     """A Fahasa book page: product JSON-LD plus a title and a publisher
     (category and gift pages also carry JSON-LD but no publisher)."""
@@ -413,6 +508,8 @@ def main() -> None:
 
     source = PlaywrightPageSource()
     ledger = load_first_seen()
+    page_cache = load_page_cache()
+    cache_stats = {"max_age_hours": args.cache_max_age_hours, "hits": 0, "fetched": 0}
     try:
         product_urls: list[str] = []
         for page_number in range(1, args.max_listing_pages + 1):
@@ -427,24 +524,31 @@ def main() -> None:
         for url in product_urls:
             if len(records) >= args.max_listings:
                 break
-            time.sleep(PAGE_DELAY_SECONDS)
             try:
-                metadata = source.fetch_metadata(url)
+                metadata, fetched_at, from_cache = acquire_page(source, url, page_cache, args.cache_max_age_hours)
             except Exception as error:  # one page failing never stops the batch
                 errors.append({"url": url, "error": f"{type(error).__name__}: {error}"[:300]})
                 continue
+            cache_stats["hits" if from_cache else "fetched"] += 1
             if not is_book_product_page(metadata):
                 continue  # category/landing/gift page, not a book
             ledger.setdefault(url, utc_now_iso())
             record = build_record(url, metadata, ledger[url])
+            record["metadata_fetched_at"] = fetched_at
+            record["metadata_from_cache"] = from_cache
             record.update(classify_record(record, entries, posts, coverage_note))
             records.append(record)
-            print(f"[{len(records):>2}] {record['classification']:<26} {record['identity_strength']:<8} {record['title']}")
+            origin = "cache" if from_cache else "live "
+            print(f"[{len(records):>2}] {origin} {record['classification']:<26} {record['identity_strength']:<8} {record['title']}")
     finally:
         source.close()
         save_first_seen(ledger)
+        save_page_cache(page_cache)
 
-    write_report(args.listing_url, started_at, woo_entries, database_entries, posts, coverage_note, records, errors)
+    write_report(
+        args.listing_url, started_at, woo_entries, database_entries, posts, coverage_note, records, errors,
+        page_cache_stats=cache_stats,
+    )
 
 
 def write_report(
@@ -457,6 +561,7 @@ def write_report(
     records: list[dict[str, Any]],
     errors: list[dict[str, str]],
     reclassified_from: str | None = None,
+    page_cache_stats: dict[str, Any] | None = None,
 ) -> Path:
     summary: dict[str, int] = {name: 0 for name in idx.CLASSIFICATIONS}
     for record in records:
@@ -480,6 +585,7 @@ def write_report(
                     "facebook_posts": None if posts is None else len(posts),
                 },
                 "facebook_coverage_note": coverage_note,
+                "page_cache": page_cache_stats,
                 "summary": summary,
                 "errors": errors,
                 "records": records,
@@ -493,6 +599,8 @@ def write_report(
     for name, count in summary.items():
         print(f"{name:<26} {count}")
     print(f"Fetch errors: {len(errors)}")
+    if page_cache_stats:
+        print(f"Pages reused from cache: {page_cache_stats['hits']}, fetched live: {page_cache_stats['fetched']}")
     print(f"Report: {output_path}")
     return output_path
 

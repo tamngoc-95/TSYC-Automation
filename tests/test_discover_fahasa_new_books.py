@@ -76,3 +76,117 @@ def test_facebook_export_coverage_note_uses_latest_post_date(tmp_path):
     posts, note = discovery.load_facebook_posts(path)
     assert [post.ref for post in posts] == ["fb-export-1", "fb-export-2"]
     assert "2026-08-23" in note
+
+
+# --- page cache (discoverer 1.1.0) ---------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+import pytest  # noqa: E402
+
+_URL = "https://www.fahasa.com/biet-doi-cho-bay.html"
+_NOW = datetime(2026, 11, 27, 12, 0, tzinfo=timezone.utc)
+
+
+class _FakeSource:
+    def __init__(self, metadata=None, error=None):
+        self.metadata = metadata
+        self.error = error
+        self.calls = []
+
+    def fetch_metadata(self, url):
+        self.calls.append(url)
+        if self.error:
+            raise self.error
+        return self.metadata
+
+
+def _entry(hours_old, metadata):
+    return {"fetched_at": (_NOW - timedelta(hours=hours_old)).isoformat(), "metadata": metadata}
+
+
+def test_fresh_cache_entry_is_reused_without_contacting_fahasa_or_sleeping():
+    source, sleeps = _FakeSource(_metadata()), []
+    cache = {_URL: _entry(10, _metadata())}
+    metadata, fetched_at, from_cache = discovery.acquire_page(source, _URL, cache, 72, now=_NOW, sleep=sleeps.append)
+    assert from_cache and metadata == _metadata()
+    assert fetched_at == cache[_URL]["fetched_at"]
+    assert source.calls == [] and sleeps == []
+
+
+@pytest.mark.parametrize("hours_old", [73, -1])
+def test_stale_or_future_cache_entry_is_fetched_again(hours_old):
+    source, sleeps = _FakeSource(_metadata(reference_title="Mới")), []
+    cache = {_URL: _entry(hours_old, _metadata())}
+    metadata, _, from_cache = discovery.acquire_page(source, _URL, cache, 72, now=_NOW, sleep=sleeps.append)
+    assert not from_cache and metadata["reference_title"] == "Mới"
+    assert source.calls == [_URL] and sleeps == [discovery.PAGE_DELAY_SECONDS]
+    assert cache[_URL]["metadata"]["reference_title"] == "Mới"
+
+
+def test_zero_max_age_always_fetches():
+    source = _FakeSource(_metadata())
+    cache = {_URL: _entry(0, _metadata())}
+    _, _, from_cache = discovery.acquire_page(source, _URL, cache, 0, now=_NOW, sleep=lambda _s: None)
+    assert not from_cache and source.calls == [_URL]
+
+
+def test_non_book_page_is_cached_as_none_and_reused():
+    cache = {}
+    discovery.acquire_page(_FakeSource(None), _URL, cache, 72, sleep=lambda _s: None)
+    assert cache[_URL]["metadata"] is None
+    source = _FakeSource(_metadata())
+    metadata, _, from_cache = discovery.acquire_page(source, _URL, cache, 72, sleep=lambda _s: None)
+    assert from_cache and metadata is None and source.calls == []
+
+
+def test_fetch_error_propagates_and_is_never_cached():
+    cache = {}
+    with pytest.raises(RuntimeError):
+        discovery.acquire_page(_FakeSource(error=RuntimeError("boom")), _URL, cache, 72, sleep=lambda _s: None)
+    assert cache == {}
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"metadata": {}},
+        {"fetched_at": "not-a-date", "metadata": {}},
+        {"fetched_at": "2026-11-27T11:00:00", "metadata": {}},  # naive timestamp
+        {"fetched_at": "2026-11-27T11:00:00+00:00"},
+        "garbage",
+    ],
+)
+def test_malformed_cache_entry_is_a_miss(entry):
+    assert discovery.cached_page({_URL: entry}, _URL, _NOW, 72) == (False, None)
+
+
+def test_metadata_that_does_not_round_trip_is_not_cached():
+    cache = {_URL: _entry(1, _metadata())}
+    discovery.remember_page(cache, _URL, _metadata(raw_metadata={"when": datetime(2026, 1, 1)}), "x")
+    assert _URL not in cache
+    discovery.remember_page(cache, _URL, _metadata(reference_page_count=(1, 2)), "x")  # tuple -> list changes it
+    assert _URL not in cache
+
+
+def test_cached_record_classifies_like_a_live_one(tmp_path):
+    path = tmp_path / "cache.json"
+    cache = {}
+    discovery.remember_page(cache, _URL, _metadata(), _NOW.isoformat())
+    discovery.save_page_cache(cache, path)
+    restored = discovery.load_page_cache(path)
+    hit, metadata = discovery.cached_page(restored, _URL, _NOW, 72)
+    assert hit
+    live = discovery.build_record(_URL, _metadata(), "2026-10-09T00:00:00+00:00")
+    cached = discovery.build_record(_URL, metadata, "2026-10-09T00:00:00+00:00")
+    assert live == cached
+    assert discovery.classify_record(cached, [], None, None) == discovery.classify_record(live, [], None, None)
+
+
+def test_unreadable_cache_file_is_empty(tmp_path):
+    path = tmp_path / "cache.json"
+    assert discovery.load_page_cache(path) == {}
+    path.write_text("{not json", encoding="utf-8")
+    assert discovery.load_page_cache(path) == {}
+    path.write_text("[1, 2]", encoding="utf-8")
+    assert discovery.load_page_cache(path) == {}
