@@ -314,8 +314,48 @@ Then, for the exact NEW_CONFIRMED indexes chosen:
 .venv/Scripts/python.exe scripts/import_fahasa_candidates.py --discovery-report <report>.json --cover-reviews <reviews>.json --discovery-index N ... --max-candidates K --batch-code FAHASA-2026-NNN --execute
 .venv/Scripts/python.exe scripts/run_batch.py --batch-code FAHASA-2026-NNN --candidate-codes <codes> --max-candidates K --non-interactive
 ```
-FAHASA- candidates are live-pipeline candidates: Woo drafts need the owner's
-bounded authorization on exact codes (`--allow-woo-draft`).
+FAHASA- candidates are live-pipeline candidates. Under the standing owner
+authorization (CLAUDE.md 6.3), an eligible Fahasa pre-order passes the full
+live readiness gate, derives `READY_FOR_DRAFT_FAHASA`, and run_batch creates
+its draft without `--allow-woo-draft`. Any other FAHASA- candidate keeps the
+`--allow-woo-draft` human gate.
+
+Hold these instead of importing them, with the reason recorded:
+- the only Fahasa text describes the series, not the volume;
+- the cover conflicts with the record (title, publisher or edition);
+- the only image is a promotional composite;
+- the book is an edition variant of a product the shop already sells.
+
+Sibling volumes trip the catalog check ("Series already represented"). When
+every match is an in-batch sibling with a different title, story and cover,
+resolve it with `resolve_catalog_duplicate_review.py --decision DISTINCT`.
+Pass one `--distinct-from` per stored ref, and work in rounds:
+1. Resolve the first sibling and create it.
+2. Refresh the next sibling's marker. `create_woocommerce_draft.py
+   --product-code ... --non-interactive --confirm-create` re-runs the check
+   and records a fresh marker. It creates nothing unless the result is
+   NEW_CONFIRMED.
+3. Resolve that sibling against the new draft, then repeat.
+
+Post-create verification (create_woocommerce_draft.py 1.6.0, CLAUDE.md 6.3).
+Every new draft is re-read after its local finalization, using GET
+`context=edit` plus an exact-SKU search over any + trash. The check covers:
+- Woo ID, SKU and the `_tsyc_internal_product_id` link;
+- name and draft status;
+- empty regular, sale and active price;
+- `manage_stock` true, `stock_quantity` 0 and `backorders` "yes";
+- image IDs and their order;
+- the VI description and short description;
+- exactly one product with this SKU.
+
+The result is saved as `response_payload.post_create_verification` on the
+sync row. A FAILED or unreadable check also sets `recovery_required`, so the
+candidate stops at RECOVERY_REVIEW_REQUIRED. The draft is never re-created or
+edited automatically.
+
+A reference crawl that ends FAILED (for example, a Playwright launch error)
+is not reset automatically. `--reset-stuck-in-progress` covers only
+IN_PROGRESS crawls, so the candidate is held for an owner decision.
 
 ## Editorial content pipeline (VI/EN/DE)
 Read `docs/content_style/TSYC_CONTENT_GUIDE.md` and `docs/content_style/EDITORIAL_REFERENCE.md` first. Then write
